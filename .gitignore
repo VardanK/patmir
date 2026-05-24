@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+.uv/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+
+# Eval outputs — large, regenerable, not source of truth.
+eval_runs/
+
+# Local secrets
+.env
+.env.local
+
+# Audio / large files that shouldn't be in git unless explicitly committed
+*.wav
+*.mp3
+*.mp4
+*.mkv
+*.webm
+# Allow committed sample audio under eval_data/ if needed:
+!eval_data/**/*.wav
