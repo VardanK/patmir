@@ -22,6 +22,12 @@ venv/
 # Eval outputs — large, regenerable, not source of truth.
 eval_runs/
 
+# Pipeline job outputs (Phase 1) — large, regenerable.
+runs/
+
+# Local test inputs — user-local scratch dir.
+samples/
+
 # Local secrets
 .env
 .env.local

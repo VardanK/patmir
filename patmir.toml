@@ -58,6 +58,39 @@ model     = "claude-opus-4-7"
 # ANTHROPIC_API_KEY is read from the environment.
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Translation candidates added post-Phase-0 — registered, not yet enabled.
+# Picked up by the GPU re-eval pass. See Phase 1 spec for details.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Gen2B/HyGPT-10b-it — Eastern-Armenian-centric LLM (Gemma-2-9b base, 10B AR
+# tokens, July 2025). Supports EN/RU/hy translation via prompting.
+# ~20 GB VRAM at fp16; GPU workstation required.
+[[eval.translation.candidates]]
+id        = "hygpt_10b_it"
+enabled   = false
+module    = "patmir.eval.candidates.translation.hygpt"
+model_id  = "Gen2B/HyGPT-10b-it"
+device    = "cuda"
+
+# Helsinki-NLP OPUS-MT — explicit Eastern Armenian, ~80 MB each, MPS-friendly.
+# Modest quality (BLEU 16.6 on en→hy Tatoeba). Fast-path A/B candidates.
+[[eval.translation.candidates]]
+id        = "opus_mt_en_hy"
+enabled   = false
+module    = "patmir.eval.candidates.translation.opus_mt"
+model_id  = "Helsinki-NLP/opus-mt-en-hy"
+source_lang = "en"
+device    = "mps"
+
+[[eval.translation.candidates]]
+id        = "opus_mt_ru_hy"
+enabled   = false
+module    = "patmir.eval.candidates.translation.opus_mt"
+model_id  = "Helsinki-NLP/opus-mt-ru-hy"
+source_lang = "ru"
+device    = "mps"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # TTS candidates (eval).
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -85,6 +118,13 @@ model_id  = "facebook/mms-tts-hyw"
 device    = "mps"
 
 # Deferred to the GPU pass.
+#
+# CORRECTION (Phase 1 shaping): XTTS-v2's current model card lists 17 languages
+# (en, es, fr, de, it, pt, pl, tr, ru, nl, cs, ar, zh-cn, ja, hu, ko, hi).
+# Armenian is NOT among them. XTTS-v2 cannot produce Armenian without a full
+# language fine-tune, which is out of Phase 1/2 scope. Entry kept here as a
+# documented dead end so future scans don't re-add it. See tech-stack.md
+# Stage 4 for the matching correction.
 [[eval.tts.candidates]]
 id        = "xtts_v2"
 enabled   = false
@@ -105,3 +145,56 @@ enabled   = false
 module    = "patmir.eval.candidates.tts.google_tts_cloud"
 voice     = "hy-AM-Standard-A"
 # GOOGLE_APPLICATION_CREDENTIALS env var must point at a service-account JSON.
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 1 pipeline.
+# ──────────────────────────────────────────────────────────────────────────────
+# `[pipeline]` is the single source of truth for which candidate runs each
+# stage. Each value is a candidate `id`; translation/tts ids resolve against
+# `[[eval.<stage>.candidates]]`, the four new stages against
+# `[[stages.<stage>.candidates]]` below.
+
+[pipeline]
+ingest    = "ffmpeg"
+asr       = "faster_whisper_large_v3_turbo"
+translate = "nllb_200_distilled_600m"
+tts       = "piper_hye"
+mux       = "ffmpeg_pad_stretch"
+output    = "mkv_default"
+
+[pipeline.options]
+stretch_cap       = 0.20    # max ±20% time-stretch ratio per sentence (preserves pitch)
+asr_int8          = true
+keep_intermediate = true
+
+# ─── Ingest ───────────────────────────────────────────────────────────────────
+[[stages.ingest.candidates]]
+id     = "ffmpeg"
+module = "patmir.pipeline.stages.ingest.ffmpeg"
+
+# ─── ASR ──────────────────────────────────────────────────────────────────────
+[[stages.asr.candidates]]
+id            = "faster_whisper_large_v3_turbo"
+module        = "patmir.pipeline.stages.asr.faster_whisper"
+model_id      = "large-v3-turbo"
+device        = "auto"       # auto → mps if available, else cpu
+compute_type  = "int8"
+
+# Quality-leaning fallback. Same module; bigger Whisper checkpoint.
+[[stages.asr.candidates]]
+id            = "faster_whisper_large_v3"
+module        = "patmir.pipeline.stages.asr.faster_whisper"
+model_id      = "large-v3"
+device        = "auto"
+compute_type  = "int8"
+
+# ─── Mux ──────────────────────────────────────────────────────────────────────
+[[stages.mux.candidates]]
+id     = "ffmpeg_pad_stretch"
+module = "patmir.pipeline.stages.mux.ffmpeg_pad_stretch"
+
+# ─── Output ───────────────────────────────────────────────────────────────────
+[[stages.output.candidates]]
+id     = "mkv_default"
+module = "patmir.pipeline.stages.output.mkv"

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>patmir runs</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 2rem; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    table { border-collapse: collapse; }
+    td, th { padding: 0.4rem 0.8rem; border-bottom: 1px solid #eee; font-size: 0.9rem; }
+    .pending { color: #999; }
+    .running { color: #0a84ff; }
+    .done    { color: #2bb673; }
+    .failed  { color: #d33; }
+    a { color: #0a84ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>patmir runs</h1>
+  {% if not runs %}
+    <p>No runs yet.</p>
+  {% else %}
+    <table>
+      <thead>
+        <tr><th>job</th><th>source</th><th>lang</th><th>stages</th></tr>
+      </thead>
+      <tbody>
+        {% for r in runs %}
+        <tr>
+          <td><a href="/run/{{ r.job_id }}">{{ r.job_id }}</a></td>
+          <td>{{ r.source }}</td>
+          <td>{{ r.lang }}</td>
+          <td>
+            {% for name, state in r.stages %}
+              <span class="{{ state }}" title="{{ name }}={{ state }}">{{ name[:3] }}</span>
+            {% endfor %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</body>
+</html>

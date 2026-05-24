@@ -1,11 +1,11 @@
 [project]
 name = "patmir"
 version = "0.0.0"
-description = "Local-first Armenian dubbing workstation — Phase 0 feasibility harness"
+description = "Local-first Armenian dubbing workstation"
 requires-python = ">=3.11"
 dependencies = [
-  # Core eval harness only — no Phase 1 pipeline deps yet.
-  # Local model candidates pull in heavy ML deps and are kept optional via extras.
+  # Core eval harness only — no heavy ML deps at the root.
+  # Pipeline stages and model candidates pull deps via extras.
 ]
 
 [project.optional-dependencies]
@@ -15,8 +15,11 @@ local = [
   "transformers>=4.40",
   "sentencepiece>=0.2",
   "numpy>=1.26",
-  "piper-tts>=1.4",     # Eastern-Armenian community voice (the local TTS baseline)
+  "piper-tts>=1.4",       # Eastern-Armenian community voice (the local TTS baseline)
   "huggingface-hub>=0.20",
+  "faster-whisper>=1.0",  # Phase 1 ASR
+  "pyrubberband>=0.3",    # Phase 1 mux time-stretching (needs system `rubberband` binary)
+  "soundfile>=0.12",      # WAV I/O for mux
 ]
 # Cloud baselines (translation ceiling + TTS ceiling).
 cloud = [
@@ -24,7 +27,16 @@ cloud = [
   "openai>=1.30",
   "google-cloud-texttospeech>=2.16",
 ]
-all = ["patmir[local,cloud]"]
+# Local FastAPI progress UI (Phase 1).
+ui = [
+  "fastapi>=0.110",
+  "uvicorn>=0.27",
+  "jinja2>=3.1",
+]
+all = ["patmir[local,cloud,ui]"]
+
+[project.scripts]
+patmir = "patmir.cli:main"
 
 [build-system]
 requires = ["hatchling"]
