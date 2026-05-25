@@ -20,6 +20,7 @@ local = [
   "faster-whisper>=1.0",  # Phase 1 ASR
   "pyrubberband>=0.3",    # Phase 1 mux time-stretching (needs system `rubberband` binary)
   "soundfile>=0.12",      # WAV I/O for mux
+  "demucs>=4.0",          # Phase 1 vocal/accompaniment separation
 ]
 # Cloud baselines (translation ceiling + TTS ceiling).
 cloud = [

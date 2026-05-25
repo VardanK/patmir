@@ -18,6 +18,13 @@ class PipelineOptions:
     stretch_cap: float = 0.20
     asr_int8: bool = True
     keep_intermediate: bool = True
+    # Linear gain applied to the accompaniment bed when mixing the AR voice
+    # on top. 1.0 = unchanged source mix volume; 0.6 = -4 dB (a touch quieter
+    # so the dialogue sits above the music). The voice itself is normalized
+    # to roughly match the original dialogue loudness.
+    music_bed_gain: float = 0.6
+    # Extra dB applied to the AR voice over its native level. 0 = identity.
+    voice_gain_db: float = 0.0
 
 
 @dataclass

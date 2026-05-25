@@ -90,6 +90,81 @@ model_id  = "Helsinki-NLP/opus-mt-ru-hy"
 source_lang = "ru"
 device    = "mps"
 
+# Qwen3 instruction-tuned LLM via mlx-lm — runs on Apple Silicon GPU + unified
+# memory. Used as a prompted translator; far stronger on idioms / register /
+# narration than NLLB-600M. Qwen3 has no 7B variant in its lineup (4B → 8B
+# → 14B), so the closest analog to "Qwen3-7B-Instruct" is Qwen3-8B at 4-bit.
+# Install once: `uv pip install mlx-lm`
+[[eval.translation.candidates]]
+id          = "qwen3_8b_mlx"
+enabled     = true
+module      = "patmir.eval.candidates.translation.qwen3_instruct_mlx"
+model_id    = "mlx-community/Qwen3-8B-4bit"
+max_tokens  = 256
+temperature = 0.0
+no_think    = true
+
+[[eval.translation.candidates]]
+id          = "qwen3_4b_instruct_mlx"
+enabled     = false
+module      = "patmir.eval.candidates.translation.qwen3_instruct_mlx"
+model_id    = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+max_tokens  = 256
+temperature = 0.0
+no_think    = true
+
+[[eval.translation.candidates]]
+id          = "qwen3_14b_mlx"
+enabled     = false
+module      = "patmir.eval.candidates.translation.qwen3_instruct_mlx"
+model_id    = "mlx-community/Qwen3-14B-4bit"
+max_tokens  = 256
+temperature = 0.0
+no_think    = true
+
+# Qwen3.6-27B — Apr 2026 release. ~3.4x the parameters of Qwen3-8B, meaningfully
+# better on low-resource languages like Armenian. 4bit is 15 GB on disk;
+# 5bit is 18 GB. Both fit comfortably alongside the other pipeline stages on
+# 32 GB shared memory given the lazy-load runner only holds one stage at a time.
+# No "Instruct" suffix — Qwen3.6 uses the hybrid thinking model with chat templates
+# (same pattern as Qwen3-8B).
+[[eval.translation.candidates]]
+id          = "qwen3_6_27b_mlx_4bit"
+enabled     = false
+module      = "patmir.eval.candidates.translation.qwen3_instruct_mlx"
+model_id    = "mlx-community/Qwen3.6-27B-4bit"
+max_tokens  = 256
+temperature = 0.1
+top_p       = 0.9
+repetition_penalty = 1.15
+no_think    = true
+
+[[eval.translation.candidates]]
+id          = "qwen3_6_27b_mlx_5bit"
+enabled     = false
+module      = "patmir.eval.candidates.translation.qwen3_instruct_mlx"
+model_id    = "mlx-community/Qwen3.6-27B-5bit"
+max_tokens  = 256
+temperature = 0.1
+top_p       = 0.9
+repetition_penalty = 1.15
+no_think    = true
+
+# Unsloth Dynamic v2.0 4-bit variant of Qwen3.6-27B — selective high-precision
+# quantization keeps more bits in sensitive layers (where low-resource language
+# knowledge lives), at the cost of larger weights (~26 GB vs 15 GB for plain
+# 4-bit). Best 4-bit-class quality available for Armenian on a 32 GB Mac.
+[[eval.translation.candidates]]
+id          = "qwen3_6_27b_unsloth_ud_mlx_4bit"
+enabled     = false
+module      = "patmir.eval.candidates.translation.qwen3_instruct_mlx"
+model_id    = "unsloth/Qwen3.6-27B-UD-MLX-4bit"
+max_tokens  = 256
+temperature = 0.1
+top_p       = 0.9
+repetition_penalty = 1.15
+no_think    = true
+
 # ──────────────────────────────────────────────────────────────────────────────
 # TTS candidates (eval).
 # ──────────────────────────────────────────────────────────────────────────────
@@ -106,6 +181,25 @@ module      = "patmir.eval.candidates.tts.piper_hye"
 repo_id     = "davit312/piper-TTS-Armenian"
 onnx_file   = "v3/hy_AM-gor-medium.onnx"
 config_file = "v3/hy_AM-gor-medium.onnx.json"
+
+# OmniVoice — zero-shot multilingual TTS (k2-fsa/OmniVoice, Apache-2.0, ~0.6B
+# params). Lists 646 languages, Armenian among them (`hy`/`hye`, ~42 h of
+# training data). Dialect is the macrolanguage code so Eastern vs Western
+# has to be ear-judged. Voice-clone-only — needs a reference audio + its
+# transcription. Default reference is one of the Phase 0 Piper outputs
+# (known Eastern-Armenian dialect); swap for your own native voice memo
+# later.
+[[eval.tts.candidates]]
+id          = "omnivoice"
+enabled     = false
+module      = "patmir.eval.candidates.tts.omnivoice"
+model_id    = "k2-fsa/OmniVoice"
+device      = "auto"     # auto → mps on Apple Silicon
+dtype       = "float32"  # bf16/fp16 on cuda once GPU box is online
+ref_audio   = "eval_runs/20260524-160019/tts/piper_hye/hy-cartoon-01.wav"
+ref_text    = "Արկածի գնանք։"
+num_step    = 32
+speed       = 1.0
 
 # Western-Armenian MMS-TTS — kept here disabled so the author can opt in to
 # hear how a wrong-dialect baseline sounds for comparison. NOT a valid Phase 0
@@ -157,9 +251,10 @@ voice     = "hy-AM-Standard-A"
 
 [pipeline]
 ingest    = "ffmpeg"
-asr       = "faster_whisper_large_v3_turbo"
-translate = "nllb_200_distilled_600m"
-tts       = "piper_hye"
+separate  = "htdemucs"
+asr       = "qwen3_asr_1_7b_mlx_8bit"
+translate = "qwen3_6_27b_unsloth_ud_mlx_4bit"
+tts       = "omnivoice"
 mux       = "ffmpeg_pad_stretch"
 output    = "mkv_default"
 
@@ -167,19 +262,32 @@ output    = "mkv_default"
 stretch_cap       = 0.20    # max ±20% time-stretch ratio per sentence (preserves pitch)
 asr_int8          = true
 keep_intermediate = true
+music_bed_gain    = 0.6     # accompaniment level under the AR voice (1.0 = unchanged)
+voice_gain_db     = 0.0     # extra dB applied to the AR voice over its native level
 
 # ─── Ingest ───────────────────────────────────────────────────────────────────
 [[stages.ingest.candidates]]
 id     = "ffmpeg"
 module = "patmir.pipeline.stages.ingest.ffmpeg"
 
+# ─── Separate (vocals vs music + sfx) ─────────────────────────────────────────
+[[stages.separate.candidates]]
+id     = "htdemucs"
+module = "patmir.pipeline.stages.separate.htdemucs"
+model  = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
+device = "auto"          # auto → mps on Apple Silicon
+
 # ─── ASR ──────────────────────────────────────────────────────────────────────
 [[stages.asr.candidates]]
 id            = "faster_whisper_large_v3_turbo"
 module        = "patmir.pipeline.stages.asr.faster_whisper"
 model_id      = "large-v3-turbo"
-device        = "auto"       # auto → mps if available, else cpu
+device        = "auto"       # auto → cpu on Mac (CT2 has no MPS); cuda on GPU box
 compute_type  = "int8"
+# ASR runs on the isolated vocals from the `separate` stage — mostly real
+# silence with occasional speech — so Silero VAD is reliable here and prevents
+# Whisper from hallucinating phrases like "Thank you." on silent stretches.
+vad_filter    = true
 
 # Quality-leaning fallback. Same module; bigger Whisper checkpoint.
 [[stages.asr.candidates]]
@@ -188,6 +296,73 @@ module        = "patmir.pipeline.stages.asr.faster_whisper"
 model_id      = "large-v3"
 device        = "auto"
 compute_type  = "int8"
+vad_filter    = true
+
+# Qwen3-ASR (Apache-2.0, Jan 2026). 52 languages incl. EN + RU. Beats
+# Whisper-large-v3 on multilingual avg (CommonVoice 9.18 vs 10.77) and on
+# noisy English (LibriSpeech other 3.38 vs 3.97).
+#
+# Two backends — pick by platform:
+#   - On Apple Silicon: use `qwen3_asr_*_mlx` (runs on the Mac GPU + unified
+#     memory via `mlx-qwen3-asr`, includes a working MLX ForcedAligner).
+#   - On NVIDIA GPU box: use `qwen3_asr_*` below (official `qwen-asr`).
+#
+# The official PyTorch `qwen-asr` package pins `transformers<5` which conflicts
+# with omnivoice (needs transformers>=5). The MLX path has no such conflict.
+#
+# Install before enabling:
+#   Mac:  `uv pip install mlx-qwen3-asr`
+#   CUDA: `uv pip install qwen-asr`
+[[stages.asr.candidates]]
+id              = "qwen3_asr_1_7b"
+module          = "patmir.pipeline.stages.asr.qwen3_asr"
+model_id        = "Qwen/Qwen3-ASR-1.7B"
+device          = "auto"
+dtype           = "bfloat16"
+forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
+aligner_dtype   = "bfloat16"
+max_new_tokens  = 256
+
+[[stages.asr.candidates]]
+id              = "qwen3_asr_0_6b"
+module          = "patmir.pipeline.stages.asr.qwen3_asr"
+model_id        = "Qwen/Qwen3-ASR-0.6B"
+device          = "auto"
+dtype           = "bfloat16"
+forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
+aligner_dtype   = "bfloat16"
+max_new_tokens  = 256
+
+# Qwen3-ASR via MLX — native Apple Silicon GPU, working forced aligner.
+# Use these on Mac instead of the CUDA-targeted entries above. Loads weights
+# directly from mlx-community/ (already MLX-formatted).
+#
+# 8bit is the default — best quality/disk tradeoff for a 1.7B ASR model on
+# Apple Silicon. Pure 4bit can cause text-quality regressions on low-resource
+# languages; bf16 is overkill for a 1.7B model (and 2x the disk).
+[[stages.asr.candidates]]
+id              = "qwen3_asr_1_7b_mlx_8bit"
+module          = "patmir.pipeline.stages.asr.qwen3_asr_mlx"
+model_id        = "mlx-community/Qwen3-ASR-1.7B-8bit"
+dtype           = "bfloat16"
+forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
+aligner_dtype   = "bfloat16"
+
+[[stages.asr.candidates]]
+id              = "qwen3_asr_1_7b_mlx_4bit"
+module          = "patmir.pipeline.stages.asr.qwen3_asr_mlx"
+model_id        = "mlx-community/Qwen3-ASR-1.7B-4bit"
+dtype           = "bfloat16"
+forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
+aligner_dtype   = "bfloat16"
+
+[[stages.asr.candidates]]
+id              = "qwen3_asr_0_6b_mlx_bf16"
+module          = "patmir.pipeline.stages.asr.qwen3_asr_mlx"
+model_id        = "mlx-community/Qwen3-ASR-0.6B-bf16"
+dtype           = "bfloat16"
+forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
+aligner_dtype   = "bfloat16"
 
 # ─── Mux ──────────────────────────────────────────────────────────────────────
 [[stages.mux.candidates]]

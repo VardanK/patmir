@@ -33,8 +33,11 @@ class Manifest:
     stages: dict[str, StageStatus] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.stages:
-            self.stages = {name: StageStatus(name=name) for name in STAGE_ORDER}
+        # Always ensure every stage in STAGE_ORDER has an entry. This keeps
+        # older manifests forward-compatible when new stages are added between
+        # versions (e.g. a job started before `separate` was introduced).
+        for name in STAGE_ORDER:
+            self.stages.setdefault(name, StageStatus(name=name))
 
     def stage(self, name: str) -> StageStatus:
         return self.stages[name]

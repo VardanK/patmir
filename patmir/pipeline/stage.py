@@ -23,6 +23,35 @@ class AudioTrack:
 
 
 @dataclass
+class SeparatedAudio:
+    """Result of vocal / accompaniment separation + speech filtering.
+
+    `accompaniment` is the music + sound-effects bed from Demucs (drums +
+    bass + other stems summed). `vocals` is the full Demucs vocal stem —
+    contains spoken dialogue AND non-speech vocalizations (laughs, screams,
+    grunts, etc.) — kept as the upstream artifact and the audio ASR sees.
+
+    `speech_vocals` and `non_speech_vocals` are precomputed VAD-masked stems
+    of `vocals` — `non_speech_vocals` is mixed into the bed alongside
+    `accompaniment` so the cartoon's atmospheric vocal sounds survive into
+    the final dub. `speech_vocals` is kept as an inspection artifact.
+
+    `vad_intervals` is the list of [start, end] (seconds) speech windows
+    from Silero VAD. ASR uses these as a *post-filter* on its word
+    timestamps — words that don't overlap any interval get dropped — which
+    keeps soft-onset speech (that the hard-mask would have clipped) while
+    still discarding ASR hallucinations on pure scream/laugh regions.
+    """
+    accompaniment: Path
+    vocals: Path
+    sample_rate: int
+    channels: int
+    speech_vocals: Path | None = None
+    non_speech_vocals: Path | None = None
+    vad_intervals: list[tuple[float, float]] | None = None
+
+
+@dataclass
 class Word:
     text: str
     start: float
@@ -97,6 +126,11 @@ class IngestStage(Protocol):
 
 
 @runtime_checkable
+class SeparateStage(Protocol):
+    def separate(self, source_video: Path, ctx: "JobContext") -> SeparatedAudio: ...
+
+
+@runtime_checkable
 class ASRStage(Protocol):
     def transcribe(self, audio: AudioTrack, ctx: "JobContext") -> Transcript: ...
 
@@ -113,7 +147,13 @@ class TTSStage(Protocol):
 
 @runtime_checkable
 class MuxStage(Protocol):
-    def mux(self, synth: SynthesizedAudio, source: AudioTrack, ctx: "JobContext") -> MuxedAudio: ...
+    def mux(
+        self,
+        synth: SynthesizedAudio,
+        source: AudioTrack,
+        separated: SeparatedAudio,
+        ctx: "JobContext",
+    ) -> MuxedAudio: ...
 
 
 @runtime_checkable
@@ -129,6 +169,7 @@ class OutputStage(Protocol):
 
 STAGE_ORDER: tuple[str, ...] = (
     "ingest",
+    "separate",
     "asr",
     "translate",
     "tts",

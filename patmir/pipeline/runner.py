@@ -11,6 +11,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.context import JobContext
@@ -69,15 +70,17 @@ def run_job(
         st.started_at = time.time()
         manifest.to_path(manifest_path)
         ctx.progress(name, 0.0, "start")
+        # Build this stage's instance JIT and release it after running so MPS
+        # / CUDA only holds one stage's models in memory at a time.
+        stage_obj = cfg.build_stage(name)
         try:
-            output = _run_stage(name, cfg, state, ctx)
+            output = _run_stage(name, stage_obj, state, ctx)
             state[name] = output
             _record_artifacts(name, output, st, job_dir)
             st.state = "done"
             st.finished_at = time.time()
             ctx.progress(name, 1.0, "done")
             if name == "asr" and output is not None:
-                # ASR sets language
                 manifest.source_lang = ctx.source_lang
             manifest.to_path(manifest_path)
         except Exception as exc:
@@ -87,25 +90,81 @@ def run_job(
             manifest.to_path(manifest_path)
             ctx.progress(name, 1.0, f"failed: {exc}")
             raise
+        finally:
+            stage_obj = None  # noqa — drop reference
+            _free_accelerator_cache()
 
     return manifest
 
 
-def _run_stage(name: str, cfg: PipelineConfig, state: dict[str, object], ctx: JobContext):
+def _free_accelerator_cache() -> None:
+    """Drop the just-finished stage's compute graph + free MPS/CUDA cache."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch  # type: ignore[import-not-found]
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+    try:
+        import mlx.core as mx  # type: ignore[import-not-found]
+        # MLX has no explicit cache to clear in 0.x; the gc above + the next
+        # allocator pass usually reclaims everything via reference counting.
+        # Calling metal.clear_cache() is the closest equivalent and is no-op
+        # if unsupported on the current MLX build.
+        try:
+            mx.metal.clear_cache()  # type: ignore[attr-defined]
+        except (AttributeError, RuntimeError):
+            pass
+    except ImportError:
+        pass
+
+
+def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobContext):
+    from patmir.pipeline.stage import AudioTrack, SeparatedAudio
+
     if name == "ingest":
-        return cfg.ingest.extract(ctx.source_path, ctx)
+        return stage_obj.extract(ctx.source_path, ctx)
+    if name == "separate":
+        return stage_obj.separate(ctx.source_path, ctx)
     if name == "asr":
-        out = cfg.asr.transcribe(state["ingest"], ctx)  # type: ignore[arg-type]
-        # ASR stage sets ctx.source_lang internally
-        return out
+        # Transcribe the FULL vocal stem (not the VAD-masked speech stem) —
+        # the hard mask was clipping soft-onset speech. Instead, we expose
+        # the VAD intervals on the JobContext as `ctx.extra["vad_intervals"]`,
+        # and the ASR module filters its own word timestamps against those
+        # intervals after decoding. Hallucinated words from pure
+        # scream/laugh zones get dropped; real speech with quiet onsets is
+        # kept because ASR sees the full audio context.
+        sep = state.get("separate")
+        ingest = state["ingest"]  # type: ignore[assignment]
+        audio_for_asr = ingest  # type: ignore[assignment]
+        if isinstance(sep, SeparatedAudio):
+            if sep.vocals is not None and sep.vocals.exists():
+                audio_for_asr = AudioTrack(
+                    path=sep.vocals,
+                    sample_rate=sep.sample_rate,
+                    duration=ingest.duration,  # type: ignore[attr-defined]
+                )
+            if sep.vad_intervals:
+                ctx.extra["vad_intervals"] = sep.vad_intervals
+        return stage_obj.transcribe(audio_for_asr, ctx)
     if name == "translate":
-        return cfg.translate.translate(state["asr"], ctx)  # type: ignore[arg-type]
+        return stage_obj.translate(state["asr"], ctx)  # type: ignore[arg-type]
     if name == "tts":
-        return cfg.tts.synthesize(state["translate"], ctx)  # type: ignore[arg-type]
+        return stage_obj.synthesize(state["translate"], ctx)  # type: ignore[arg-type]
     if name == "mux":
-        return cfg.mux.mux(state["tts"], state["ingest"], ctx)  # type: ignore[arg-type]
+        return stage_obj.mux(
+            state["tts"],          # type: ignore[arg-type]
+            state["ingest"],       # type: ignore[arg-type]
+            state["separate"],     # type: ignore[arg-type]
+            ctx,
+        )
     if name == "output":
-        return cfg.output.write(
+        return stage_obj.write(
             state["mux"],  # type: ignore[arg-type]
             ctx.source_path,
             state["translate"],  # type: ignore[arg-type]
@@ -130,6 +189,7 @@ def _load_resume_artifact(name: str, job_dir: Path, ctx: JobContext):
     from patmir.pipeline.stage import (
         AudioTrack,
         MuxedAudio,
+        SeparatedAudio,
         Sentence,
         SynthesizedAudio,
         SynthesizedSentence,
@@ -142,6 +202,20 @@ def _load_resume_artifact(name: str, job_dir: Path, ctx: JobContext):
     if name == "ingest":
         data = json.loads((job_dir / "audio.meta.json").read_text())
         return AudioTrack(path=Path(data["path"]), sample_rate=data["sample_rate"], duration=data["duration"])
+    if name == "separate":
+        data = json.loads((job_dir / "separated.meta.json").read_text())
+        speech_v = data.get("speech_vocals")
+        nonspeech_v = data.get("non_speech_vocals")
+        intervals = data.get("vad_intervals")
+        return SeparatedAudio(
+            accompaniment=Path(data["accompaniment"]),
+            vocals=Path(data["vocals"]),
+            sample_rate=data["sample_rate"],
+            channels=data["channels"],
+            speech_vocals=Path(speech_v) if speech_v else None,
+            non_speech_vocals=Path(nonspeech_v) if nonspeech_v else None,
+            vad_intervals=[(float(s), float(e)) for s, e in intervals] if intervals else None,
+        )
     if name == "asr":
         data = json.loads((job_dir / "transcript.json").read_text())
         ctx.source_lang = data["language"]

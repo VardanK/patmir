@@ -17,6 +17,7 @@ from typing import Any
 
 from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import AudioTrack, Sentence, Transcript, Word
+from patmir.pipeline.stages.asr._sentence import filter_words_by_vad, group_into_sentences
 
 
 def _resolve_device(requested: str) -> str:
@@ -35,11 +36,12 @@ def _resolve_device(requested: str) -> str:
 class FasterWhisperASR:
     id = "faster_whisper"
 
-    def __init__(self, model_id: str, device: str, compute_type: str) -> None:
+    def __init__(self, model_id: str, device: str, compute_type: str, vad_filter: bool = False) -> None:
         from faster_whisper import WhisperModel  # lazy import
 
         self.device = _resolve_device(device)
         self.compute_type = compute_type
+        self.vad_filter = vad_filter
         self.model = WhisperModel(model_id, device=self.device, compute_type=compute_type)
 
     def transcribe(self, audio: AudioTrack, ctx: JobContext) -> Transcript:
@@ -47,7 +49,7 @@ class FasterWhisperASR:
             str(audio.path),
             word_timestamps=True,
             language=None,
-            vad_filter=True,
+            vad_filter=self.vad_filter,
         )
         ctx.source_lang = info.language
         ctx.progress("asr", 0.05, f"detected language={info.language}")
@@ -61,40 +63,11 @@ class FasterWhisperASR:
             if audio.duration > 0:
                 ctx.progress("asr", min(0.95, seg.end / audio.duration), f"t={seg.end:.1f}s")
 
-        sentences = _group_into_sentences(words)
+        words = filter_words_by_vad(words, ctx.extra.get("vad_intervals"))
+        sentences = group_into_sentences(words)
         transcript = Transcript(language=info.language, words=words, sentences=sentences)
         _write_transcript(ctx.job_dir, transcript)
         return transcript
-
-
-def _group_into_sentences(words: list[Word], max_gap_s: float = 0.6) -> list[Sentence]:
-    sentences: list[Sentence] = []
-    bucket: list[Word] = []
-    idx = 0
-
-    def flush() -> None:
-        nonlocal idx, bucket
-        if not bucket:
-            return
-        text = " ".join(w.text for w in bucket).strip()
-        sentences.append(Sentence(
-            idx=idx,
-            text=text,
-            start=bucket[0].start,
-            end=bucket[-1].end,
-            words=list(bucket),
-        ))
-        idx += 1
-        bucket = []
-
-    for i, w in enumerate(words):
-        bucket.append(w)
-        ends_sentence = w.text.endswith((".", "!", "?", "。", "！", "？"))
-        gap_next = words[i + 1].start - w.end if i + 1 < len(words) else 0.0
-        if ends_sentence or gap_next > max_gap_s:
-            flush()
-    flush()
-    return sentences
 
 
 def _write_transcript(job_dir: Path, transcript: Transcript) -> None:
@@ -125,4 +98,5 @@ def build(config: dict[str, Any]) -> FasterWhisperASR:
         model_id=config["model_id"],
         device=config.get("device", "auto"),
         compute_type=config.get("compute_type", "int8"),
+        vad_filter=config.get("vad_filter", False),
     )

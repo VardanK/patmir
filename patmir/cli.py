@@ -66,7 +66,7 @@ def cmd_dub(args: argparse.Namespace) -> int:
     if not args.video.exists():
         print(f"error: {args.video} not found", file=sys.stderr)
         return 2
-    cfg = load_pipeline_config(args.config)
+    cfg = load_pipeline_config(args.config, skip_before=args.resume_from)
 
     job_dir = args.resume_job
     progress_stop = threading.Event()
