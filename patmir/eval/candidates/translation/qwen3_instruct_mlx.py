@@ -68,6 +68,7 @@ class Qwen3InstructTranslator:
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=not self.no_think,
         )
         # A tiny temperature + top-p + repetition penalty avoids the under-
         # trained-on-Armenian LLM falling into "որտեղ ես գնում, որտեղ ես
