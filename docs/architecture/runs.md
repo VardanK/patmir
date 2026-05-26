@@ -1,0 +1,66 @@
+# `runs/<job>/` artifact map
+
+Every job creates a fresh directory under `runs/`, named `<YYYYMMDD-HHMMSS>-<source-stem>/`. Below is what each file is and how to use it for debugging.
+
+## Top-level files
+
+| File                  | Stage    | Purpose                                                                                  |
+| --------------------- | -------- | ---------------------------------------------------------------------------------------- |
+| `manifest.json`       | runner   | Per-stage status (`pending` / `running` / `done` / `failed`), timestamps, artifacts paths, error tracebacks. The first thing to read when something failed. |
+| `progress.jsonl`      | runner   | One row per `ctx.progress(...)` call — `{stage, pct, msg, ts}`. The FastAPI UI tails this for live progress. |
+| `audio.wav`           | ingest   | 16 kHz mono PCM extracted from the source video.                                         |
+| `audio.meta.json`     | ingest   | Sample rate, duration, source video path (also in manifest).                             |
+| `full_audio.wav`      | separate | Demucs input — usually the same content as `audio.wav` but at Demucs's native SR.        |
+| `vocals.wav`          | separate | **Demucs vocal stem (full).** What ASR + diarize consume. Contains dialogue + laughs + screams + grunts. |
+| `accompaniment.wav`   | separate | Music + sound-effects bed (drums + bass + other stems summed). What mux mixes under the AR voice. |
+| `speech_vocals.wav`   | separate | VAD-masked vocals with 20 ms cosine fades. What `ref_picker` slices ref clips from. Cleaner than `vocals.wav`. |
+| `non_speech_vocals.wav` | separate | Inverse VAD mask — atmospheric vocals only. Mixed back into the bed at mux time so cartoon screams/laughs survive. |
+| `separated.meta.json` | separate | Sample rate, channels, VAD intervals list, paths.                                        |
+| `transcript.json`     | asr      | Word-level ASR output: `language`, full `words` list (each with `start`/`end`/`text`), and grouped `sentences` (each with `speaker_id` + Phase-2.x `emotion`). |
+| `sentences.json`      | asr      | Same sentences as in `transcript.json` but flat (legacy convenience).                    |
+| `translated.json`     | translate | `TranslatedTranscript` — source + target text per sentence + timing + speaker_id (+ emotion). |
+| `synthesized.json`    | tts      | Per-sentence WAV paths, durations, source timings, target text.                          |
+| `dub.wav`             | mux      | Single concatenated Armenian voice track (resampled to source's SR; per-sentence afade in/out applied). |
+| `dub.meta.json`       | mux      | Duration, sample rate, options used (stretch_cap, music_bed_gain, voice_gain_db).        |
+| `out.mkv`             | output   | Final MKV — Armenian default audio, original retained as secondary, Armenian SRT as default subtitle track. |
+| `out.hy.srt`          | output   | Standalone subtitle file (also muxed into `out.mkv`).                                    |
+
+## Subdirectories
+
+```
+runs/<job>/
+├── diarize/
+│   ├── turns.json            # Speaker turns + overlap intervals
+│   ├── refs.json             # SpeakerRef per (speaker[, emotion]) — paths + source windows + ref_text
+│   └── refs/
+│       └── <speaker>/        # Phase 2.x: one subdir per speaker
+│           └── <emotion>.wav # Reference clip used by TTS for that (speaker, emotion) pair
+├── emotion/                  # Phase 2.x
+│   └── segments.json         # Per-turn emotion predictions (start, end, emotion, confidence)
+└── tts/
+    ├── 0.wav                 # One file per synthesized sentence
+    ├── 1.wav
+    └── ...
+```
+
+## How to debug a failed run
+
+1. Open `manifest.json`. The first stage with `state: "failed"` (or `state: "done"` with an `error` field, which happens for some recoverable errors) shows the traceback. Check its `error` field.
+2. If the failed stage produced *any* output, the per-stage files above are still on disk — read them to see what the previous stage handed off.
+3. Re-run from that stage: `patmir dub <video> --resume-job runs/<job> --resume-from <stage>`. The runner loads prior artifacts from disk and skips earlier stages.
+4. To force a clean rerun, delete the failed stage's artifacts and resume from it. `--resume-from` is `STAGE_ORDER`-aware; deleting `transcript.json` and resuming from `asr` is enough to make ASR run again.
+
+## How to inspect ref-clip selection
+
+Open `diarize/refs.json`. Each entry has `source_start` / `source_end` — open `vocals.wav` (or `speech_vocals.wav`) at those timestamps to hear what the ref clip's source looked like. Listen to `diarize/refs/<speaker>/<emotion>.wav` for the actual sliced clip (post-trim, post-fade-guard).
+
+If a character sounds wrong in `dub.wav`, the most likely cause is:
+
+- Wrong speaker bucketed (diarizer error) — check `diarize/turns.json`.
+- Right speaker, wrong emotion bin (so a calm-voice ref was used for an angry line) — check `emotion/segments.json` against `transcript.json`.
+- Ref clip itself is poor (background bleed, non-lexical vocalization) — open the WAV and listen.
+
+## Run-list CLI
+
+`patmir runs ls` — table of all run dirs with stage status glyphs.
+`patmir runs show <job_id>` — full manifest summary including speaker count + (Phase 2.x) per-speaker emotion-bin coverage.
