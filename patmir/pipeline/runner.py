@@ -34,6 +34,7 @@ def run_job(
     runs_root: Path | None = None,
     resume_job_dir: Path | None = None,
     resume_from: str | None = None,
+    source_lang: str | None = None,
 ) -> Manifest:
     runs_root = runs_root or Path.cwd() / "runs"
 
@@ -44,6 +45,9 @@ def run_job(
     else:
         job_dir, job_id = _make_job_dir(source, runs_root)
         manifest = Manifest(job_id=job_id, source_path=str(source))
+
+    if source_lang:
+        manifest.source_lang = source_lang
 
     manifest_path = job_dir / "manifest.json"
     manifest.to_path(manifest_path)

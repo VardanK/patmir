@@ -37,6 +37,9 @@ def main(argv: list[str] | None = None) -> int:
     p_dub.add_argument("--resume-from", choices=STAGE_ORDER, default=None)
     p_dub.add_argument("--resume-job", type=Path, default=None,
                        help="Existing job dir under runs/ to resume into.")
+    p_dub.add_argument("--source-lang", type=str, default=None,
+                       help="ISO source language hint (e.g. 'ru', 'en'). "
+                            "Used by ASR as a fallback if it can't detect language.")
 
     p_runs = sub.add_parser("runs", help="Inspect prior runs.")
     p_runs_sub = p_runs.add_subparsers(dest="runs_cmd", required=True)
@@ -94,6 +97,7 @@ def cmd_dub(args: argparse.Namespace) -> int:
             runs_root=RUNS_ROOT,
             resume_job_dir=job_dir,
             resume_from=args.resume_from,
+            source_lang=args.source_lang,
         )
     except Exception as exc:
         progress_stop.set()

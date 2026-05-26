@@ -8,10 +8,33 @@ punctuation OR a gap > `max_gap_s` between consecutive words.
 interval from Silero VAD — the post-filter alternative to hard-masking the
 audio before ASR. Lets ASR see full audio (no soft-onset clipping) while
 still dropping hallucinations from pure non-speech-vocal regions.
+
+`is_non_lexical_repetition` detects onomatopoeic sentences like 'Ха-ха-ха!'
+or 'Ням-ням-ням' so they can be dropped before translate/TTS — the original
+laughter/eating sounds already survive in the music bed via htdemucs.
 """
 from __future__ import annotations
 
+import re
+from collections import Counter
+
 from patmir.pipeline.stage import Sentence, Word
+
+
+def is_non_lexical_repetition(text: str) -> bool:
+    """True for onomatopoeic repetition like 'Ха-ха-ха!', 'Ня-ня-ня',
+    'Ням-ням-ням-ням!', 'Ах-ха-ха!'. The threshold is 60% of tokens
+    repeating, which catches both pure repetition (3/3 'ха') and minor
+    variants (2/3 'ха' + 1 'ах') while keeping real short utterances
+    like 'Да нет' or 'что-то' (50% repetition).
+    """
+    cleaned = re.sub(r"[!?.,…—]+", " ", text).strip()
+    tokens = [t.lower() for t in re.split(r"[\s\-]+", cleaned) if t]
+    if len(tokens) < 2:
+        return False
+    counts = Counter(tokens)
+    most_common = counts.most_common(1)[0][1]
+    return most_common / len(tokens) >= 0.6
 
 
 def filter_words_by_vad(

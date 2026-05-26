@@ -200,20 +200,20 @@ def _split_vocals_with_vad(
         mono16 = mono.astype("float32")
     wav16 = torch.from_numpy(mono16)
 
-    # Silero's default threshold=0.5 is calibrated for noisy real-world audio.
-    # Demucs's vocal stem has dead silence between vocalizations, which makes
-    # 0.5 too strict — it clips the soft onsets of utterances. We lower the
-    # threshold and pad boundaries more generously so quiet sentence-starts
-    # aren't lost.
+    # Silero's default threshold=0.5 is for noisy real-world recordings. On
+    # cartoon dialogue running over music, even after Demucs separation the
+    # vocal stem retains some background energy and Silero misses most
+    # utterances at 0.3. 0.2 is the floor below which background music
+    # starts firing as speech.
     intervals = get_speech_timestamps(
         wav16,
         model,
         sampling_rate=16000,
         return_seconds=True,
-        threshold=0.3,
+        threshold=0.2,
         min_speech_duration_ms=100,
         min_silence_duration_ms=200,
-        speech_pad_ms=300,
+        speech_pad_ms=500,
     )
 
     # 3) Build a per-sample float32 speech mask at the original (Demucs) sample rate.

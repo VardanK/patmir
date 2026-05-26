@@ -53,6 +53,23 @@ def _mx_dtype(name: str):
     }.get(name, mx.bfloat16)
 
 
+def _word_in_target_script(text: str, language: str) -> bool:
+    """True if `text` contains at least one character in the script the
+    target language uses. Used to drop CJK/emoji garbage that Qwen3-ASR
+    hallucinates on cartoon sound effects when running in Russian or
+    English mode."""
+    if not text:
+        return False
+    if language == "ru":
+        return any("Ѐ" <= ch <= "ӿ" for ch in text)
+    if language == "en":
+        return any("a" <= ch.lower() <= "z" for ch in text)
+    if language == "hy":
+        return any("԰" <= ch <= "֏" for ch in text)
+    # Unknown target language — be permissive, just reject pure CJK.
+    return not all("一" <= ch <= "鿿" or ch.isspace() for ch in text)
+
+
 class Qwen3ASRMLX:
     id = "qwen3_asr_mlx"
 
@@ -121,18 +138,15 @@ class Qwen3ASRMLX:
                 start=float(seg.get("start", 0.0)),
                 end=float(seg.get("end", seg.get("start", 0.0))),
             ))
-        # VAD post-filter: drop words that don't overlap any speech interval
-        # from the `separate` stage. This catches ASR hallucinations on pure
-        # scream/laugh regions without clipping soft-onset real speech.
-        words = filter_words_by_vad(words, ctx.extra.get("vad_intervals"))
-
-        # mlx-qwen3-asr emits sentence-shaped chunks with punctuation; use
-        # them as sentence boundaries but narrow each one's [start, end] to
-        # the *word range* of words that survived VAD filtering. Chunks with
-        # no surviving words (e.g. a chunk that was entirely scream-region
-        # hallucination) are dropped wholesale.
+        # Build sentences from Qwen3-ASR chunks first, then fall back to
+        # gap-based grouping for any aligned words that weren't covered by
+        # an accepted chunk. Qwen3-ASR occasionally tags chunks with the
+        # wrong language (e.g. "und"/"en" on Russian interjections like
+        # "Ням ням ням"), and those chunks get filtered out — but the
+        # forced aligner still emits the words, so we'd lose real dialogue.
         sentences: list[Sentence] = []
         idx = 0
+        covered_word_ids: set[int] = set()
         for c in chunks:
             txt = (c.get("text") or "").strip()
             if not txt:
@@ -143,11 +157,17 @@ class Qwen3ASRMLX:
             cstart = float(c.get("start", 0.0))
             cend = float(c.get("end", cstart))
             matching = [w for w in words if cstart <= w.start <= cend]
-            if not matching:
-                # Whole chunk got VAD-filtered out — skip.
-                continue
-            s_start = min(w.start for w in matching)
-            s_end = max(w.end for w in matching)
+            # Qwen3-ASR chunks often span tens of seconds of leading/trailing
+            # silence around the actual utterance. Narrow [start, end] to the
+            # aligned word range so the mux places TTS where the speaker
+            # actually talks, not at the chunk pre-roll.
+            if matching:
+                s_start = min(w.start for w in matching)
+                s_end = max(w.end for w in matching)
+            else:
+                s_start, s_end = cstart, cend
+            for w in matching:
+                covered_word_ids.add(id(w))
             sentences.append(Sentence(
                 idx=idx,
                 text=txt,
@@ -156,6 +176,45 @@ class Qwen3ASRMLX:
                 words=matching,
             ))
             idx += 1
+
+        # Orphan-word recovery: any aligned word that wasn't covered by an
+        # accepted chunk gets folded into a synthetic sentence, grouped by
+        # gap so continuous speech becomes one utterance. We additionally
+        # require the word to contain at least one character in the target
+        # language's script — Qwen3-ASR routinely hallucinates CJK
+        # characters for cartoon sound effects ("嗯", "滋 巴"), and those
+        # would translate to nonsense if let through.
+        orphan_words = [
+            w for w in words
+            if id(w) not in covered_word_ids and _word_in_target_script(w.text, language)
+        ]
+        if orphan_words:
+            orphan_words.sort(key=lambda w: w.start)
+            gap_threshold = 1.5  # seconds — split groups at >1.5s of silence
+            group: list[Word] = []
+            groups: list[list[Word]] = []
+            for w in orphan_words:
+                if group and (w.start - group[-1].end) > gap_threshold:
+                    groups.append(group)
+                    group = []
+                group.append(w)
+            if group:
+                groups.append(group)
+            for g in groups:
+                text = " ".join(w.text for w in g).strip()
+                if not text:
+                    continue
+                sentences.append(Sentence(
+                    idx=idx,
+                    text=text,
+                    start=min(w.start for w in g),
+                    end=max(w.end for w in g),
+                    words=g,
+                ))
+                idx += 1
+            sentences.sort(key=lambda s: s.start)
+            for i, s in enumerate(sentences):
+                s.idx = i
 
         transcript = Transcript(language=language, words=words, sentences=sentences)
         _write_transcript(ctx.job_dir, transcript)

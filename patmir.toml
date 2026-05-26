@@ -25,13 +25,35 @@ module    = "patmir.eval.candidates.translation.nllb_200_distilled_600m"
 model_id  = "facebook/nllb-200-distilled-600M"
 device    = "mps"           # "cpu" | "mps" | "cuda" — default to Apple Metal on M-series Macs
 
-# Deferred to the GPU pass — flip `enabled = true` once the workstation is ready.
+# NLLB-200-3.3B via Transformers on MPS at fp16. ~6.6 GB resident.
+# Same loader as the 600M distilled candidate; the only difference is
+# model size + dtype. fp16 keeps the model within the 32 GB Mac budget.
 [[eval.translation.candidates]]
 id        = "nllb_200_3.3b"
-enabled   = false
+enabled   = true
 module    = "patmir.eval.candidates.translation.nllb_200_distilled_600m"  # same loader
 model_id  = "facebook/nllb-200-3.3B"
-device    = "cuda"
+device    = "mps"
+dtype     = "float32"
+max_new_tokens = 512
+num_beams = 4
+no_repeat_ngram_size = 3
+
+# DEAD END — acceldium/nllb-200-3.3B-GGUF requires a fork of llama.cpp that
+# implements the `nllb` architecture; upstream llama.cpp does not, and
+# llama-cpp-python builds against upstream. Kept here as a documented
+# non-viable path so future scans don't re-explore it.
+[[eval.translation.candidates]]
+id          = "nllb_200_3_3b_gguf"
+enabled     = false
+module      = "patmir.eval.candidates.translation.nllb_gguf"
+repo_id     = "acceldium/nllb-200-3.3B-GGUF"
+filename    = "nllb-3.3B.gguf"
+max_tokens  = 512
+temperature = 0.0
+top_p       = 1.0
+n_ctx       = 1024
+n_gpu_layers = -1
 
 [[eval.translation.candidates]]
 id        = "madlad_400"
@@ -165,6 +187,44 @@ top_p       = 0.9
 repetition_penalty = 1.15
 no_think    = true
 
+# Qwen3-14B Q4_K_M via llama.cpp Metal backend. ~9 GB on disk; fits the
+# 32 GB Mac with headroom for ASR + TTS without thrashing. K-quants
+# preserve more precision in attention layers than plain Q4.
+# Install once: `CMAKE_ARGS="-DGGML_METAL=on" uv pip install llama-cpp-python`.
+# Quality on Armenian was visibly weaker than the 27B and 30B-A3B options;
+# kept here as a small-memory fallback.
+[[eval.translation.candidates]]
+id          = "qwen3_14b_gguf_q4km"
+enabled     = false
+module      = "patmir.eval.candidates.translation.qwen3_gguf"
+repo_id     = "unsloth/Qwen3-14B-GGUF"
+filename    = "Qwen3-14B-Q4_K_M.gguf"
+max_tokens  = 256
+temperature = 0.1
+top_p       = 0.9
+repetition_penalty = 1.15
+n_ctx       = 4096
+n_gpu_layers = -1
+no_think    = true
+
+# Qwen3-30B-A3B (MoE) Q4_K_M via llama.cpp Metal. ~17 GB on disk; activates
+# only ~3B parameters per token thanks to MoE sparsity, so it stays fast on
+# Apple Silicon while having the lexical breadth of a 30B model — important
+# for low-resource Armenian.
+[[eval.translation.candidates]]
+id          = "qwen3_30b_a3b_gguf_q4km"
+enabled     = true
+module      = "patmir.eval.candidates.translation.qwen3_gguf"
+repo_id     = "unsloth/Qwen3-30B-A3B-GGUF"
+filename    = "Qwen3-30B-A3B-Q4_K_M.gguf"
+max_tokens  = 256
+temperature = 0.1
+top_p       = 0.9
+repetition_penalty = 1.15
+n_ctx       = 4096
+n_gpu_layers = -1
+no_think    = true
+
 # ──────────────────────────────────────────────────────────────────────────────
 # TTS candidates (eval).
 # ──────────────────────────────────────────────────────────────────────────────
@@ -200,6 +260,22 @@ ref_audio   = "eval_runs/20260524-160019/tts/piper_hye/hy-cartoon-01.wav"
 ref_text    = "Արկածի գնանք։"
 num_step    = 32
 speed       = 1.0
+
+# MLX-native OmniVoice with int8 group-size-64 affine quantization
+# (Apache-2.0). ~1 GB total resident (vs 3 GB for the PyTorch fp16 above),
+# ~25% faster RTF on Apple Silicon. Same voice-clone interface.
+# Install once: `uv pip install mlx-audio`.
+[[eval.tts.candidates]]
+id            = "omnivoice_mlx_q8"
+enabled       = true
+module        = "patmir.eval.candidates.tts.omnivoice_mlx"
+repo_id       = "lightsofapollo/omnivoice-mlx-q8-g64"
+ref_audio     = "eval_runs/20260524-160019/tts/piper_hye/hy-cartoon-01.wav"
+ref_text      = "Արկածի գնանք։"
+num_steps     = 32
+guidance_scale = 2.0
+language      = "None"
+lang_code     = "None"
 
 # Western-Armenian MMS-TTS — kept here disabled so the author can opt in to
 # hear how a wrong-dialect baseline sounds for comparison. NOT a valid Phase 0
@@ -252,9 +328,9 @@ voice     = "hy-AM-Standard-A"
 [pipeline]
 ingest    = "ffmpeg"
 separate  = "htdemucs"
-asr       = "qwen3_asr_1_7b_mlx_8bit"
-translate = "qwen3_6_27b_mlx_4bit"
-tts       = "omnivoice"
+asr       = "whisper_large_v3_mlx_fp16"
+translate = "nllb_200_3.3b"
+tts       = "omnivoice_mlx_q8"
 mux       = "ffmpeg_pad_stretch"
 output    = "mkv_default"
 
@@ -348,6 +424,17 @@ dtype           = "bfloat16"
 forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
 aligner_dtype   = "bfloat16"
 
+# Higher-precision bf16 variant of Qwen3-ASR-1.7B. ~3.4 GB resident (vs
+# 2.3 GB at 8-bit). Reduces CJK hallucinations on cartoon sound effects
+# at the cost of more memory.
+[[stages.asr.candidates]]
+id              = "qwen3_asr_1_7b_mlx_bf16"
+module          = "patmir.pipeline.stages.asr.qwen3_asr_mlx"
+model_id        = "mlx-community/Qwen3-ASR-1.7B-bf16"
+dtype           = "bfloat16"
+forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
+aligner_dtype   = "bfloat16"
+
 [[stages.asr.candidates]]
 id              = "qwen3_asr_1_7b_mlx_4bit"
 module          = "patmir.pipeline.stages.asr.qwen3_asr_mlx"
@@ -363,6 +450,30 @@ model_id        = "mlx-community/Qwen3-ASR-0.6B-bf16"
 dtype           = "bfloat16"
 forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
 aligner_dtype   = "bfloat16"
+
+# Whisper-large-v3 via mlx-whisper (Apple Metal native). 99 languages
+# including English + Russian. Native word timestamps — no separate
+# forced-aligner needed. ~3 GB resident at fp16.
+# Install once: `uv pip install mlx-whisper`.
+# Note: this repo uses the older `weights.npz` filename that mlx-whisper
+# 0.4.3 expects natively. The newer `whisper-large-v3-fp16` repo (with
+# `model.safetensors`) doesn't load through mlx-whisper without a rename.
+[[stages.asr.candidates]]
+id              = "whisper_large_v3_mlx_fp16"
+module          = "patmir.pipeline.stages.asr.whisper_mlx"
+repo_id         = "mlx-community/whisper-large-v3-mlx"
+temperature     = 0.0
+condition_on_previous_text = true
+no_speech_threshold        = 0.6
+
+# Whisper-large-v3-turbo (distilled, ~4× faster, ~same quality). Same loader.
+[[stages.asr.candidates]]
+id              = "whisper_large_v3_turbo_mlx"
+module          = "patmir.pipeline.stages.asr.whisper_mlx"
+repo_id         = "mlx-community/whisper-large-v3-turbo"
+temperature     = 0.0
+condition_on_previous_text = true
+no_speech_threshold        = 0.6
 
 # ─── Mux ──────────────────────────────────────────────────────────────────────
 [[stages.mux.candidates]]

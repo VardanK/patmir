@@ -51,18 +51,27 @@ class FFmpegPadStretch:
         voice_lin = 10.0 ** (ctx.options.voice_gain_db / 20.0)
         music_lin = ctx.options.music_bed_gain
 
-        # Read the music bed. If the separate stage produced a non-speech-vocal
-        # stem (laughs / screams / grunts), mix it into the bed so those
-        # atmospheric sounds survive into the final dub.
+        # Music bed = accompaniment + full vocals stem ducked under the TTS
+        # audio. Outside TTS spans, the original vocal expressions (laughs,
+        # screams, breaths, un-ASR'd dialogue) survive. Inside, vocals are
+        # crossfaded to zero so the AR dub plays alone. The Silero-derived
+        # speech_vocals/non_speech_vocals split is unreliable on cartoon
+        # dialogue and is no longer used here.
         bed, sr = sf.read(str(separated.accompaniment), dtype="float32", always_2d=True)
-        if separated.non_speech_vocals is not None and separated.non_speech_vocals.exists():
-            nsv, nsv_sr = sf.read(str(separated.non_speech_vocals), dtype="float32", always_2d=True)
-            if nsv_sr == sr and nsv.shape == bed.shape:
-                bed = bed + nsv
         n_samples = bed.shape[0]
         n_channels = bed.shape[1]
 
+        vocals_arr: np.ndarray | None = None
+        if separated.vocals is not None and separated.vocals.exists():
+            v, vsr = sf.read(str(separated.vocals), dtype="float32", always_2d=True)
+            if vsr == sr and v.shape == bed.shape:
+                vocals_arr = v
+
         voice_track = np.zeros_like(bed)
+        duck_mask = np.ones(n_samples, dtype="float32")
+        fade = int(0.020 * sr)
+        fade_in_curve = 0.5 * (1 - np.cos(np.linspace(0, np.pi, fade, dtype="float32")))
+        fade_out_curve = fade_in_curve[::-1]
         total = len(synth.sentences) or 1
 
         for i, s in enumerate(synth.sentences):
@@ -85,8 +94,31 @@ class FFmpegPadStretch:
             # Spread mono voice across all bed channels.
             voice_track[start_sample:end_sample, :] += mono[:, None] * voice_lin
 
+            # Duck the original vocals across the full ASR sentence window
+            # (not just the TTS span). When TTS is shorter than the source
+            # utterance — common with the ±20% stretch cap on long
+            # sentences — the original speaker would otherwise continue
+            # talking after the AR voice finishes. The duck window is the
+            # union of [source_start, source_end] and [tts_start, tts_end].
+            if vocals_arr is not None:
+                src_end_sample = min(int(s.source_end * sr), n_samples)
+                duck_start = start_sample
+                duck_end = max(end_sample, src_end_sample)
+                duck_end = min(duck_end, n_samples)
+                a = min(fade, duck_end - duck_start)
+                if a > 0:
+                    duck_mask[duck_start:duck_start + a] = np.minimum(
+                        duck_mask[duck_start:duck_start + a], fade_out_curve[:a]
+                    )
+                    duck_mask[duck_end - a:duck_end] = np.minimum(
+                        duck_mask[duck_end - a:duck_end], fade_in_curve[:a]
+                    )
+                duck_mask[duck_start + a:duck_end - a] = 0.0
+
             ctx.progress("mux", (i + 1) / total, f"sentence {i + 1}/{total}")
 
+        if vocals_arr is not None:
+            bed = bed + vocals_arr * duck_mask[:, None]
         out_audio = bed * music_lin + voice_track
 
         # Peak normalize to -1 dBFS to prevent clipping after the sum.
