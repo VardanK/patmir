@@ -26,7 +26,19 @@ class PiperHye:
 
         self.voice = PiperVoice.load(str(onnx_path), config_path=str(config_path))
 
-    def synthesize(self, text: str) -> bytes:
+    def synthesize(
+        self,
+        text: str,
+        *,
+        ref_audio: Path | str | None = None,
+        ref_text: str | None = None,
+        guidance_scale: float | None = None,
+    ) -> bytes:
+        # Piper has a fixed voice — accept the per-call cloning/guidance
+        # kwargs from the adapter so the TTS-stage signature stays uniform,
+        # but ignore them. The adapter falls back to Piper for sentences
+        # that have no (speaker, emotion) reference clip available.
+        del ref_audio, ref_text, guidance_scale
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             self.voice.synthesize_wav(text, wf)

@@ -180,21 +180,21 @@ def backfill_ref_text(diarization: Diarization, transcript: Transcript) -> None:
     """Fill each SpeakerRef.ref_text in place by joining ASR words whose
     midpoint falls inside the reference window. Mutates `diarization.refs`.
 
-    Speakers whose ref window turns out to contain only non-lexical content
-    (laughter, bird chirps, single-word interjections) are removed from
-    `diarization.refs` entirely — the TTS adapter then falls back to the
-    global ref voice for that speaker's sentences. A SPEAKER_03 character
-    who only laughs in the source shouldn't seed their cloned voice with a
-    "Ха-ха-ха!" reference.
+    Refs whose backfilled text is empty or entirely non-lexical (laughter,
+    bird chirps, single-word interjections) are removed from the refs map
+    — the TTS adapter then falls back through the lookup chain
+    (exact → speaker-neutral → global default).
+
+    `diarization.refs` is keyed by `(speaker_id, emotion_bin)` in Phase 2.x.
     """
-    drop: list[str] = []
-    for spk, ref in diarization.refs.items():
+    drop: list[tuple[str, str]] = []
+    for key, ref in diarization.refs.items():
         words = [
             w for w in transcript.words
             if ref.source_start <= 0.5 * (w.start + w.end) < ref.source_end
         ]
         ref.ref_text = " ".join(w.text for w in words).strip()
         if not ref.ref_text or is_non_lexical(ref.ref_text):
-            drop.append(spk)
-    for spk in drop:
-        del diarization.refs[spk]
+            drop.append(key)
+    for key in drop:
+        del diarization.refs[key]

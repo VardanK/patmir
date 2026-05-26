@@ -51,14 +51,17 @@ class OmniVoiceMLXTTS:
         *,
         ref_audio: Path | str | None = None,
         ref_text: str | None = None,
+        guidance_scale: float | None = None,
     ) -> bytes:
         import mlx.core as mx  # lazy
 
-        # Per-sentence reference override — falls back to constructor defaults
-        # when not supplied. OmniVoice's `model.generate` already accepts the
-        # reference per call, so multi-voice cloning is a no-op refactor.
+        # Per-sentence overrides — fall back to constructor defaults when not
+        # supplied. OmniVoice's `model.generate` already accepts these per
+        # call, so per-emotion ref clips + per-emotion guidance is just a
+        # different kwarg per call.
         eff_ref_audio = str(ref_audio) if ref_audio is not None else self.ref_audio
         eff_ref_text = ref_text if ref_text is not None else self.ref_text
+        eff_guidance = guidance_scale if guidance_scale is not None else self.guidance_scale
 
         # `Model.generate` is a generator yielding GenerationResult chunks.
         chunks = list(
@@ -67,7 +70,7 @@ class OmniVoiceMLXTTS:
                 ref_audio=eff_ref_audio,
                 ref_text=eff_ref_text,
                 num_steps=self.num_steps,
-                guidance_scale=self.guidance_scale,
+                guidance_scale=eff_guidance,
                 language=self.language,
                 lang_code=self.lang_code,
             )

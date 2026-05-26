@@ -44,6 +44,7 @@ def write_transcript(job_dir: Path, transcript: Transcript) -> None:
                 "start": s.start,
                 "end": s.end,
                 "speaker_id": s.speaker_id,
+                "emotion": s.emotion,
                 "words": [asdict(w) for w in s.words],
             }
             for s in transcript.sentences
@@ -51,7 +52,10 @@ def write_transcript(job_dir: Path, transcript: Transcript) -> None:
     }
     (job_dir / "transcript.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
     sentences_only = [
-        {"idx": s.idx, "text": s.text, "start": s.start, "end": s.end, "speaker_id": s.speaker_id}
+        {
+            "idx": s.idx, "text": s.text, "start": s.start, "end": s.end,
+            "speaker_id": s.speaker_id, "emotion": s.emotion,
+        }
         for s in transcript.sentences
     ]
     (job_dir / "sentences.json").write_text(json.dumps(sentences_only, indent=2, ensure_ascii=False))

@@ -329,6 +329,7 @@ voice     = "hy-AM-Standard-A"
 ingest    = "ffmpeg"
 separate  = "htdemucs"
 diarize   = "pyannote_3_1"
+emotion   = "emotion2vec_plus_base"
 asr       = "whisper_large_v3_mlx_fp16"
 translate = "nllb_200_3.3b"
 tts       = "omnivoice_mlx_q8"
@@ -336,11 +337,37 @@ mux       = "ffmpeg_pad_stretch"
 output    = "mkv_default"
 
 [pipeline.options]
-stretch_cap       = 0.20    # max ±20% time-stretch ratio per sentence (preserves pitch)
-asr_int8          = true
-keep_intermediate = true
-music_bed_gain    = 0.6     # accompaniment level under the AR voice (1.0 = unchanged)
-voice_gain_db     = 0.0     # extra dB applied to the AR voice over its native level
+stretch_cap            = 0.20    # max ±20% time-stretch ratio per sentence (preserves pitch)
+asr_int8               = true
+keep_intermediate      = true
+music_bed_gain         = 0.6     # accompaniment level under the AR voice (1.0 = unchanged)
+voice_gain_db          = 0.0     # extra dB applied to the AR voice over its native level
+min_ref_seconds        = 3.0     # shortest clean turn that qualifies as a (speaker, emotion) ref clip
+sentence_afade_seconds = 0.05    # per-sentence fade in/out on the AR voice (suppresses boundary bleed — quality issue #4)
+
+# Maps emotion2vec's 9 classes → 5 ref-clip bins. Each key is a SER class
+# label (lowercase, English); each value is the bin name. Bins are:
+# neutral | happy | sad | angry | fearful.
+[emotion_bins]
+angry      = "angry"
+disgusted  = "angry"
+fearful    = "fearful"
+happy      = "happy"
+neutral    = "neutral"
+other      = "neutral"
+sad        = "sad"
+surprised  = "happy"
+unknown    = "neutral"
+
+# OmniVoice `guidance_scale` per emotion bin (higher = more faithful to ref
+# + text; lower = more freedom). The TTS adapter looks this up per sentence
+# and overrides the OmniVoice constructor default for that one call.
+[emotion_guidance]
+neutral = 0.7
+happy   = 0.9
+sad     = 0.6
+angry   = 0.9
+fearful = 0.8
 
 # ─── Ingest ───────────────────────────────────────────────────────────────────
 [[stages.ingest.candidates]]
@@ -370,8 +397,21 @@ model_id        = "pyannote/speaker-diarization-3.1"
 device          = "auto"   # auto → cuda > mps > cpu; pyannote MPS coverage is partial, set "cpu" if it crashes
 min_speakers    = 0        # 0 = let pyannote estimate
 max_speakers    = 8
-min_ref_seconds = 3.0      # shortest clean turn we'll accept as a per-speaker reference clip
 hf_token_env    = "HF_TOKEN"
+# Note: ref-clip slicing is no longer done in this stage — it runs in the
+# runner after the `emotion` stage, so per-(speaker, emotion) ref clips
+# can be picked. `min_ref_seconds` lives under `[pipeline.options]` now.
+
+# ─── Emotion (speech emotion recognition; Phase 2.x) ──────────────────────────
+# Runs on the Demucs vocal stem per diarization turn. Outputs feed two
+# downstream consumers: ref_picker (chooses per-(speaker, emotion) clips)
+# and apply_emotion_tags (tags each ASR sentence with its dominant emotion).
+[[stages.emotion.candidates]]
+id             = "emotion2vec_plus_base"
+module         = "patmir.pipeline.stages.emotion.emotion2vec"
+model_id       = "iic/emotion2vec_plus_base"
+device         = "auto"
+min_confidence = 0.5   # below this, the prediction is reassigned to "neutral"
 
 # ─── ASR ──────────────────────────────────────────────────────────────────────
 [[stages.asr.candidates]]

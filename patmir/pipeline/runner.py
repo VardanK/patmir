@@ -138,6 +138,35 @@ def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobCont
     if name == "diarize":
         sep = state["separate"]
         return stage_obj.diarize(sep, ctx)  # type: ignore[arg-type]
+    if name == "emotion":
+        # Detect per-turn emotion on the source vocal stem, then populate
+        # `Diarization.refs` here in the runner via `ref_picker.pick_refs` —
+        # the diarize stage couldn't do this earlier because it didn't know
+        # each turn's emotion bin yet. See ref_picker.pick_refs docstring.
+        sep = state["separate"]
+        diar = state["diarize"]
+        if not isinstance(sep, SeparatedAudio) or not isinstance(diar, Diarization):
+            return []
+        predictions = stage_obj.detect(sep, diar, ctx)  # type: ignore[arg-type]
+        ctx.extra["emotion_predictions"] = predictions
+
+        # Now slice per-(speaker, emotion) reference clips.
+        from patmir.pipeline.stages.diarize.ref_picker import pick_refs
+        refs_dir = ctx.job_dir / "diarize" / "refs"
+        speech_for_refs = sep.speech_vocals or sep.vocals
+        diar.refs = pick_refs(
+            turns=diar.turns,
+            overlaps=diar.overlaps,
+            predictions=predictions,
+            speech_vocals=speech_for_refs,
+            refs_dir=refs_dir,
+            min_ref_seconds=ctx.options.min_ref_seconds,
+        )
+        # Persist the now-filled refs (text empty for now — backfilled post-ASR).
+        _write_refs_json(ctx, diar)
+        # Rewrite turns.json so each turn carries its assigned emotion bin.
+        _write_turns_json(ctx, diar)
+        return predictions
     if name == "asr":
         # Transcribe the FULL vocal stem (not the VAD-masked speech stem) —
         # the hard mask was clipping soft-onset speech. Instead, we expose
@@ -164,6 +193,7 @@ def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobCont
         transcript = stage_obj.transcribe(audio_for_asr, ctx)
         if isinstance(diar, Diarization):
             from patmir.pipeline.stages.asr._sentence import write_transcript
+            from patmir.pipeline.stages.asr.emotion_tag import apply_emotion_tags
             from patmir.pipeline.stages.asr.gap_filler import fill_gaps
             from patmir.pipeline.stages.asr.speaker_tag import (
                 apply_speaker_tags,
@@ -186,8 +216,15 @@ def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobCont
                 added = len(transcript.sentences) - before
                 if added > 0:
                     transcript = apply_speaker_tags(transcript, diar)
+            # Tag each sentence with its dominant emotion bin from the
+            # per-turn predictions emitted by the emotion stage. No-op when
+            # the emotion stage didn't run (e.g. resume from a pre-Phase-2.x
+            # job).
+            predictions = ctx.extra.get("emotion_predictions")
+            if predictions:
+                transcript = apply_emotion_tags(transcript, predictions)
             backfill_ref_text(diar, transcript)
-            _rewrite_refs_json(ctx, diar)
+            _write_refs_json(ctx, diar)
             # Persist the speaker-tagged + re-indexed transcript (overrides the
             # candidate's first write that lacked speaker_id and didn't have splits).
             write_transcript(ctx.job_dir, transcript)
@@ -224,19 +261,73 @@ def _record_artifacts(name: str, output: object, st, job_dir: Path) -> None:
     # Stages with list outputs (transcript, translated, synth) drop sidecar JSONs already.
 
 
-def _rewrite_refs_json(ctx: JobContext, diar) -> None:
-    """Persist the now-backfilled SpeakerRef.ref_text values to refs.json."""
+_REFS_KEY_SEP = "__"
+
+
+def _refs_key(speaker_id: str, emotion: str) -> str:
+    """Encode a (speaker, emotion) tuple as a JSON-portable string key.
+
+    pyannote's speaker labels are `SPEAKER_00`-style and don't contain `__`,
+    so the separator is safe.
+    """
+    return f"{speaker_id}{_REFS_KEY_SEP}{emotion}"
+
+
+def _parse_refs_key(key: str) -> tuple[str, str]:
+    """Inverse of `_refs_key`. Falls back to a `(key, "neutral")` tuple for
+    legacy single-speaker keys produced by pre-Phase-2.x runs."""
+    if _REFS_KEY_SEP in key:
+        spk, emo = key.rsplit(_REFS_KEY_SEP, 1)
+        return spk, emo
+    return key, "neutral"
+
+
+def _write_turns_json(ctx: JobContext, diar) -> None:
+    """Rewrite `diarize/turns.json` so each turn carries its emotion bin.
+
+    The diarize stage writes a first version without emotion; the runner
+    overwrites it after the emotion stage tags every turn.
+    """
+    turns_json = ctx.job_dir / "diarize" / "turns.json"
+    if not turns_json.parent.exists():
+        return
+    existing = {}
+    if turns_json.exists():
+        try:
+            existing = json.loads(turns_json.read_text())
+        except json.JSONDecodeError:
+            existing = {}
+    existing["turns"] = [
+        {"start": t.start, "end": t.end, "speaker_id": t.speaker_id, "emotion": t.emotion}
+        for t in diar.turns
+    ]
+    existing.setdefault("overlaps", [
+        {"start": o.start, "end": o.end} for o in diar.overlaps
+    ])
+    turns_json.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+
+
+def _write_refs_json(ctx: JobContext, diar) -> None:
+    """Persist `Diarization.refs` to `diarize/refs.json`.
+
+    Keys are encoded as `"speaker__emotion"`. Called twice per job:
+    once from the `emotion` stage (right after `pick_refs` populates the
+    refs map; `ref_text` is empty), and once from the `asr` branch (after
+    `backfill_ref_text` fills in the text and prunes non-lexical refs).
+    """
     refs_json = ctx.job_dir / "diarize" / "refs.json"
     if not refs_json.parent.exists():
         return
     refs_json.write_text(json.dumps({
-        spk: {
+        _refs_key(spk, emo): {
+            "speaker_id": spk,
+            "emotion": emo,
             "ref_audio": str(r.ref_audio),
             "ref_text": r.ref_text,
             "source_start": r.source_start,
             "source_end": r.source_end,
         }
-        for spk, r in diar.refs.items()
+        for (spk, emo), r in diar.refs.items()
     }, indent=2, ensure_ascii=False))
 
 
@@ -282,13 +373,22 @@ def _load_resume_artifact(name: str, job_dir: Path, ctx: JobContext):
         if not turns_path.exists():
             return None
         td = json.loads(turns_path.read_text())
-        turns = [SpeakerTurn(start=t["start"], end=t["end"], speaker_id=t["speaker_id"]) for t in td["turns"]]
+        turns = [
+            SpeakerTurn(
+                start=t["start"], end=t["end"],
+                speaker_id=t["speaker_id"],
+                emotion=t.get("emotion"),
+            )
+            for t in td["turns"]
+        ]
         overlaps = [OverlapInterval(start=o["start"], end=o["end"]) for o in td.get("overlaps", [])]
-        refs: dict[str, SpeakerRef] = {}
+        refs: dict[tuple[str, str], SpeakerRef] = {}
         if refs_path.exists():
             rd = json.loads(refs_path.read_text())
-            for spk, r in rd.items():
-                refs[spk] = SpeakerRef(
+            for key, r in rd.items():
+                spk = r.get("speaker_id") or _parse_refs_key(key)[0]
+                emo = r.get("emotion") or _parse_refs_key(key)[1]
+                refs[(spk, emo)] = SpeakerRef(  # type: ignore[index]
                     speaker_id=spk,
                     ref_audio=Path(r["ref_audio"]),
                     ref_text=r.get("ref_text", ""),
@@ -303,6 +403,23 @@ def _load_resume_artifact(name: str, job_dir: Path, ctx: JobContext):
         diar = Diarization(turns=turns, overlaps=overlaps, refs=refs, sample_rate=sample_rate)
         ctx.extra["diarization"] = diar
         return diar
+    if name == "emotion":
+        seg_path = job_dir / "emotion" / "segments.json"
+        if not seg_path.exists():
+            return []
+        from patmir.pipeline.stage import EmotionPrediction
+        data = json.loads(seg_path.read_text())
+        predictions = [
+            EmotionPrediction(
+                start=float(p["start"]),
+                end=float(p["end"]),
+                emotion=p["emotion"],
+                confidence=float(p.get("confidence", 0.0)),
+            )
+            for p in data.get("predictions", [])
+        ]
+        ctx.extra["emotion_predictions"] = predictions
+        return predictions
     if name == "asr":
         data = json.loads((job_dir / "transcript.json").read_text())
         ctx.source_lang = data["language"]
@@ -315,6 +432,7 @@ def _load_resume_artifact(name: str, job_dir: Path, ctx: JobContext):
                 end=s["end"],
                 words=[Word(**w) for w in s["words"]],
                 speaker_id=s.get("speaker_id"),
+                emotion=s.get("emotion"),
             )
             for s in data["sentences"]
         ]

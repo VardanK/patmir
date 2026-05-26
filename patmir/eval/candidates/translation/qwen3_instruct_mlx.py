@@ -48,15 +48,27 @@ class Qwen3InstructTranslator:
         self.repetition_penalty = repetition_penalty
         self.no_think = no_think
 
-    def translate(self, text: str, source_lang: str) -> str:
+    def translate(self, text: str, source_lang: str, emotion: str | None = None) -> str:
         from mlx_lm import generate  # lazy
         from mlx_lm.sample_utils import make_logits_processors, make_sampler  # lazy
 
         src_name = _LANG_NAME.get(source_lang, source_lang)
-        user_msg = (
-            f"Translate this {src_name} sentence into Eastern Armenian:\n\n"
-            f"{text}"
-        )
+        if emotion and emotion != "neutral":
+            # The system prompt already directs Qwen3 to "preserve tone,
+            # register, and emotion"; the per-sentence tag tells it *which*
+            # emotion the source sentence carries, so the Armenian phrasing
+            # can match. Skip for neutral — adding "with emotion: neutral"
+            # tends to flatten the translation rather than help.
+            user_msg = (
+                f"Translate this {src_name} sentence into Eastern Armenian. "
+                f"The speaker's emotion is {emotion}; reflect that tone in the Armenian phrasing.\n\n"
+                f"{text}"
+            )
+        else:
+            user_msg = (
+                f"Translate this {src_name} sentence into Eastern Armenian:\n\n"
+                f"{text}"
+            )
         if self.no_think:
             user_msg += " /no_think"
 

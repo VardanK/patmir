@@ -72,6 +72,16 @@ class FFmpegPadStretch:
         fade = int(0.020 * sr)
         fade_in_curve = 0.5 * (1 - np.cos(np.linspace(0, np.pi, fade, dtype="float32")))
         fade_out_curve = fade_in_curve[::-1]
+        # Per-sentence afade applied to the synthesized voice itself (not the
+        # duck mask) to suppress the original-voice bleed reported as quality
+        # issue #4. The cause is that ASR sentence boundaries are word-aligned
+        # but the duck-mask boundaries are AR-audio-aligned — there's a small
+        # window at the start/end of each synthesized line where the original
+        # vocal isn't yet fully ducked but the AR voice has already begun /
+        # has just ended. A short cosine fade on the AR audio itself softens
+        # those transitions enough that the bleed becomes inaudible.
+        sentence_fade_seconds = float(getattr(ctx.options, "sentence_afade_seconds", 0.05))
+        sentence_fade = max(0, int(sentence_fade_seconds * sr))
         total = len(synth.sentences) or 1
 
         for i, s in enumerate(synth.sentences):
@@ -91,6 +101,14 @@ class FFmpegPadStretch:
                 end_sample = n_samples
 
             mono = audio  # voice is mono
+            # Apply per-sentence afade in/out on the AR voice — see issue #4.
+            n_aud = len(mono)
+            if sentence_fade > 0 and n_aud > 2 * sentence_fade:
+                fin = 0.5 * (1 - np.cos(np.linspace(0, np.pi, sentence_fade, dtype="float32")))
+                fout = fin[::-1]
+                mono = mono.copy()
+                mono[:sentence_fade] *= fin
+                mono[-sentence_fade:] *= fout
             # Spread mono voice across all bed channels.
             voice_track[start_sample:end_sample, :] += mono[:, None] * voice_lin
 

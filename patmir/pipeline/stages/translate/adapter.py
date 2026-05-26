@@ -32,9 +32,23 @@ class SentenceTranslator:
         source_lang = ctx.source_lang or transcript.language
         sentences: list[TranslatedSentence] = []
         total = len(transcript.sentences) or 1
+        # Some inner translators (e.g. Qwen3-Instruct-MLX) accept an `emotion`
+        # kwarg and inject it into the per-sentence prompt; NLLB ignores it.
+        # Probe once via the function signature.
+        import inspect
+        try:
+            inner_sig = inspect.signature(self.inner.translate)
+            inner_accepts_emotion = "emotion" in inner_sig.parameters
+        except (TypeError, ValueError):
+            inner_accepts_emotion = False
 
         for i, s in enumerate(transcript.sentences):
-            target_text = self.inner.translate(s.text, source_lang=source_lang)
+            if inner_accepts_emotion:
+                target_text = self.inner.translate(
+                    s.text, source_lang=source_lang, emotion=s.emotion,
+                )
+            else:
+                target_text = self.inner.translate(s.text, source_lang=source_lang)
             sentences.append(TranslatedSentence(
                 idx=s.idx,
                 source_text=s.text,
@@ -42,6 +56,7 @@ class SentenceTranslator:
                 start=s.start,
                 end=s.end,
                 speaker_id=s.speaker_id,
+                emotion=s.emotion,
             ))
             ctx.progress("translate", (i + 1) / total, f"sentence {i + 1}/{total}")
 

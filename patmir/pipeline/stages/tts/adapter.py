@@ -41,8 +41,22 @@ class SentenceTTS:
             sig = inspect.signature(inner.synthesize)
             params = sig.parameters
             self._supports_ref = "ref_audio" in params and "ref_text" in params
+            self._supports_guidance = "guidance_scale" in params
         except (TypeError, ValueError):
             self._supports_ref = False
+            self._supports_guidance = False
+
+    def _lookup_ref(self, diarization: Diarization | None, speaker_id: str | None, emotion: str | None):
+        """Apply the fallback chain: (spk, emo) → (spk, "neutral") → None."""
+        if diarization is None or not speaker_id:
+            return None
+        emo = emotion or "neutral"
+        ref = diarization.refs.get((speaker_id, emo))
+        if ref is None and emo != "neutral":
+            ref = diarization.refs.get((speaker_id, "neutral"))
+        if ref is not None and ref.ref_text.strip():
+            return ref
+        return None
 
     def synthesize(self, translated: TranslatedTranscript, ctx: JobContext) -> SynthesizedAudio:
         out_dir = ctx.job_dir / "tts"
@@ -57,21 +71,20 @@ class SentenceTTS:
         for i, s in enumerate(translated.sentences):
             if not s.target_text.strip():
                 continue
-            ref_audio = None
-            ref_text = None
-            if self._supports_ref and diarization is not None and s.speaker_id:
-                ref = diarization.refs.get(s.speaker_id)
-                if ref is not None and ref.ref_text.strip():
-                    ref_audio = ref.ref_audio
-                    ref_text = ref.ref_text
+            ref = self._lookup_ref(diarization, s.speaker_id, s.emotion) if self._supports_ref else None
+            ref_audio = ref.ref_audio if ref is not None else None
+            ref_text = ref.ref_text if ref is not None else None
+
+            kwargs: dict[str, Any] = {}
             if self._supports_ref:
-                wav_bytes = self.inner.synthesize(
-                    s.target_text,
-                    ref_audio=ref_audio,
-                    ref_text=ref_text,
-                )
-            else:
-                wav_bytes = self.inner.synthesize(s.target_text)
+                kwargs["ref_audio"] = ref_audio
+                kwargs["ref_text"] = ref_text
+            if self._supports_guidance and s.emotion:
+                gs = ctx.options.emotion_guidance.get(s.emotion)
+                if gs is not None:
+                    kwargs["guidance_scale"] = gs
+
+            wav_bytes = self.inner.synthesize(s.target_text, **kwargs)
             wav_path = out_dir / f"{s.idx:04d}.wav"
             wav_path.write_bytes(wav_bytes)
             sr, duration = _wav_header_meta(wav_bytes)

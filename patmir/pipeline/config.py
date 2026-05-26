@@ -30,6 +30,7 @@ _STAGE_NAMESPACE: dict[str, tuple[str, str]] = {
     "ingest":    ("stages", "ingest"),
     "separate":  ("stages", "separate"),
     "diarize":   ("stages", "diarize"),
+    "emotion":   ("stages", "emotion"),
     "asr":       ("stages", "asr"),
     "translate": ("eval", "translation"),
     "tts":       ("eval", "tts"),
@@ -110,12 +111,26 @@ def load_pipeline_config(config_path: Path, *, skip_before: str | None = None) -
         raise RuntimeError(f"[pipeline] is missing selectors for: {missing}")
 
     opts_raw = pipe.get("options", {}) or {}
+    # Emotion guidance lives in a top-level [emotion_guidance] table (not
+    # under [pipeline.options]) because it's a per-bin lookup table, not a
+    # scalar option. Merge user overrides on top of the defaults.
+    guidance_raw = toml.get("emotion_guidance", {}) or {}
+    from patmir.pipeline.context import _DEFAULT_EMOTION_GUIDANCE
+    emotion_guidance: dict[str, float] = dict(_DEFAULT_EMOTION_GUIDANCE)
+    for k, v in guidance_raw.items():
+        try:
+            emotion_guidance[str(k)] = float(v)
+        except (TypeError, ValueError):
+            pass
     options = PipelineOptions(
         stretch_cap=float(opts_raw.get("stretch_cap", 0.20)),
         asr_int8=bool(opts_raw.get("asr_int8", True)),
         keep_intermediate=bool(opts_raw.get("keep_intermediate", True)),
         music_bed_gain=float(opts_raw.get("music_bed_gain", 0.6)),
         voice_gain_db=float(opts_raw.get("voice_gain_db", 0.0)),
+        min_ref_seconds=float(opts_raw.get("min_ref_seconds", 3.0)),
+        sentence_afade_seconds=float(opts_raw.get("sentence_afade_seconds", 0.05)),
+        emotion_guidance=emotion_guidance,
     )
 
     start_idx = STAGE_ORDER.index(skip_before) if skip_before else 0

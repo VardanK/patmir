@@ -12,9 +12,13 @@ in scream/laugh regions).
 Overlap regions come straight from `Annotation.get_overlap()` — pyannote
 detects overlapped speech as part of segmentation.
 
-Reference clip slicing is delegated to `ref_picker.pick_refs`. `ref_text`
-is left empty here and backfilled by the runner once ASR has produced
-word-level timestamps.
+Reference clip slicing is **not** done here (Phase 2.x change). The
+`emotion` stage runs between `diarize` and `asr`, and ref clips need the
+per-turn emotion bin to be picked correctly (one ref per `(speaker,
+emotion)` cell). So this stage writes `turns.json` + overlaps and returns
+a `Diarization` with `refs = {}`; the runner calls `ref_picker.pick_refs`
+after the emotion stage returns. `ref_text` is then backfilled by the
+runner after ASR runs.
 
 HF token: read from the env var named by `hf_token_env` (default `HF_TOKEN`).
 Falls back to the `hf auth login` cached token if the env var is unset.
@@ -36,7 +40,6 @@ from patmir.pipeline.stage import (
     SeparatedAudio,
     SpeakerTurn,
 )
-from patmir.pipeline.stages.diarize.ref_picker import pick_refs
 
 
 def _resolve_device(requested: str) -> str:
@@ -161,35 +164,15 @@ class PyannoteDiarize:
             "overlaps": [{"start": ov.start, "end": ov.end} for ov in overlaps],
         }, indent=2))
 
-        ctx.progress("diarize", 0.90, f"{len(speakers)} speakers, slicing refs")
+        ctx.progress("diarize", 1.0, f"{len(speakers)} speakers, {len(kept)} turns")
 
-        refs_dir = diarize_dir / "refs"
-        speech_for_refs = separated.speech_vocals or separated.vocals
-        refs = pick_refs(
-            turns=kept,
-            overlaps=overlaps,
-            speech_vocals=speech_for_refs,
-            refs_dir=refs_dir,
-            min_ref_seconds=self.min_ref_seconds,
-        )
-
-        # Persist refs.json (ref_text empty for now — backfilled post-ASR).
-        (diarize_dir / "refs.json").write_text(json.dumps({
-            spk: {
-                "ref_audio": str(r.ref_audio),
-                "ref_text": r.ref_text,
-                "source_start": r.source_start,
-                "source_end": r.source_end,
-            }
-            for spk, r in refs.items()
-        }, indent=2, ensure_ascii=False))
-
-        ctx.progress("diarize", 1.0, f"{len(refs)}/{len(speakers)} speakers have ref clips")
-
+        # `refs` is intentionally empty — the runner populates it after the
+        # `emotion` stage runs, since per-(speaker, emotion) ref clips need
+        # the per-turn emotion bin to be picked.
         return Diarization(
             turns=kept,
             overlaps=overlaps,
-            refs=refs,
+            refs={},
             sample_rate=separated.sample_rate,
         )
 

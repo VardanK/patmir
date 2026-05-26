@@ -171,7 +171,7 @@ def _print_summary(m: Manifest) -> None:
 
 
 def _print_diarize_summary(m: Manifest) -> None:
-    """Surface speaker count and per-speaker ref-clip durations when diarize ran."""
+    """Surface speaker count + per-(speaker, emotion) ref-clip coverage."""
     job_dir = RUNS_ROOT / m.job_id
     turns_path = job_dir / "diarize" / "turns.json"
     refs_path = job_dir / "diarize" / "refs.json"
@@ -188,18 +188,45 @@ def _print_diarize_summary(m: Manifest) -> None:
             refs = json.loads(refs_path.read_text())
         except (OSError, json.JSONDecodeError):
             refs = {}
+    # Group refs by speaker — keys are "speaker__emotion" strings in Phase 2.x.
+    by_spk: dict[str, list[tuple[str, dict]]] = {}
+    for key, r in refs.items():
+        spk = r.get("speaker_id")
+        emo = r.get("emotion") or "neutral"
+        if not spk and "__" in key:
+            spk, emo = key.rsplit("__", 1)
+        elif not spk:
+            spk = key
+        by_spk.setdefault(spk, []).append((emo, r))
+
     print()
     print(f"diarize: {len(speakers)} speaker(s)")
     for spk in speakers:
-        r = refs.get(spk)
-        if r:
+        spk_refs = sorted(by_spk.get(spk, []))
+        if not spk_refs:
+            print(f"  {spk}: no clean reference clip — using global fallback voice")
+            continue
+        bins = ", ".join(e for e, _ in spk_refs)
+        print(f"  {spk}: {len(spk_refs)} bin(s) — {bins}")
+        for emo, r in spk_refs:
             dur = float(r["source_end"]) - float(r["source_start"])
             text = (r.get("ref_text") or "").strip().replace("\n", " ")
             if len(text) > 60:
                 text = text[:57] + "..."
-            print(f"  {spk}: ref {dur:.1f}s — {text}")
-        else:
-            print(f"  {spk}: no clean reference clip — using global fallback voice")
+            print(f"    [{emo}] {dur:.1f}s — {text}")
+
+    # Per-sentence emotion coverage (from transcript.json).
+    transcript_path = job_dir / "transcript.json"
+    if transcript_path.exists():
+        try:
+            td = json.loads(transcript_path.read_text())
+            from collections import Counter
+            emo_counts = Counter(s.get("emotion") for s in td.get("sentences", []) if s.get("emotion"))
+            if emo_counts:
+                print(f"emotion (sentences): " + ", ".join(
+                    f"{e}={n}" for e, n in emo_counts.most_common()))
+        except (OSError, json.JSONDecodeError):
+            pass
 
 
 def _state_glyph(state: str) -> str:

@@ -7,10 +7,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from patmir.pipeline.context import JobContext
+
+
+# ─── emotion ─────────────────────────────────────────────────────────────────
+
+Emotion = Literal["neutral", "happy", "sad", "angry", "fearful"]
+"""Coarse emotion bins used for per-(speaker, emotion) ref-clip selection and
+per-emotion TTS guidance. The full 9-class output from emotion2vec collapses
+to these 5 bins via the [emotion_bins] table in patmir.toml.
+"""
 
 
 # ─── inter-stage data contracts ───────────────────────────────────────────────
@@ -53,10 +62,32 @@ class SeparatedAudio:
 
 @dataclass
 class SpeakerTurn:
-    """A single contiguous span attributed to one speaker by the diarizer."""
+    """A single contiguous span attributed to one speaker by the diarizer.
+
+    `emotion` is filled by the runner after the `emotion` stage runs — it's
+    the dominant predicted emotion bin over this turn's window.
+    """
     start: float
     end: float
     speaker_id: str
+    emotion: Emotion | None = None
+
+
+@dataclass
+class EmotionPrediction:
+    """Per-turn (or per-window) speech-emotion-recognition output.
+
+    `emotion` is one of the 5 collapsed bins (post `[emotion_bins]` mapping).
+    `confidence` is the SER model's softmax probability for the winning class
+    *before* any confidence floor is applied — predictions below the
+    `min_confidence` config threshold are reassigned to `"neutral"` at the
+    candidate level (not here), so this dataclass always carries the
+    post-floor effective label.
+    """
+    start: float
+    end: float
+    emotion: Emotion
+    confidence: float
 
 
 @dataclass
@@ -81,9 +112,18 @@ class SpeakerRef:
 
 @dataclass
 class Diarization:
+    """Output of the diarize stage + the runner's post-emotion ref-picker.
+
+    `refs` is keyed by `(speaker_id, emotion_bin)` in Phase 2.x. It's empty
+    when the diarize stage returns — the runner populates it after the
+    emotion stage runs, since picking the right ref per (speaker, emotion)
+    requires knowing each turn's dominant emotion.
+
+    JSON serialization keys these tuples as `"speaker__emotion"` strings.
+    """
     turns: list[SpeakerTurn]
     overlaps: list[OverlapInterval]
-    refs: dict[str, SpeakerRef]
+    refs: dict[tuple[str, Emotion], SpeakerRef]
     sample_rate: int
 
 
@@ -102,6 +142,7 @@ class Sentence:
     end: float
     words: list[Word] = field(default_factory=list)
     speaker_id: str | None = None
+    emotion: Emotion | None = None
 
 
 @dataclass
@@ -119,6 +160,7 @@ class TranslatedSentence:
     start: float
     end: float
     speaker_id: str | None = None
+    emotion: Emotion | None = None
 
 
 @dataclass
@@ -174,6 +216,16 @@ class DiarizeStage(Protocol):
 
 
 @runtime_checkable
+class EmotionStage(Protocol):
+    def detect(
+        self,
+        separated: SeparatedAudio,
+        diarization: Diarization,
+        ctx: "JobContext",
+    ) -> list[EmotionPrediction]: ...
+
+
+@runtime_checkable
 class ASRStage(Protocol):
     def transcribe(self, audio: AudioTrack, ctx: "JobContext") -> Transcript: ...
 
@@ -214,6 +266,7 @@ STAGE_ORDER: tuple[str, ...] = (
     "ingest",
     "separate",
     "diarize",
+    "emotion",
     "asr",
     "translate",
     "tts",

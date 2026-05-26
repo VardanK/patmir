@@ -1,16 +1,25 @@
-"""Per-speaker reference clip picker.
+"""Per-`(speaker, emotion)` reference clip picker.
 
-Given the pyannote turn list, the overlap intervals, and the VAD-masked
-`speech_vocals` stem, pick one reference window per speaker — the longest
-turn that
+Phase 2 originally picked one ref clip per speaker. Phase 2.x picks one per
+`(speaker, emotion_bin)` so OmniVoice can swap to a matching emotional ref
+clip per sentence. This module owns:
 
-  (a) does not intersect any overlap region,
-  (b) is at least `min_ref_seconds` long after trimming 100 ms inward each side.
+1. Binning each diarization turn by dominant emotion (uses the per-turn
+   `EmotionPrediction` list emitted by the `emotion` stage).
+2. Picking, per `(speaker, emotion)` cell, the longest turn that:
+     (a) is the dominant emotion for that cell (or has any overlap with that
+         emotion when there's only one matching turn — see `_dominant_bin`),
+     (b) does not intersect any overlap region,
+     (c) is at least `min_ref_seconds` long after trimming 100 ms inward each side.
+3. Slicing the chosen window out of `speech_vocals` (cleaner than `vocals`),
+   resampling to 16 kHz mono, and writing it as
+   `<refs_dir>/<speaker>/<emotion>.wav`.
 
-The slice is resampled to 16 kHz mono and written as `<refs_dir>/<spk>.wav`.
+Fallback chain at TTS lookup time (handled by `tts/adapter.py`, not here):
+`refs[(spk, emo)] → refs[(spk, "neutral")] → global default ref`.
 
-`ref_text` is filled in later by `runner._backfill_ref_text` — we don't have
-ASR words yet at diarize time.
+`ref_text` is filled in later by `runner._backfill_ref_text` — ASR words
+aren't available at the time this runs.
 """
 from __future__ import annotations
 
@@ -19,7 +28,13 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from patmir.pipeline.stage import OverlapInterval, SpeakerRef, SpeakerTurn
+from patmir.pipeline.stage import (
+    Emotion,
+    EmotionPrediction,
+    OverlapInterval,
+    SpeakerRef,
+    SpeakerTurn,
+)
 
 REF_SR = 16_000
 EDGE_TRIM_SEC = 0.100
@@ -43,33 +58,70 @@ def _resample_linear(mono: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return np.interp(x_new, x_old, mono).astype("float32")
 
 
+def _dominant_bin(turn: SpeakerTurn, predictions: list[EmotionPrediction]) -> Emotion:
+    """Find the dominant emotion bin overlapping this turn.
+
+    Emotion predictions are produced per-turn (they share endpoints with the
+    diarizer's turns), so the simple case is a direct lookup. The general
+    code path measures temporal overlap so it stays correct if the emotion
+    stage is ever changed to produce windowed (non-turn-aligned) predictions.
+    """
+    weight: dict[Emotion, float] = {}
+    for p in predictions:
+        lo = max(turn.start, p.start)
+        hi = min(turn.end, p.end)
+        if hi > lo:
+            weight[p.emotion] = weight.get(p.emotion, 0.0) + (hi - lo)
+    if not weight:
+        return "neutral"
+    return max(weight, key=lambda e: weight[e])
+
+
+def tag_turns_with_emotion(
+    turns: list[SpeakerTurn],
+    predictions: list[EmotionPrediction],
+) -> list[SpeakerTurn]:
+    """Return a new turn list with `emotion` populated from predictions.
+
+    Mutates in-place AND returns the list for caller convenience.
+    """
+    for t in turns:
+        t.emotion = _dominant_bin(t, predictions)
+    return turns
+
+
 def pick_refs(
     *,
     turns: list[SpeakerTurn],
     overlaps: list[OverlapInterval],
+    predictions: list[EmotionPrediction],
     speech_vocals: Path,
     refs_dir: Path,
     min_ref_seconds: float,
-) -> dict[str, SpeakerRef]:
-    """Pick + slice one reference clip per speaker.
+) -> dict[tuple[str, Emotion], SpeakerRef]:
+    """Pick + slice one reference clip per `(speaker, emotion)` cell.
 
-    Speakers with no qualifying turn are omitted from the result; the TTS
-    adapter falls back to the global ref for them.
+    Cells with no qualifying turn are omitted — the TTS adapter's lookup
+    fallback chain handles the missing case (exact → speaker-neutral →
+    global default).
     """
     refs_dir.mkdir(parents=True, exist_ok=True)
 
+    # Bin every turn by its dominant emotion (mutates turn.emotion).
+    tag_turns_with_emotion(turns, predictions)
+
     audio, src_sr = sf.read(str(speech_vocals), dtype="float32", always_2d=True)
-    # Downmix to mono — cloning refs are mono and pyannote+OmniVoice both prefer it.
     mono_full = audio.mean(axis=1)
 
-    by_speaker: dict[str, list[SpeakerTurn]] = {}
+    # Group turns by (speaker, emotion).
+    cells: dict[tuple[str, Emotion], list[SpeakerTurn]] = {}
     for t in turns:
-        by_speaker.setdefault(t.speaker_id, []).append(t)
+        if t.emotion is None:
+            continue
+        cells.setdefault((t.speaker_id, t.emotion), []).append(t)
 
-    out: dict[str, SpeakerRef] = {}
-    for spk, spk_turns in by_speaker.items():
-        # Trim each turn by EDGE_TRIM_SEC, drop ones intersecting overlaps,
-        # drop ones too short after trimming.
+    out: dict[tuple[str, Emotion], SpeakerRef] = {}
+    for (spk, emo), spk_turns in cells.items():
         eligible: list[tuple[float, float]] = []
         for t in spk_turns:
             s = t.start + EDGE_TRIM_SEC
@@ -81,7 +133,7 @@ def pick_refs(
             eligible.append((s, e))
         if not eligible:
             continue
-        # Pick the longest.
+
         s, e = max(eligible, key=lambda se: se[1] - se[0])
         i0 = max(0, int(s * src_sr))
         i1 = min(len(mono_full), int(e * src_sr))
@@ -89,9 +141,12 @@ def pick_refs(
             continue
         slice_mono = mono_full[i0:i1]
         slice_16k = _resample_linear(slice_mono, src_sr, REF_SR)
-        ref_path = refs_dir / f"{spk}.wav"
+
+        spk_dir = refs_dir / spk
+        spk_dir.mkdir(exist_ok=True)
+        ref_path = spk_dir / f"{emo}.wav"
         sf.write(str(ref_path), slice_16k, REF_SR, subtype="PCM_16")
-        out[spk] = SpeakerRef(
+        out[(spk, emo)] = SpeakerRef(
             speaker_id=spk,
             ref_audio=ref_path,
             ref_text="",  # backfilled after ASR

@@ -13,6 +13,15 @@ from pathlib import Path
 from typing import Any
 
 
+_DEFAULT_EMOTION_GUIDANCE: dict[str, float] = {
+    "neutral": 0.7,
+    "happy":   0.9,
+    "sad":     0.6,
+    "angry":   0.9,
+    "fearful": 0.8,
+}
+
+
 @dataclass
 class PipelineOptions:
     stretch_cap: float = 0.20
@@ -25,6 +34,20 @@ class PipelineOptions:
     music_bed_gain: float = 0.6
     # Extra dB applied to the AR voice over its native level. 0 = identity.
     voice_gain_db: float = 0.0
+    # Minimum duration (seconds) a turn must be — after 100 ms inward trim
+    # on each side — to qualify as a reference clip for OmniVoice cloning.
+    # Used by ref_picker, which runs in the runner post-emotion stage.
+    min_ref_seconds: float = 3.0
+    # Per-sentence afade duration (seconds) applied to the synthesized track
+    # at sentence boundaries in mux. Suppresses the original-voice bleed at
+    # boundaries reported as quality issue #4.
+    sentence_afade_seconds: float = 0.05
+    # OmniVoice guidance_scale per emotion bin. The TTS adapter looks this
+    # up per sentence and passes it to the inner candidate as a per-call
+    # override of the constructor default.
+    emotion_guidance: dict[str, float] = field(
+        default_factory=lambda: dict(_DEFAULT_EMOTION_GUIDANCE)
+    )
 
 
 @dataclass
