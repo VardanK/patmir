@@ -14,14 +14,12 @@ Install once: `uv pip install mlx-qwen3-asr`
 """
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import AudioTrack, Sentence, Transcript, Word
-from patmir.pipeline.stages.asr._sentence import filter_words_by_vad
+from patmir.pipeline.stages.asr._sentence import filter_words_by_vad, write_transcript
 
 
 # Qwen3-ASR labels languages with full English names ("English", "Russian", …).
@@ -217,31 +215,8 @@ class Qwen3ASRMLX:
                 s.idx = i
 
         transcript = Transcript(language=language, words=words, sentences=sentences)
-        _write_transcript(ctx.job_dir, transcript)
+        write_transcript(ctx.job_dir, transcript)
         return transcript
-
-
-def _write_transcript(job_dir: Path, transcript: Transcript) -> None:
-    payload = {
-        "language": transcript.language,
-        "words": [asdict(w) for w in transcript.words],
-        "sentences": [
-            {
-                "idx": s.idx,
-                "text": s.text,
-                "start": s.start,
-                "end": s.end,
-                "words": [asdict(w) for w in s.words],
-            }
-            for s in transcript.sentences
-        ],
-    }
-    (job_dir / "transcript.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-    sentences_only = [
-        {"idx": s.idx, "text": s.text, "start": s.start, "end": s.end}
-        for s in transcript.sentences
-    ]
-    (job_dir / "sentences.json").write_text(json.dumps(sentences_only, indent=2, ensure_ascii=False))
 
 
 def build(config: dict[str, Any]) -> Qwen3ASRMLX:

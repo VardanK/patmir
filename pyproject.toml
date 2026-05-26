@@ -25,6 +25,8 @@ local = [
   "pyrubberband>=0.3",    # Phase 1 mux time-stretching (needs system `rubberband` binary)
   "soundfile>=0.12",      # WAV I/O for mux
   "demucs>=4.0",          # Phase 1 vocal/accompaniment separation
+  "silero-vad>=5.0",      # Phase 1 VAD on the vocal stem (htdemucs.py)
+  "pyannote.audio>=3.1",  # Phase 2 speaker diarization (SOTA + overlap detection)
 ]
 # Cloud baselines (translation ceiling + TTS ceiling).
 cloud = [

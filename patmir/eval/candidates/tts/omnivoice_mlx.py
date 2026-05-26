@@ -45,15 +45,27 @@ class OmniVoiceMLXTTS:
         self.language = language
         self.lang_code = lang_code
 
-    def synthesize(self, text: str) -> bytes:
+    def synthesize(
+        self,
+        text: str,
+        *,
+        ref_audio: Path | str | None = None,
+        ref_text: str | None = None,
+    ) -> bytes:
         import mlx.core as mx  # lazy
+
+        # Per-sentence reference override — falls back to constructor defaults
+        # when not supplied. OmniVoice's `model.generate` already accepts the
+        # reference per call, so multi-voice cloning is a no-op refactor.
+        eff_ref_audio = str(ref_audio) if ref_audio is not None else self.ref_audio
+        eff_ref_text = ref_text if ref_text is not None else self.ref_text
 
         # `Model.generate` is a generator yielding GenerationResult chunks.
         chunks = list(
             self.model.generate(
                 text=text,
-                ref_audio=self.ref_audio,
-                ref_text=self.ref_text,
+                ref_audio=eff_ref_audio,
+                ref_text=eff_ref_text,
                 num_steps=self.num_steps,
                 guidance_scale=self.guidance_scale,
                 language=self.language,

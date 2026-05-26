@@ -41,6 +41,7 @@ class SentenceTranslator:
                 target_text=target_text,
                 start=s.start,
                 end=s.end,
+                speaker_id=s.speaker_id,
             ))
             ctx.progress("translate", (i + 1) / total, f"sentence {i + 1}/{total}")
 

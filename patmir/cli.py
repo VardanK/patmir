@@ -167,6 +167,39 @@ def _print_summary(m: Manifest) -> None:
         print(f"  {_state_glyph(st.state)} {name:<10} {dur}")
         for k, v in st.artifacts.items():
             print(f"        {k}: {v}")
+    _print_diarize_summary(m)
+
+
+def _print_diarize_summary(m: Manifest) -> None:
+    """Surface speaker count and per-speaker ref-clip durations when diarize ran."""
+    job_dir = RUNS_ROOT / m.job_id
+    turns_path = job_dir / "diarize" / "turns.json"
+    refs_path = job_dir / "diarize" / "refs.json"
+    if not turns_path.exists():
+        return
+    try:
+        turns_data = json.loads(turns_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    speakers = turns_data.get("speakers") or sorted({t["speaker_id"] for t in turns_data.get("turns", [])})
+    refs: dict[str, dict] = {}
+    if refs_path.exists():
+        try:
+            refs = json.loads(refs_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            refs = {}
+    print()
+    print(f"diarize: {len(speakers)} speaker(s)")
+    for spk in speakers:
+        r = refs.get(spk)
+        if r:
+            dur = float(r["source_end"]) - float(r["source_start"])
+            text = (r.get("ref_text") or "").strip().replace("\n", " ")
+            if len(text) > 60:
+                text = text[:57] + "..."
+            print(f"  {spk}: ref {dur:.1f}s — {text}")
+        else:
+            print(f"  {spk}: no clean reference clip — using global fallback voice")
 
 
 def _state_glyph(state: str) -> str:

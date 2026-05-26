@@ -129,12 +129,15 @@ def _free_accelerator_cache() -> None:
 
 
 def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobContext):
-    from patmir.pipeline.stage import AudioTrack, SeparatedAudio
+    from patmir.pipeline.stage import AudioTrack, Diarization, SeparatedAudio
 
     if name == "ingest":
         return stage_obj.extract(ctx.source_path, ctx)
     if name == "separate":
         return stage_obj.separate(ctx.source_path, ctx)
+    if name == "diarize":
+        sep = state["separate"]
+        return stage_obj.diarize(sep, ctx)  # type: ignore[arg-type]
     if name == "asr":
         # Transcribe the FULL vocal stem (not the VAD-masked speech stem) —
         # the hard mask was clipping soft-onset speech. Instead, we expose
@@ -155,7 +158,40 @@ def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobCont
                 )
             if sep.vad_intervals:
                 ctx.extra["vad_intervals"] = sep.vad_intervals
-        return stage_obj.transcribe(audio_for_asr, ctx)
+        diar = state.get("diarize")
+        if isinstance(diar, Diarization):
+            ctx.extra["diarization"] = diar
+        transcript = stage_obj.transcribe(audio_for_asr, ctx)
+        if isinstance(diar, Diarization):
+            from patmir.pipeline.stages.asr._sentence import write_transcript
+            from patmir.pipeline.stages.asr.gap_filler import fill_gaps
+            from patmir.pipeline.stages.asr.speaker_tag import (
+                apply_speaker_tags,
+                backfill_ref_text,
+            )
+            transcript = apply_speaker_tags(transcript, diar)
+            # Second-pass ASR over diarization turns the first pass missed
+            # (e.g. dialogue lost inside a long sustained-noise region).
+            # Only run if the active ASR exposes a slice-transcription helper.
+            transcribe_slice = getattr(stage_obj, "transcribe_slice", None)
+            if callable(transcribe_slice) and isinstance(sep, SeparatedAudio):
+                before = len(transcript.sentences)
+                transcript = fill_gaps(
+                    transcript,
+                    diar,
+                    sep,
+                    asr_fn=transcribe_slice,
+                    progress=lambda msg: ctx.progress("asr", 1.0, f"gap-fill {msg}"),
+                )
+                added = len(transcript.sentences) - before
+                if added > 0:
+                    transcript = apply_speaker_tags(transcript, diar)
+            backfill_ref_text(diar, transcript)
+            _rewrite_refs_json(ctx, diar)
+            # Persist the speaker-tagged + re-indexed transcript (overrides the
+            # candidate's first write that lacked speaker_id and didn't have splits).
+            write_transcript(ctx.job_dir, transcript)
+        return transcript
     if name == "translate":
         return stage_obj.translate(state["asr"], ctx)  # type: ignore[arg-type]
     if name == "tts":
@@ -188,13 +224,33 @@ def _record_artifacts(name: str, output: object, st, job_dir: Path) -> None:
     # Stages with list outputs (transcript, translated, synth) drop sidecar JSONs already.
 
 
+def _rewrite_refs_json(ctx: JobContext, diar) -> None:
+    """Persist the now-backfilled SpeakerRef.ref_text values to refs.json."""
+    refs_json = ctx.job_dir / "diarize" / "refs.json"
+    if not refs_json.parent.exists():
+        return
+    refs_json.write_text(json.dumps({
+        spk: {
+            "ref_audio": str(r.ref_audio),
+            "ref_text": r.ref_text,
+            "source_start": r.source_start,
+            "source_end": r.source_end,
+        }
+        for spk, r in diar.refs.items()
+    }, indent=2, ensure_ascii=False))
+
+
 def _load_resume_artifact(name: str, job_dir: Path, ctx: JobContext):
     """Materialize a prior stage's output from disk so downstream stages can run."""
     from patmir.pipeline.stage import (
         AudioTrack,
+        Diarization,
         MuxedAudio,
+        OverlapInterval,
         SeparatedAudio,
         Sentence,
+        SpeakerRef,
+        SpeakerTurn,
         SynthesizedAudio,
         SynthesizedSentence,
         TranslatedSentence,
@@ -220,12 +276,46 @@ def _load_resume_artifact(name: str, job_dir: Path, ctx: JobContext):
             non_speech_vocals=Path(nonspeech_v) if nonspeech_v else None,
             vad_intervals=[(float(s), float(e)) for s, e in intervals] if intervals else None,
         )
+    if name == "diarize":
+        turns_path = job_dir / "diarize" / "turns.json"
+        refs_path = job_dir / "diarize" / "refs.json"
+        if not turns_path.exists():
+            return None
+        td = json.loads(turns_path.read_text())
+        turns = [SpeakerTurn(start=t["start"], end=t["end"], speaker_id=t["speaker_id"]) for t in td["turns"]]
+        overlaps = [OverlapInterval(start=o["start"], end=o["end"]) for o in td.get("overlaps", [])]
+        refs: dict[str, SpeakerRef] = {}
+        if refs_path.exists():
+            rd = json.loads(refs_path.read_text())
+            for spk, r in rd.items():
+                refs[spk] = SpeakerRef(
+                    speaker_id=spk,
+                    ref_audio=Path(r["ref_audio"]),
+                    ref_text=r.get("ref_text", ""),
+                    source_start=float(r["source_start"]),
+                    source_end=float(r["source_end"]),
+                )
+        # Sample rate is recorded indirectly via separated.meta.json; default 16k if missing.
+        sample_rate = 16000
+        sep_meta_path = job_dir / "separated.meta.json"
+        if sep_meta_path.exists():
+            sample_rate = json.loads(sep_meta_path.read_text()).get("sample_rate", 16000)
+        diar = Diarization(turns=turns, overlaps=overlaps, refs=refs, sample_rate=sample_rate)
+        ctx.extra["diarization"] = diar
+        return diar
     if name == "asr":
         data = json.loads((job_dir / "transcript.json").read_text())
         ctx.source_lang = data["language"]
         words = [Word(**w) for w in data["words"]]
         sentences = [
-            Sentence(idx=s["idx"], text=s["text"], start=s["start"], end=s["end"], words=[Word(**w) for w in s["words"]])
+            Sentence(
+                idx=s["idx"],
+                text=s["text"],
+                start=s["start"],
+                end=s["end"],
+                words=[Word(**w) for w in s["words"]],
+                speaker_id=s.get("speaker_id"),
+            )
             for s in data["sentences"]
         ]
         return Transcript(language=data["language"], words=words, sentences=sentences)

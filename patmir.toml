@@ -328,6 +328,7 @@ voice     = "hy-AM-Standard-A"
 [pipeline]
 ingest    = "ffmpeg"
 separate  = "htdemucs"
+diarize   = "pyannote_3_1"
 asr       = "whisper_large_v3_mlx_fp16"
 translate = "nllb_200_3.3b"
 tts       = "omnivoice_mlx_q8"
@@ -352,6 +353,25 @@ id     = "htdemucs"
 module = "patmir.pipeline.stages.separate.htdemucs"
 model  = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
 device = "auto"          # auto → mps on Apple Silicon
+
+# ─── Diarize (who-spoke-when) ─────────────────────────────────────────────────
+# Runs on the Demucs vocal stem; pyannote 3.1 is SOTA on DIHARD/AMI and has
+# native overlap detection that the speaker_tag pass uses to split sentences
+# that cross a speaker boundary. Token is read from `HF_TOKEN` env var, or
+# falls back to the `hf auth login` cached token. One-time license acceptance
+# required on all three gated repos pyannote 3.1 pulls in:
+#   - https://huggingface.co/pyannote/segmentation-3.0
+#   - https://huggingface.co/pyannote/speaker-diarization-3.1
+#   - https://huggingface.co/pyannote/speaker-diarization-community-1
+[[stages.diarize.candidates]]
+id              = "pyannote_3_1"
+module          = "patmir.pipeline.stages.diarize.pyannote"
+model_id        = "pyannote/speaker-diarization-3.1"
+device          = "auto"   # auto → cuda > mps > cpu; pyannote MPS coverage is partial, set "cpu" if it crashes
+min_speakers    = 0        # 0 = let pyannote estimate
+max_speakers    = 8
+min_ref_seconds = 3.0      # shortest clean turn we'll accept as a per-speaker reference clip
+hf_token_env    = "HF_TOKEN"
 
 # ─── ASR ──────────────────────────────────────────────────────────────────────
 [[stages.asr.candidates]]

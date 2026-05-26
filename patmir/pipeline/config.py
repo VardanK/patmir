@@ -29,6 +29,7 @@ from patmir.pipeline.context import PipelineOptions
 _STAGE_NAMESPACE: dict[str, tuple[str, str]] = {
     "ingest":    ("stages", "ingest"),
     "separate":  ("stages", "separate"),
+    "diarize":   ("stages", "diarize"),
     "asr":       ("stages", "asr"),
     "translate": ("eval", "translation"),
     "tts":       ("eval", "tts"),

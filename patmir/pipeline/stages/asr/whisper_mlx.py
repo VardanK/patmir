@@ -14,14 +14,12 @@ Install once: `uv pip install mlx-whisper`.
 """
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import AudioTrack, Sentence, Transcript, Word
-from patmir.pipeline.stages.asr._sentence import is_non_lexical_repetition
+from patmir.pipeline.stages.asr._sentence import is_non_lexical, write_transcript
 
 
 class WhisperMLX:
@@ -79,7 +77,7 @@ class WhisperMLX:
             # they don't translate to garbage or get TTS'd as artificial
             # speech. The original sound survives in the htdemucs vocals
             # stem that the mux mixes back outside ducked windows.
-            if is_non_lexical_repetition(seg_text):
+            if is_non_lexical(seg_text):
                 continue
             if seg_words:
                 s_start = min(w.start for w in seg_words)
@@ -96,32 +94,37 @@ class WhisperMLX:
             ))
 
         transcript = Transcript(language=language, words=words, sentences=sentences)
-        _write_transcript(ctx.job_dir, transcript)
+        write_transcript(ctx.job_dir, transcript)
         ctx.progress("asr", 1.0, "done")
         return transcript
 
-
-def _write_transcript(job_dir: Path, transcript: Transcript) -> None:
-    payload = {
-        "language": transcript.language,
-        "words": [asdict(w) for w in transcript.words],
-        "sentences": [
-            {
-                "idx": s.idx,
-                "text": s.text,
-                "start": s.start,
-                "end": s.end,
-                "words": [asdict(w) for w in s.words],
-            }
-            for s in transcript.sentences
-        ],
-    }
-    (job_dir / "transcript.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-    sentences_only = [
-        {"idx": s.idx, "text": s.text, "start": s.start, "end": s.end}
-        for s in transcript.sentences
-    ]
-    (job_dir / "sentences.json").write_text(json.dumps(sentences_only, indent=2, ensure_ascii=False))
+    def transcribe_slice(self, audio_path: Path, language: str | None) -> list[Word]:
+        """Re-transcribe a single short clip and return its words (no file I/O,
+        no segmentation). Used by the runner's diarization-driven gap-filler
+        to recover dialogue Whisper missed when running over the whole stem.
+        """
+        result = self._mlx_whisper.transcribe(
+            str(audio_path),
+            path_or_hf_repo=self.repo_id,
+            language=language,
+            word_timestamps=True,
+            temperature=self.temperature,
+            condition_on_previous_text=False,
+            no_speech_threshold=self.no_speech_threshold,
+            verbose=False,
+        )
+        words: list[Word] = []
+        for seg in result.get("segments", []) or []:
+            for w in seg.get("words", []) or []:
+                tok = (w.get("word") or "").strip()
+                if not tok:
+                    continue
+                words.append(Word(
+                    text=tok,
+                    start=float(w.get("start", w.get("end", 0.0))),
+                    end=float(w.get("end", w.get("start", 0.0))),
+                ))
+        return words
 
 
 def build(config: dict[str, Any]) -> WhisperMLX:

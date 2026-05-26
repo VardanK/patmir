@@ -16,14 +16,12 @@ doesn't pull anything in until the user flips it on.
 """
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import AudioTrack, Transcript, Word
-from patmir.pipeline.stages.asr._sentence import group_into_sentences
+from patmir.pipeline.stages.asr._sentence import group_into_sentences, write_transcript
 
 
 # Qwen3-ASR returns the language as the full English name (e.g. "English",
@@ -144,7 +142,7 @@ class Qwen3ASR:
 
         sentences = group_into_sentences(words)
         transcript = Transcript(language=language, words=words, sentences=sentences)
-        _write_transcript(ctx.job_dir, transcript)
+        write_transcript(ctx.job_dir, transcript)
         return transcript
 
 
@@ -162,29 +160,6 @@ def _parse_ts_entry(entry: Any) -> tuple[str | None, float, float]:
     start = getattr(entry, "start", 0.0)
     end = getattr(entry, "end", 0.0)
     return (str(text).strip() if text else None, float(start), float(end))
-
-
-def _write_transcript(job_dir: Path, transcript: Transcript) -> None:
-    payload = {
-        "language": transcript.language,
-        "words": [asdict(w) for w in transcript.words],
-        "sentences": [
-            {
-                "idx": s.idx,
-                "text": s.text,
-                "start": s.start,
-                "end": s.end,
-                "words": [asdict(w) for w in s.words],
-            }
-            for s in transcript.sentences
-        ],
-    }
-    (job_dir / "transcript.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-    sentences_only = [
-        {"idx": s.idx, "text": s.text, "start": s.start, "end": s.end}
-        for s in transcript.sentences
-    ]
-    (job_dir / "sentences.json").write_text(json.dumps(sentences_only, indent=2, ensure_ascii=False))
 
 
 def build(config: dict[str, Any]) -> Qwen3ASR:

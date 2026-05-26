@@ -10,14 +10,16 @@ run on `cpu` with `int8`, which is still fast for the model size. We resolve
 """
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import AudioTrack, Sentence, Transcript, Word
-from patmir.pipeline.stages.asr._sentence import filter_words_by_vad, group_into_sentences
+from patmir.pipeline.stages.asr._sentence import (
+    filter_words_by_vad,
+    group_into_sentences,
+    write_transcript,
+)
 
 
 def _resolve_device(requested: str) -> str:
@@ -66,31 +68,8 @@ class FasterWhisperASR:
         words = filter_words_by_vad(words, ctx.extra.get("vad_intervals"))
         sentences = group_into_sentences(words)
         transcript = Transcript(language=info.language, words=words, sentences=sentences)
-        _write_transcript(ctx.job_dir, transcript)
+        write_transcript(ctx.job_dir, transcript)
         return transcript
-
-
-def _write_transcript(job_dir: Path, transcript: Transcript) -> None:
-    payload = {
-        "language": transcript.language,
-        "words": [asdict(w) for w in transcript.words],
-        "sentences": [
-            {
-                "idx": s.idx,
-                "text": s.text,
-                "start": s.start,
-                "end": s.end,
-                "words": [asdict(w) for w in s.words],
-            }
-            for s in transcript.sentences
-        ],
-    }
-    (job_dir / "transcript.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-    sentences_only = [
-        {"idx": s.idx, "text": s.text, "start": s.start, "end": s.end}
-        for s in transcript.sentences
-    ]
-    (job_dir / "sentences.json").write_text(json.dumps(sentences_only, indent=2, ensure_ascii=False))
 
 
 def build(config: dict[str, Any]) -> FasterWhisperASR:

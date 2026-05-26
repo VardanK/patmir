@@ -52,6 +52,42 @@ class SeparatedAudio:
 
 
 @dataclass
+class SpeakerTurn:
+    """A single contiguous span attributed to one speaker by the diarizer."""
+    start: float
+    end: float
+    speaker_id: str
+
+
+@dataclass
+class OverlapInterval:
+    """A time window pyannote flagged as overlapped speech (>1 speaker active)."""
+    start: float
+    end: float
+
+
+@dataclass
+class SpeakerRef:
+    """Reference clip + transcript for cloning one speaker.
+
+    `ref_text` is empty at diarize time and backfilled after ASR runs.
+    """
+    speaker_id: str
+    ref_audio: Path
+    ref_text: str
+    source_start: float
+    source_end: float
+
+
+@dataclass
+class Diarization:
+    turns: list[SpeakerTurn]
+    overlaps: list[OverlapInterval]
+    refs: dict[str, SpeakerRef]
+    sample_rate: int
+
+
+@dataclass
 class Word:
     text: str
     start: float
@@ -65,6 +101,7 @@ class Sentence:
     start: float
     end: float
     words: list[Word] = field(default_factory=list)
+    speaker_id: str | None = None
 
 
 @dataclass
@@ -81,6 +118,7 @@ class TranslatedSentence:
     target_text: str
     start: float
     end: float
+    speaker_id: str | None = None
 
 
 @dataclass
@@ -131,6 +169,11 @@ class SeparateStage(Protocol):
 
 
 @runtime_checkable
+class DiarizeStage(Protocol):
+    def diarize(self, separated: SeparatedAudio, ctx: "JobContext") -> Diarization: ...
+
+
+@runtime_checkable
 class ASRStage(Protocol):
     def transcribe(self, audio: AudioTrack, ctx: "JobContext") -> Transcript: ...
 
@@ -170,6 +213,7 @@ class OutputStage(Protocol):
 STAGE_ORDER: tuple[str, ...] = (
     "ingest",
     "separate",
+    "diarize",
     "asr",
     "translate",
     "tts",
