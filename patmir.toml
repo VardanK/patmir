@@ -100,6 +100,10 @@ max_tokens  = 512
 temperature = 0.2
 top_p       = 0.9
 timeout_seconds = 60.0
+# Gemini 3.5+ has mandatory reasoning (HTTP 400 if you try `enabled=false`).
+# `effort=minimal` keeps reasoning_tokens at 0, halves latency (~2s vs ~4s
+# per sentence), and drops per-call cost ~30×. Verified 2026-05-26.
+reasoning   = { effort = "minimal" }
 
 [[eval.translation.candidates]]
 id          = "openrouter_claude_opus"

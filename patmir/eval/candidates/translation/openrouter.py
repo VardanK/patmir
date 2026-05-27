@@ -68,6 +68,15 @@ class OpenRouterTranslator:
         top_p: float = 0.9,
         timeout_seconds: float = 60.0,
         base_url: str = _BASE_URL,
+        # Reasoning controls. Some OpenRouter models (gemini-3.5-flash,
+        # gemini-3.1-pro-preview, gpt-5, claude-opus-4.7 with extended
+        # thinking) burn 400-1500 reasoning tokens per call by default —
+        # makes translate stages crawl serially and burn cost. We default
+        # to `effort=minimal` which forces 0 reasoning tokens on models
+        # that mandate thinking (Gemini 3.5+ refuses `enabled=false`).
+        # Set `reasoning=None` to opt out of sending the parameter (some
+        # legacy models don't accept it).
+        reasoning: dict | None = None,
         # Optional OpenRouter attribution headers (recommended by their docs).
         referer: str = "https://github.com/patmir-dub",
         title: str = "Patmir Armenian Dubbing",
@@ -84,6 +93,7 @@ class OpenRouterTranslator:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.reasoning = reasoning
         self.base_url = base_url.rstrip("/")
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -119,6 +129,8 @@ class OpenRouterTranslator:
             "temperature": self.temperature,
             "top_p": self.top_p,
         }
+        if self.reasoning is not None:
+            payload["reasoning"] = self.reasoning
         resp = self._client.post(
             f"{self.base_url}/chat/completions",
             headers=self.headers,
@@ -159,6 +171,7 @@ def build(config: dict[str, Any]) -> OpenRouterTranslator:
         top_p=float(config.get("top_p", 0.9)),
         timeout_seconds=float(config.get("timeout_seconds", 60.0)),
         base_url=config.get("base_url", _BASE_URL),
+        reasoning=config.get("reasoning"),
         referer=config.get("referer", "https://github.com/patmir-dub"),
         title=config.get("title", "Patmir Armenian Dubbing"),
     )
