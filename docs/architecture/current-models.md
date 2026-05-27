@@ -11,8 +11,8 @@ The single source of truth is `patmir.toml [pipeline]`. This table mirrors it fo
 | diarize   | `pyannote_3_1`                   | `pyannote/speaker-diarization-3.1`          | auto   | `min_speakers=0`, `max_speakers=8`, requires `HF_TOKEN` + license accept |
 | emotion   | `emotion2vec_plus_base`          | `iic/emotion2vec_plus_base` (via funasr)    | auto   | 9→5 bin map; confidence floor 0.5 → neutral                            |
 | asr       | `whisper_large_v3_mlx_fp16`      | `mlx-whisper large-v3` (fp16)               | mlx    | VAD post-filter + gap-filler for laughter-dominated regions + hallucination blocklist |
-| translate | `nllb_200_3.3b`                  | `facebook/nllb-200-3.3B`                    | mps    | fp32, 4 beams, no_repeat_ngram_size=3                                  |
-| tts       | `omnivoice_mlx_q8`               | OmniVoice MLX (8-bit quant)                 | mlx    | per-`(speaker, emotion)` ref clip; `guidance_scale` per emotion bin; piper_hye is the fallback when no ref |
+| translate | `openrouter_gemini_flash`        | `google/gemini-2.5-flash` via OpenRouter    | cloud  | emotion tag injected per sentence; requires `OPENROUTER_API_KEY`. NLLB-3.3B is the local fallback (`nllb_200_3.3b` — flip `[pipeline].translate` to revert). |
+| tts       | `openrouter_gemini_flash_tts`    | `google/gemini-3.1-flash-tts-preview` via OpenRouter `/v1/audio/speech` | cloud  | per-speaker voice rotation (Kore / Puck / Aoede / Charon / Leda / Orus); inline `[happy]`/`[sad]`/`[angry]`/`[whispers]` audio tags from `s.emotion`; requires `OPENROUTER_API_KEY`. OmniVoice MLX (`omnivoice_mlx_q8`) is the local fallback — flip `[pipeline].tts` to revert. ElevenLabs Multilingual v2 registered as a future cloud option (needs Creator-tier key). |
 | mux       | `ffmpeg_pad_stretch`             | n/a (ffmpeg + pyrubberband)                 | cpu    | `stretch_cap=0.20`, `music_bed_gain=0.6`, 50 ms afade in/out on synthesized track |
 | output    | `mkv_default`                    | n/a (ffmpeg mux)                            | cpu    | Armenian default audio, original retained, Armenian SRT default subs   |
 

@@ -18,6 +18,7 @@ import threading
 import time
 from pathlib import Path
 
+from patmir.env import load_dotenv
 from patmir.pipeline.config import load_pipeline_config
 from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.runner import run_job
@@ -28,6 +29,10 @@ RUNS_ROOT = Path("runs")
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Project-scoped secrets (OPENROUTER_API_KEY, HF_TOKEN, etc.) live in
+    # `.env` at the project root. Shell-exported env vars always win.
+    load_dotenv()
+
     parser = argparse.ArgumentParser(prog="patmir")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

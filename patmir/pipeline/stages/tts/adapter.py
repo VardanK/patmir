@@ -42,20 +42,50 @@ class SentenceTTS:
             params = sig.parameters
             self._supports_ref = "ref_audio" in params and "ref_text" in params
             self._supports_guidance = "guidance_scale" in params
+            self._supports_emotion = "emotion" in params
         except (TypeError, ValueError):
             self._supports_ref = False
             self._supports_guidance = False
+            self._supports_emotion = False
 
     def _lookup_ref(self, diarization: Diarization | None, speaker_id: str | None, emotion: str | None):
-        """Apply the fallback chain: (spk, emo) → (spk, "neutral") → None."""
+        """Fallback chain (Phase 2.x): preserve speaker identity first,
+        emotion match second.
+
+          1. (speaker, emotion)             — exact match
+          2. (speaker, "neutral")           — same speaker, neutral emotion
+          3. any (speaker, *)               — same speaker, any emotion clip
+                                              (prefer the longest by duration)
+          4. None → caller falls back to the global default (Piper)
+
+        Step 3 is what keeps us from regressing vs Phase 2's "one ref per
+        speaker": when a speaker has only one emotion bucket's worth of
+        clean clips, every sentence in any other emotion would otherwise
+        fall through to a different character's voice (the global Piper
+        fallback). Better to use the same-speaker clip in the "wrong"
+        emotion than to swap voices mid-character.
+        """
         if diarization is None or not speaker_id:
             return None
+
+        def _is_usable(r) -> bool:
+            return r is not None and r.ref_text.strip() != ""
+
         emo = emotion or "neutral"
         ref = diarization.refs.get((speaker_id, emo))
-        if ref is None and emo != "neutral":
-            ref = diarization.refs.get((speaker_id, "neutral"))
-        if ref is not None and ref.ref_text.strip():
+        if _is_usable(ref):
             return ref
+        if emo != "neutral":
+            ref = diarization.refs.get((speaker_id, "neutral"))
+            if _is_usable(ref):
+                return ref
+        # Any ref for this speaker — pick the longest source window for stability.
+        same_speaker = [
+            r for (spk, _bin), r in diarization.refs.items()
+            if spk == speaker_id and _is_usable(r)
+        ]
+        if same_speaker:
+            return max(same_speaker, key=lambda r: r.source_end - r.source_start)
         return None
 
     def synthesize(self, translated: TranslatedTranscript, ctx: JobContext) -> SynthesizedAudio:
@@ -83,6 +113,12 @@ class SentenceTTS:
                 gs = ctx.options.emotion_guidance.get(s.emotion)
                 if gs is not None:
                     kwargs["guidance_scale"] = gs
+            if self._supports_emotion:
+                # ElevenLabs (and any other candidate that accepts an
+                # explicit `emotion` kwarg) drives its own per-emotion knobs
+                # off this. OmniVoice/Piper don't have this param and the
+                # block is skipped via the signature probe.
+                kwargs["emotion"] = s.emotion
 
             wav_bytes = self.inner.synthesize(s.target_text, **kwargs)
             wav_path = out_dir / f"{s.idx:04d}.wav"

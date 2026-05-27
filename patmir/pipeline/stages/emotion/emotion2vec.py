@@ -94,12 +94,21 @@ class Emotion2VecCandidate:
         device: str = "auto",
         min_confidence: float = 0.5,
         bin_map: dict[str, Emotion] | None = None,
+        hub: str = "hf",
     ) -> None:
         from funasr import AutoModel  # lazy, heavy
 
         self.device = _resolve_device(device)
-        # funasr's AutoModel handles device placement when the param is set.
-        self.model = AutoModel(model=model_id, device=self.device)
+        # funasr defaults to ModelScope (mainland-China-hosted) which is slow
+        # from outside Asia — emotion2vec is mirrored to HuggingFace under
+        # `emotion2vec/emotion2vec_plus_base`; using `hub="hf"` pulls from
+        # Cloudflare-fronted HF and is dramatically faster.
+        hf_model_id = model_id
+        if hub == "hf" and model_id.startswith("iic/"):
+            # Map ModelScope id `iic/emotion2vec_plus_base` →
+            # HuggingFace id `emotion2vec/emotion2vec_plus_base`.
+            hf_model_id = "emotion2vec/" + model_id.split("/", 1)[1]
+        self.model = AutoModel(model=hf_model_id, device=self.device, hub=hub)
         self.min_confidence = float(min_confidence)
         self.bin_map: dict[str, Emotion] = dict(DEFAULT_BIN_MAP)
         if bin_map:
@@ -223,4 +232,5 @@ def build(config: dict[str, Any]) -> Emotion2VecCandidate:
         device=config.get("device", "auto"),
         min_confidence=float(config.get("min_confidence", 0.5)),
         bin_map=config.get("bin_map"),
+        hub=config.get("hub", "hf"),
     )

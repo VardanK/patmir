@@ -1,6 +1,7 @@
 # emotion2vec_plus_base (emotion)
 
-- **Repo / version:** `iic/emotion2vec_plus_base` on ModelScope / HuggingFace (loaded via `funasr.AutoModel`)
+- **Repo / version:** `iic/emotion2vec_plus_base` on ModelScope; mirrored to HuggingFace as `emotion2vec/emotion2vec_plus_base`. Loaded via `funasr.AutoModel`.
+- **Download source:** **HuggingFace** (Cloudflare-fronted, tens of MB/s). funasr defaults to ModelScope which is hosted in China and crawls at ~500-700 KB/s from the US; the candidate hardcodes `hub="hf"` and rewrites the id to the HF mirror. See [decisions/2026-05-26-prefer-fast-model-mirrors.md](../../decisions/2026-05-26-prefer-fast-model-mirrors.md).
 - **Parameters / size / runtime memory:** ~90M params, ~360 MB on disk, ~1-2 GB peak during inference
 - **Quantization available:** none official (fp32)
 - **Apple Silicon (MLX/MPS) / CUDA / CPU:** PyTorch — MPS workable, CUDA full, CPU full

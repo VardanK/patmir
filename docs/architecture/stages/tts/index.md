@@ -16,13 +16,18 @@ class TTSStage(Protocol):
 
 ## Candidates
 
-### Active
+### Active (since 2026-05-26)
 
-- **[omnivoice-mlx](omnivoice-mlx.md)** — active. Zero-shot voice cloning via ref clip. EA support verified.
+- **[openrouter-gemini-flash-tts](openrouter-gemini-flash-tts.md)** — cloud, via OpenRouter `/v1/audio/speech`. `google/gemini-3.1-flash-tts-preview` with inline audio tags (`[happy]`, `[sad]`, `[angry]`, `[whispers]`) injected from `s.emotion`. Per-speaker voice rotation across Gemini's prebuilt voices.
 
-### Fallback
+### Registered cloud alternates
 
-- **[piper-hye](piper-hye.md)** — used when no ref clip is available for a speaker.
+- **[elevenlabs-multilingual-v2](elevenlabs-multilingual-v2.md)** — attempted 2026-05-26, blocked on Free tier (Creator $22/mo required for library voices via API + IVC). Kept registered as the higher-quality option for when a Creator-tier key arrives.
+
+### Local (fallback / revert path)
+
+- **[omnivoice-mlx](omnivoice-mlx.md)** — local zero-shot ref cloning. Stays registered as the offline fallback; flip `[pipeline].tts = "omnivoice_mlx_q8"` to revert.
+- **[piper-hye](piper-hye.md)** — used when no ref is available for a speaker (rare).
 
 ### Rejected (kept on file so we don't re-investigate)
 
@@ -32,9 +37,8 @@ class TTSStage(Protocol):
 - **[bark](bark.md)** — Armenian dialect handling unverified; deferred indefinitely.
 - **[mms-tts-hye](mms-tts-hye.md)** — does not exist on HF (only the Western `mms-tts-hyw`). Documented dead end.
 
-### Cloud (opt-in only)
+### Cloud (registered, not active)
 
-- **[elevenlabs-multilingual-v2](elevenlabs-multilingual-v2.md)** — disabled; primary cloud option if local fails.
 - **[google-tts-cloud](google-tts-cloud.md)** — disabled; roughly Piper-tier, not a meaningful upgrade.
 
 ## Per-sentence cloning

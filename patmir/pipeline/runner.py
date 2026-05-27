@@ -116,14 +116,17 @@ def _free_accelerator_cache() -> None:
         pass
     try:
         import mlx.core as mx  # type: ignore[import-not-found]
-        # MLX has no explicit cache to clear in 0.x; the gc above + the next
-        # allocator pass usually reclaims everything via reference counting.
-        # Calling metal.clear_cache() is the closest equivalent and is no-op
-        # if unsupported on the current MLX build.
-        try:
-            mx.metal.clear_cache()  # type: ignore[attr-defined]
-        except (AttributeError, RuntimeError):
-            pass
+        # MLX cache-clear API moved from `mx.metal.clear_cache` (deprecated
+        # in newer MLX) to `mx.clear_cache`. Try the new one first, fall
+        # back to the old one, no-op if neither is available.
+        clear_cache = getattr(mx, "clear_cache", None)
+        if clear_cache is None:
+            clear_cache = getattr(getattr(mx, "metal", None), "clear_cache", None)
+        if callable(clear_cache):
+            try:
+                clear_cache()
+            except (AttributeError, RuntimeError):
+                pass
     except ImportError:
         pass
 

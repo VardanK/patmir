@@ -14,11 +14,14 @@ from typing import Any
 
 
 _DEFAULT_EMOTION_GUIDANCE: dict[str, float] = {
-    "neutral": 0.7,
-    "happy":   0.9,
-    "sad":     0.6,
-    "angry":   0.9,
-    "fearful": 0.8,
+    # Anchored at OmniVoice's constructor default (2.0); pushes up for
+    # intense emotions to amplify ref-driven expression. See ADR
+    # 2026-05-26-emotion-routed-through-ref-clip-binning.
+    "neutral": 1.8,
+    "sad":     2.0,
+    "happy":   2.8,
+    "angry":   3.0,
+    "fearful": 2.6,
 }
 
 

@@ -10,6 +10,7 @@ module    = "patmir.pipeline.stages.emotion.emotion2vec"
 model_id  = "iic/emotion2vec_plus_base"
 device    = "auto"
 min_confidence = 0.5   # below this → emotion bucket forced to "neutral"
+hub       = "hf"       # funasr default is ModelScope (China-hosted, slow); HF mirror is fast
 
 [emotion_bins]
 # Maps the 9 emotion2vec classes → 5 ref-clip bins. Each key is a SER class

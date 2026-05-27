@@ -79,6 +79,43 @@ module    = "patmir.eval.candidates.translation.claude_cloud"
 model     = "claude-opus-4-7"
 # ANTHROPIC_API_KEY is read from the environment.
 
+# OpenRouter — unified gateway to frontier LLMs (GPT-5, Claude Opus 4.7,
+# Gemini 2.5 Flash, etc.) behind one API key. The translate-side cloud
+# escalation per local-first policy after local TTS + emotion routing
+# failed the masha-clip ear-test on issue #3 (emotions not transferred).
+# See `docs/architecture/decisions/2026-05-26-cloud-translate-via-openrouter.md`.
+#
+# Default model is the cheap, fast Gemini Flash for iteration; swap to
+# `anthropic/claude-opus-4.7` or `openai/gpt-5` per the comparison runs.
+[[eval.translation.candidates]]
+id          = "openrouter_gemini_flash"
+enabled     = true
+module      = "patmir.eval.candidates.translation.openrouter"
+model       = "google/gemini-2.5-flash"
+api_key_env = "OPENROUTER_API_KEY"
+max_tokens  = 512
+temperature = 0.2
+top_p       = 0.9
+timeout_seconds = 60.0
+
+[[eval.translation.candidates]]
+id          = "openrouter_claude_opus"
+enabled     = false
+module      = "patmir.eval.candidates.translation.openrouter"
+model       = "anthropic/claude-opus-4.7"
+api_key_env = "OPENROUTER_API_KEY"
+max_tokens  = 512
+temperature = 0.2
+
+[[eval.translation.candidates]]
+id          = "openrouter_gpt5"
+enabled     = false
+module      = "patmir.eval.candidates.translation.openrouter"
+model       = "openai/gpt-5"
+api_key_env = "OPENROUTER_API_KEY"
+max_tokens  = 512
+temperature = 0.2
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Translation candidates added post-Phase-0 — registered, not yet enabled.
 # Picked up by the GPU re-eval pass. See Phase 1 spec for details.
@@ -316,6 +353,70 @@ module    = "patmir.eval.candidates.tts.google_tts_cloud"
 voice     = "hy-AM-Standard-A"
 # GOOGLE_APPLICATION_CREDENTIALS env var must point at a service-account JSON.
 
+# ElevenLabs Multilingual v2 — investigated 2026-05-26 as the first cloud-TTS
+# attempt; Free-tier API access blocks both library voices (402 paid-plan-
+# required) and IVC, so the pipeline can't run on a Free key. Registered as
+# a future option for when / if a Creator-tier ($22/mo) ElevenLabs key is
+# available. Superseded by OpenRouter TTS (below) for the active path.
+# See ADRs `2026-05-26-elevenlabs-tts-cloud-opt-in.md` (attempted) +
+# `2026-05-26-openrouter-tts-cloud-opt-in.md` (active).
+[[eval.tts.candidates]]
+id               = "elevenlabs_multilingual_v2"
+enabled          = false
+module           = "patmir.eval.candidates.tts.elevenlabs"
+model_id         = "eleven_multilingual_v2"
+api_key_env      = "ELEVENLABS_API_KEY"
+default_voice_id = "21m00Tcm4TlvDq8ikWAM"   # "Rachel" — multilingual fallback when no IVC ref is available
+cleanup_voices   = true
+timeout_seconds  = 90.0
+# Output format. `mp3_44100_128` works on every tier (Free → Pro); the
+# candidate auto-decodes MP3 → WAV via ffmpeg (~50 ms / sentence; ffmpeg
+# is already a project dep). `pcm_44100` is Pro-only; `pcm_22050` /
+# `pcm_16000` are Creator+. Override if on a higher tier to skip decode.
+output_format    = "mp3_44100_128"
+
+# OpenRouter TTS — frontier cloud TTS via OpenRouter's /v1/audio/speech
+# endpoint (OpenAI-compatible). Reuses the OPENROUTER_API_KEY already set
+# for the translate stage; no separate vendor account or tier wall.
+#
+# Default model is google/gemini-3.1-flash-tts-preview — supports 200+
+# inline audio tags (`[happy]`, `[sad]`, `[angry]`, `[whispers]`, etc.),
+# which the candidate injects per sentence from `s.emotion`. Gives us
+# explicit cloud-side emotion control without voice cloning or per-emotion
+# settings juggling. See ADR `2026-05-26-openrouter-tts-cloud-opt-in.md`.
+[[eval.tts.candidates]]
+id              = "openrouter_gemini_flash_tts"
+enabled         = true
+module          = "patmir.eval.candidates.tts.openrouter"
+model           = "google/gemini-3.1-flash-tts-preview"
+api_key_env     = "OPENROUTER_API_KEY"
+voice           = "Kore"        # default voice when no ref_audio (or voices pool is empty)
+# Per-speaker voice rotation — speakers are assigned voices in encounter
+# order, then bound for the rest of the run. Keeps character variety
+# (mix of female + male voices). Override per-speaker via `voice_map`.
+voices          = ["Kore", "Puck", "Aoede", "Charon", "Leda", "Orus"]
+response_format = "pcm"         # Gemini TTS rejects mp3 — only pcm. Candidate wraps in WAV at 24 kHz.
+speed           = 1.0
+timeout_seconds = 90.0
+
+# Alternates registered for A/B comparison — flip enabled = true + change
+# [pipeline].tts to swap. Pricing per OpenRouter at 2026-05-26.
+[[eval.tts.candidates]]
+id              = "openrouter_gpt4o_mini_tts"
+enabled         = false
+module          = "patmir.eval.candidates.tts.openrouter"
+model           = "openai/gpt-4o-mini-tts-2025-12-15"
+api_key_env     = "OPENROUTER_API_KEY"
+voice           = "alloy"       # OpenAI voices: alloy / echo / fable / onyx / nova / shimmer
+response_format = "mp3"
+
+[[eval.tts.candidates]]
+id              = "openrouter_voxtral_mini_tts"
+enabled         = false
+module          = "patmir.eval.candidates.tts.openrouter"
+model           = "mistralai/voxtral-mini-tts-2603"
+api_key_env     = "OPENROUTER_API_KEY"
+response_format = "mp3"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Phase 1 pipeline.
@@ -331,8 +432,8 @@ separate  = "htdemucs"
 diarize   = "pyannote_3_1"
 emotion   = "emotion2vec_plus_base"
 asr       = "whisper_large_v3_mlx_fp16"
-translate = "nllb_200_3.3b"
-tts       = "omnivoice_mlx_q8"
+translate = "openrouter_gemini_flash"
+tts       = "openrouter_gemini_flash_tts"
 mux       = "ffmpeg_pad_stretch"
 output    = "mkv_default"
 
@@ -359,15 +460,19 @@ sad        = "sad"
 surprised  = "happy"
 unknown    = "neutral"
 
-# OmniVoice `guidance_scale` per emotion bin (higher = more faithful to ref
-# + text; lower = more freedom). The TTS adapter looks this up per sentence
-# and overrides the OmniVoice constructor default for that one call.
+# OmniVoice `guidance_scale` per emotion bin. Higher = more conditioning =
+# more of the ref clip's prosody bleeds into the synthesized line. OmniVoice's
+# constructor default is 2.0, so the per-emotion overrides anchor there and
+# push *up* for intense emotions to amplify ref-driven expression. The
+# previous range (0.6-0.9) was below the default and actually weakened the
+# emotion transfer it was supposed to enable; first ear-test on the masha
+# clip surfaced this.
 [emotion_guidance]
-neutral = 0.7
-happy   = 0.9
-sad     = 0.6
-angry   = 0.9
-fearful = 0.8
+neutral = 1.8
+sad     = 2.0
+happy   = 2.8
+angry   = 3.0
+fearful = 2.6
 
 # ─── Ingest ───────────────────────────────────────────────────────────────────
 [[stages.ingest.candidates]]
@@ -412,6 +517,7 @@ module         = "patmir.pipeline.stages.emotion.emotion2vec"
 model_id       = "iic/emotion2vec_plus_base"
 device         = "auto"
 min_confidence = 0.5   # below this, the prediction is reassigned to "neutral"
+hub            = "hf"  # ModelScope (default) is China-hosted + slow from US; HF mirror is Cloudflare-fronted
 
 # ─── ASR ──────────────────────────────────────────────────────────────────────
 [[stages.asr.candidates]]
