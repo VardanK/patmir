@@ -91,7 +91,10 @@ model     = "claude-opus-4-7"
 id          = "openrouter_gemini_flash"
 enabled     = true
 module      = "patmir.eval.candidates.translation.openrouter"
-model       = "google/gemini-2.5-flash"
+# Gemini 3.5 Flash — superseded 2.5-flash 2026-05-26 after casual-register
+# A/B (vs gemini-3.1-flash-lite). 3.5 produced more emotive/playful output
+# (diminutives like `քչիկ`, exclamatory `Ի՜նչ թթու ա՜`) at the same speed.
+model       = "google/gemini-3.5-flash"
 api_key_env = "OPENROUTER_API_KEY"
 max_tokens  = 512
 temperature = 0.2
