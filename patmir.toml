@@ -362,9 +362,15 @@ voice     = "hy-AM-Standard-A"
 # `2026-05-26-openrouter-tts-cloud-opt-in.md` (active).
 [[eval.tts.candidates]]
 id               = "elevenlabs_multilingual_v2"
-enabled          = false
+enabled          = true
 module           = "patmir.eval.candidates.tts.elevenlabs"
-model_id         = "eleven_multilingual_v2"
+# Only `eleven_v3` accepts `language_code="hy"` for Armenian. Older models
+# (eleven_multilingual_v2, eleven_turbo_v2_5, eleven_flash_v2_5) reject the
+# language code and silently read Cyrillic/Armenian as English phonemes —
+# the dub sounds like an English speaker doing fake Armenian. Verified
+# 2026-05-26 via direct API probe.
+model_id         = "eleven_v3"
+language_code    = "hy"
 api_key_env      = "ELEVENLABS_API_KEY"
 default_voice_id = "21m00Tcm4TlvDq8ikWAM"   # "Rachel" — multilingual fallback when no IVC ref is available
 cleanup_voices   = true
@@ -431,9 +437,9 @@ ingest    = "ffmpeg"
 separate  = "htdemucs"
 diarize   = "pyannote_3_1"
 emotion   = "emotion2vec_plus_base"
-asr       = "whisper_large_v3_mlx_fp16"
+asr       = "openrouter_gpt_audio"
 translate = "openrouter_gemini_flash"
-tts       = "openrouter_gemini_flash_tts"
+tts       = "elevenlabs_multilingual_v2"
 mux       = "ffmpeg_pad_stretch"
 output    = "mkv_default"
 
@@ -520,6 +526,84 @@ min_confidence = 0.5   # below this, the prediction is reassigned to "neutral"
 hub            = "hf"  # ModelScope (default) is China-hosted + slow from US; HF mirror is Cloudflare-fronted
 
 # ─── ASR ──────────────────────────────────────────────────────────────────────
+#
+# Cloud route: OpenRouter chat-completions multimodal audio. OpenRouter does
+# NOT expose a dedicated /v1/audio/transcriptions endpoint (verified 2026-05-26;
+# returns HTTP 500 for transcribe-SKU model ids). Audio-in is via
+# /v1/chat/completions with input_audio content blocks. Word-level timestamps
+# are recovered by the local MMS-FA forced aligner inside the candidate.
+#
+# Active default: `openai/gpt-audio` — clean Russian transcription on Masha
+# clips; same model family as the (no-longer-exposed) gpt-4o-transcribe.
+# Cost ~$1.20/hour of audio at posted rates.
+#
+# See ADR 2026-05-26-cloud-asr-via-openrouter.md.
+
+[[stages.asr.candidates]]
+id              = "openrouter_gpt_audio"
+module          = "patmir.pipeline.stages.asr.openrouter_stt"
+model           = "openai/gpt-audio"
+api_key_env     = "OPENROUTER_API_KEY"
+chunk_seconds   = 240.0
+timeout_seconds = 240.0
+max_tokens      = 4096
+temperature     = 0.0
+language        = "ru"   # ctx.source_lang overrides this when set upstream
+
+# Voxtral Small 24B — cheaper alternate (~$0.36/hr). Russian transcription
+# usable but slightly weaker than gpt-audio (minor word swaps observed).
+[[stages.asr.candidates]]
+enabled         = false
+id              = "openrouter_voxtral_small_24b"
+module          = "patmir.pipeline.stages.asr.openrouter_stt"
+model           = "mistralai/voxtral-small-24b-2507"
+api_key_env     = "OPENROUTER_API_KEY"
+chunk_seconds   = 240.0
+timeout_seconds = 240.0
+max_tokens      = 4096
+temperature     = 0.0
+
+# GPT Audio Mini — cheapest GPT-Audio SKU but tends to safety-refuse short
+# cartoon dialogue ("Извините, я не могу помочь с этим"). Shipped disabled.
+[[stages.asr.candidates]]
+enabled         = false
+id              = "openrouter_gpt_audio_mini"
+module          = "patmir.pipeline.stages.asr.openrouter_stt"
+model           = "openai/gpt-audio-mini"
+api_key_env     = "OPENROUTER_API_KEY"
+chunk_seconds   = 240.0
+timeout_seconds = 240.0
+max_tokens      = 4096
+temperature     = 0.0
+
+# GPT-4o Audio Preview — listed in OpenRouter's catalog but our key returns
+# 404 (model_not_found from upstream OpenAI). Kept disabled as a tripwire if
+# OpenAI re-enables access broadly.
+[[stages.asr.candidates]]
+enabled         = false
+id              = "openrouter_gpt4o_audio_preview"
+module          = "patmir.pipeline.stages.asr.openrouter_stt"
+model           = "openai/gpt-4o-audio-preview"
+api_key_env     = "OPENROUTER_API_KEY"
+chunk_seconds   = 240.0
+timeout_seconds = 240.0
+max_tokens      = 4096
+temperature     = 0.0
+
+# ElevenLabs Scribe v2 — documented-but-not-used future option. Per-project
+# policy: tier-gated until ear-tested + budget-sanctioned (mirrors how the
+# ElevenLabs Multilingual v2 TTS is shelved). NOTE: Scribe is actually on
+# the ElevenLabs Free tier — the gate here is policy, not API. No candidate
+# module is implemented; the toml entry is documentation-only. Native word
+# timestamps + diarization (up to 32 speakers); 3 GB / 10 hr per request.
+[[stages.asr.candidates]]
+enabled         = false
+id              = "elevenlabs_scribe_v2"
+module          = "patmir.pipeline.stages.asr.elevenlabs_scribe"  # NOT IMPLEMENTED
+model           = "scribe-v2"
+api_key_env     = "ELEVENLABS_API_KEY"
+timeout_seconds = 180.0
+
 [[stages.asr.candidates]]
 id            = "faster_whisper_large_v3_turbo"
 module        = "patmir.pipeline.stages.asr.faster_whisper"

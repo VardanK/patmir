@@ -16,9 +16,9 @@ Per the [local-first-strict](2026-05-24-local-first-strict.md) policy, local-TTS
 
 ## Decision
 
-Activate **ElevenLabs Multilingual v2** as the active TTS:
+Activate **ElevenLabs `eleven_v3`** (NOT `eleven_multilingual_v2`) as the active TTS:
 
-- `model_id = "eleven_multilingual_v2"` — Armenian-capable. Dialect ear-verified at first run (revert if Western Armenian comes out).
+- `model_id = "eleven_v3"` + `language_code = "hy"`. First activation attempt used `eleven_multilingual_v2` (the natural default given the model name); ear-test exposed the model was reading Armenian script with English phonemes. Direct API probe (2026-05-26 evening) confirmed only `eleven_v3` accepts `language_code="hy"` — v2 / turbo_v2_5 / flash_v2_5 all reject it with `400 invalid_parameters`. The v2 model silently English-phonetizes Armenian script when the language code is omitted, which is why the first run "sort of worked" but sounded wrong.
 - **Per-emotion `voice_settings`** drive expressive delivery:
   - `stability`: lower → more emotional variation. Intense emotions get 0.25-0.35; neutral / sad get 0.55.
   - `style`: higher → more dramatic. Intense emotions get 0.55-0.70; neutral 0.20.

@@ -32,11 +32,25 @@ import httpx
 _LANG_NAME = {"en": "English", "ru": "Russian", "hy": "Armenian"}
 
 _SYSTEM = (
-    "You are a professional translator specializing in Eastern Armenian (hy_AM). "
-    "You translate text from English or Russian into natural, idiomatic Eastern "
-    "Armenian as spoken in Armenia. You preserve tone, register, and emotion. "
-    "You never produce Western Armenian (hyw). You reply with ONLY the Armenian "
-    "translation — no quotes, no explanations, no source-language echoing."
+    "You translate dialogue into spoken, casual Eastern Armenian (hy_AM) — "
+    "the way families and kids actually talk in Yerevan, NOT formal book "
+    "Armenian and NOT news-anchor register. This is for a cartoon dub, so "
+    "keep it playful, natural, and conversational. "
+    "Concrete guidance: "
+    "(1) prefer everyday colloquial vocabulary over literary equivalents "
+    "(e.g. 'լավ' over 'բարի', 'ուզում եմ' over 'ցանկանում եմ'); "
+    "(2) use spoken contractions and elisions where a native speaker would; "
+    "(3) keep sentences short — match the source's rhythm, don't pad with "
+    "subordinate clauses; "
+    "(4) match the source's register — exclamations stay exclamatory, "
+    "questions stay direct, slang/baby-talk in the source stays slang in "
+    "the target; "
+    "(5) preserve emotion and tone (anger sounds angry, joy sounds bouncy); "
+    "(6) for sound-effect-ish words ('Ого!', 'Ой!', 'Фу!') use the natural "
+    "Armenian equivalent ('Վա՜յ', 'Օ՜', 'Ֆու՜'), not a literary substitution. "
+    "Never produce Western Armenian (hyw). "
+    "Reply with ONLY the Armenian translation — no quotes, no explanations, "
+    "no source-language echoing, no translator notes."
 )
 
 _BASE_URL = "https://openrouter.ai/api/v1"
@@ -83,13 +97,15 @@ class OpenRouterTranslator:
         src_name = _LANG_NAME.get(source_lang, source_lang)
         if emotion and emotion != "neutral":
             user_msg = (
-                f"Translate this {src_name} sentence into Eastern Armenian. "
-                f"The speaker's emotion is {emotion}; reflect that tone in the Armenian phrasing.\n\n"
+                f"Translate this {src_name} cartoon line into casual spoken "
+                f"Eastern Armenian. The speaker's emotion is {emotion}; the "
+                f"Armenian should sound {emotion} too.\n\n"
                 f"{text}"
             )
         else:
             user_msg = (
-                f"Translate this {src_name} sentence into Eastern Armenian:\n\n"
+                f"Translate this {src_name} cartoon line into casual spoken "
+                f"Eastern Armenian:\n\n"
                 f"{text}"
             )
 

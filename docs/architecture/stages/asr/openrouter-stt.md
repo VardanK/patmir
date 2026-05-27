@@ -1,0 +1,22 @@
+# openrouter-stt (asr)
+
+- **Endpoint:** OpenRouter `POST /v1/chat/completions` (NOT `/v1/audio/transcriptions` — that endpoint does not exist on OpenRouter, verified 2026-05-26).
+- **Active model:** `openai/gpt-audio`. Alternates registered as `enabled = false`: `mistralai/voxtral-small-24b-2507`, `openai/gpt-audio-mini`, `openai/gpt-4o-audio-preview`.
+- **Audio transport:** base64-encoded WAV in an `input_audio` content block.
+- **Word-level timestamps:** none from the model. Reconstructed locally by MMS-FA via `ctc-forced-aligner`. ~1.2 GB ONNX model cached at `~/.cache/ctc_forced_aligner/mms_fa.onnx`.
+- **Chunking:** default 240 s per chunk; boundaries snap to the nearest silence within ±8 s when VAD intervals are available.
+- **Languages:** any language the chat model can transcribe AND that MMS-FA supports (1000+ languages via uroman romanization). Russian is the validated path; English / Eastern Armenian-source / Mandarin should work without changes.
+- **License / gating:** OpenAI ToS (via OpenRouter); MMS-FA is CC-BY-NC.
+- **Integration surface:** `patmir/pipeline/stages/asr/openrouter_stt.py` (candidate) + `_aligner.py` (forced-alignment helper).
+- **Cost (active default):** approx. $1.20/hour of audio at posted gpt-audio rates. Voxtral Small 24B is ~$0.36/hr.
+- **Status in pipeline:** **active** since 2026-05-26 (ADR `2026-05-26-cloud-asr-via-openrouter.md`).
+- **Last evaluated:** 2026-05-26 on masha-2-5min — clean Russian transcript across 33 sentences, no hallucinations on laughter/scream regions that historically tripped the local Whisper baseline.
+- **Our experience:**
+  - `gpt-audio-mini` safety-refuses some cartoon clips ("Извините, я не могу помочь с этим"). Unusable as default.
+  - `gpt-4o-audio-preview` 404s with `model_not_found` despite being listed in the OR catalog. Tripwire entry — re-enabled if access changes.
+  - Voxtral Small 24B works but occasionally swaps phonetically similar words (`Кислятина` → `Числятина`). Acceptable cost-conscious alternate.
+  - The candidate handles long files via chunking + transcript concatenation. Forced alignment runs once on the full vocals stem with the concatenated transcript.
+- **Notes:**
+  - VAD post-filter is NOT applied to cloud transcripts — the cloud model doesn't hallucinate on silence the way Whisper does on laughter. If a future cloud model regresses on this, re-enable `filter_words_by_vad` inside the candidate.
+  - The runner's gap-filler is skipped (no `transcribe_slice()` helper on the candidate). The cloud model is already strong on the regions the gap-filler was rescuing.
+  - Hallucination blocklist still runs at sentence-assembly time (`_sentence.py`) — defense-in-depth.

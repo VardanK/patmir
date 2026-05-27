@@ -2,35 +2,43 @@
 
 ```toml
 [pipeline]
-tts = "openrouter_gemini_flash_tts"
+tts = "elevenlabs_multilingual_v2"
 
 [[eval.tts.candidates]]
-id              = "openrouter_gemini_flash_tts"
-enabled         = true
-module          = "patmir.eval.candidates.tts.openrouter"
-model           = "google/gemini-3.1-flash-tts-preview"
-api_key_env     = "OPENROUTER_API_KEY"
-voice           = "Kore"
-voices          = ["Kore", "Puck", "Aoede", "Charon", "Leda", "Orus"]
-response_format = "pcm"     # Gemini TTS rejects mp3; candidate wraps PCM in WAV @ 24 kHz
-speed           = 1.0
-timeout_seconds = 90.0
+id               = "elevenlabs_multilingual_v2"
+enabled          = true
+module           = "patmir.eval.candidates.tts.elevenlabs"
+model_id         = "eleven_multilingual_v2"
+api_key_env      = "ELEVENLABS_API_KEY"
+default_voice_id = "21m00Tcm4TlvDq8ikWAM"   # "Rachel" — fallback when no IVC ref
+cleanup_voices   = true
+timeout_seconds  = 90.0
+output_format    = "mp3_44100_128"
 ```
 
-API key in `.env` (auto-loaded by `patmir/env.py`): `OPENROUTER_API_KEY=...` — the same key used by the translate stage.
+API key in `.env` (auto-loaded by `patmir/env.py`): `ELEVENLABS_API_KEY=...`. The key must carry the `text_to_speech` + `voices_read` + `create_instant_voice_clone` permission scopes — IVC scope is the one that's easy to miss when creating a scoped key.
 
-OmniVoice MLX (`omnivoice_mlx_q8`) stays registered as the **local fallback** — flip `[pipeline].tts = "omnivoice_mlx_q8"` to revert to fully-offline operation. ElevenLabs is registered (`enabled = false`) as a future cloud option requiring a Creator-tier key.
+OpenRouter Gemini TTS (`openrouter_gemini_flash_tts`) stays registered as a cloud alternate — flip `[pipeline].tts = "openrouter_gemini_flash_tts"` to revert. OmniVoice MLX (`omnivoice_mlx_q8`) stays as the offline-fallback path. ElevenLabs Scribe v2 ASR is still registered `enabled = false` (separate stage).
 
-## Phase 2.x emotion routing
+## Phase 2.x emotion + voice routing
 
-The TTS adapter passes per-sentence overrides at call time:
+ElevenLabs combines per-speaker cloning + per-emotion expression in one shot:
 
-- **ref_audio / ref_text:** picked from `refs[(speaker_id, emotion)]` with a 4-step fallback chain (exact → speaker-neutral → any-emotion-for-same-speaker → global). The first-picked clip per *speaker* drives the IVC clone identity; emotion-driven expression comes from `voice_settings` (ElevenLabs) or `guidance_scale` (OmniVoice fallback path).
-- **emotion** (new in Phase 2.x): forwarded to candidates that accept it. ElevenLabs uses it to look up its per-emotion `voice_settings` (stability + style); OmniVoice ignores the kwarg and uses `guidance_scale` instead.
-- **guidance_scale:** looked up in `[emotion_guidance]` per-emotion table (`neutral=1.8`, `sad=2.0`, `happy=2.8`, `angry=3.0`, `fearful=2.6` — anchored at OmniVoice's `2.0` constructor default). Used by OmniVoice; ignored by ElevenLabs and Piper.
+- **Per-speaker voice (IVC):** the candidate uploads each `diarize/refs/<speaker>/*.wav` clip via `/v1/voices/add` and caches the resulting `voice_id` for that speaker. All emotions for the same speaker reuse the same upload (one IVC voice per character). Uploads are deleted at process exit (`atexit`) to free slots.
+- **Per-emotion expression:** `voice_settings.stability` (lower → more variation) + `voice_settings.style` (higher → more dramatic). Mapped per bin in `_DEFAULT_VOICE_SETTINGS` inside the candidate:
+  - `neutral` → stab 0.55 / style 0.20
+  - `happy`   → stab 0.35 / style 0.55
+  - `sad`     → stab 0.55 / style 0.40
+  - `angry`   → stab 0.25 / style 0.70
+  - `fearful` → stab 0.30 / style 0.60
+- **Adapter call passes:** `ref_audio` (chooses IVC voice), `emotion` (chooses voice_settings preset). `ref_text` and `guidance_scale` are accepted for adapter uniformity and ignored — ElevenLabs has no ref-transcript input and `guidance_scale` is an OmniVoice concept.
 
-See [omnivoice-mlx.md](omnivoice-mlx.md) for the full API surface and `stages/tts/adapter.py` for the lookup logic.
+## Fallback chain
 
-## Fallback
+- If IVC upload fails for a specific speaker (key tier, voice-slot cap, etc.), that speaker's lines fall back to `default_voice_id` (Rachel) and a single warning is logged. All other speakers keep their IVC clones.
+- If `refs` has no entry for a `speaker_id` at all (rare — a character with no qualifying turn), the adapter switches that sentence to the **piper_hye** fallback candidate.
 
-When `refs` has no entry for a `speaker_id` at all (rare — a character with no qualifying turn), the adapter switches that sentence to the **piper_hye** fallback candidate. Same EA-floor quality from Phase 0 (3/3/2.9, 20/20 watchable).
+## Notes
+
+- Output format `mp3_44100_128` works on every tier; the candidate decodes MP3 → WAV (PCM-16 mono 44.1k) via ffmpeg subprocess (~50 ms / sentence; ffmpeg is already a project dep). Override to `pcm_44100` on Creator+ to skip the decode.
+- ElevenLabs voice cleanup runs on process exit; if the run is killed (SIGKILL), the IVC slots leak and need manual cleanup via `/v1/voices/{voice_id}` DELETE on the dashboard.

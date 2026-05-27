@@ -54,7 +54,7 @@ class ElevenLabsTTS:
 
     def __init__(
         self,
-        model_id: str = "eleven_multilingual_v2",
+        model_id: str = "eleven_v3",
         api_key_env: str = "ELEVENLABS_API_KEY",
         default_voice_id: str = "21m00Tcm4TlvDq8ikWAM",  # "Rachel" — multilingual baseline
         voice_settings: dict[str, dict[str, float]] | None = None,
@@ -64,6 +64,11 @@ class ElevenLabsTTS:
         # We accept the per-call MP3 decode (~50 ms via ffmpeg) for tier
         # portability. Users on Pro+ can override via config to skip decode.
         output_format: str = "mp3_44100_128",
+        # ISO language hint passed as `language_code` to the API. Only
+        # `eleven_v3` accepts Armenian (`hy`); v2 / turbo_v2_5 / flash_v2_5
+        # reject it. Earlier multilingual models silently fall back to
+        # English-phoneme reading of Cyrillic Armenian, which sounds wrong.
+        language_code: str | None = "hy",
         # IVC upload sample-rate normalization isn't needed — ElevenLabs
         # accepts arbitrary WAV/MP3. The ref clips we slice are 16 kHz mono
         # PCM, which is fine.
@@ -84,6 +89,7 @@ class ElevenLabsTTS:
         self.timeout = timeout_seconds
         self.cleanup_voices = cleanup_voices
         self.output_format = output_format
+        self.language_code = language_code
         self._client = httpx.Client(timeout=timeout_seconds)
         self._headers = {"xi-api-key": self.api_key}
         # Speakers whose IVC upload has failed once — skip retry to avoid
@@ -211,6 +217,8 @@ class ElevenLabsTTS:
                 "use_speaker_boost": True,
             },
         }
+        if self.language_code:
+            payload["language_code"] = self.language_code
         resp = self._client.post(
             f"{_API_BASE}/text-to-speech/{voice_id}",
             headers={**self._headers, "Content-Type": "application/json"},
@@ -266,11 +274,12 @@ def _mp3_to_wav(mp3_bytes: bytes) -> bytes:
 
 def build(config: dict[str, Any]) -> ElevenLabsTTS:
     return ElevenLabsTTS(
-        model_id=config.get("model_id", "eleven_multilingual_v2"),
+        model_id=config.get("model_id", "eleven_v3"),
         api_key_env=config.get("api_key_env", "ELEVENLABS_API_KEY"),
         default_voice_id=config.get("default_voice_id", "21m00Tcm4TlvDq8ikWAM"),
         voice_settings=config.get("voice_settings"),
         timeout_seconds=float(config.get("timeout_seconds", 90.0)),
         cleanup_voices=bool(config.get("cleanup_voices", True)),
         output_format=config.get("output_format", "mp3_44100_128"),
+        language_code=config.get("language_code", "hy"),
     )

@@ -17,7 +17,7 @@
       emotion: str | None = None,             # drives the inline audio tag prefix
   ) -> bytes  # WAV (PCM-16 mono 24 kHz, wrapped from raw PCM by the candidate)
   ```
-- **Status in pipeline:** **active** since 2026-05-26
+- **Status in pipeline:** **cloud alternate** (was active 2026-05-26 → 2026-05-26; superseded by ElevenLabs Multilingual v2 after the IVC permission scope was added to the key). Flip `[pipeline].tts = "openrouter_gemini_flash_tts"` to revert.
 - **Pricing (per OpenRouter 2026-05-26):** $1 in / $20 out per 1M tokens. ~$0.05-0.10 per 5-min clip; ~$0.40-0.80 per 20-min episode.
 
 ## Inline emotion tags
