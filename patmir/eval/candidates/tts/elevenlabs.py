@@ -235,7 +235,18 @@ class ElevenLabsTTS:
         if self.output_format.startswith("mp3"):
             # Decode MP3 → PCM-16 mono 44.1k via ffmpeg subprocess (already
             # a hard project dependency for ingest + mux).
-            return _mp3_to_wav(audio_bytes)
+            try:
+                return _mp3_to_wav(audio_bytes)
+            except RuntimeError as exc:
+                ctype = resp.headers.get("content-type", "?")
+                head = audio_bytes[:80]
+                print(
+                    f"elevenlabs: MP3 decode failed for text={text[:60]!r} "
+                    f"(voice_id={voice_id}, content-type={ctype}, "
+                    f"bytes={len(audio_bytes)}, head={head!r}). "
+                    f"Returning silent WAV. ({exc})"
+                )
+                return _silent_wav(seconds=1.0, sample_rate=44100)
         elif self.output_format.startswith("pcm"):
             # `pcm_<sr>` — raw PCM-16 mono at that sample rate.
             sr = int(self.output_format.split("_", 1)[1])
@@ -249,6 +260,20 @@ class ElevenLabsTTS:
         else:
             # Assume WAV; pass through.
             return audio_bytes
+
+
+def _silent_wav(seconds: float, sample_rate: int = 44100) -> bytes:
+    """Build a silent PCM-16 mono WAV. Used as a fallback when ElevenLabs
+    returns a non-decodable payload (rare — but seen when synthesizing
+    long letter-runs that the model refuses to vocalize)."""
+    n_samples = max(1, int(seconds * sample_rate))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b"\x00\x00" * n_samples)
+    return buf.getvalue()
 
 
 def _mp3_to_wav(mp3_bytes: bytes) -> bytes:

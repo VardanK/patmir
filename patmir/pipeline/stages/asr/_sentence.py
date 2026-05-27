@@ -113,6 +113,30 @@ def is_non_lexical_interjection(text: str) -> bool:
     return tokens[0] in NON_LEXICAL_SINGLE_TOKENS
 
 
+def is_non_lexical_letter_run(text: str) -> bool:
+    """True when the sentence is a single token consisting of one letter
+    (or one base+repeat pair) repeated many times — Whisper sometimes
+    transcribes long screams or sighs as ``'Аааааааааааааа'`` (a single
+    Cyrillic letter `а` repeated 14 times, no whitespace), which falls
+    through both the multi-token-repetition AND the known-interjection
+    checks. Such giant pseudo-words break downstream TTS (ElevenLabs
+    returns malformed audio when asked to synth them).
+
+    Threshold: one base letter (Counter most-common) covering ≥70% of
+    a single token whose length is ≥4. Catches ``'Ааааа'``, ``'хххх'``,
+    ``'Ииииии'``, and the 223-char ``'Աաաա...'`` we hit on masha-2-5min.
+    """
+    tokens = _tokenize_for_lexical_check(text)
+    if len(tokens) != 1:
+        return False
+    tok = tokens[0]
+    if len(tok) < 4:
+        return False
+    char_counts = Counter(tok)
+    most_common_share = char_counts.most_common(1)[0][1] / len(tok)
+    return most_common_share >= 0.70
+
+
 def is_non_lexical(text: str) -> bool:
     """Umbrella check used by ASR / speaker-tag / ref-picker.
 
@@ -125,6 +149,8 @@ def is_non_lexical(text: str) -> bool:
     if is_non_lexical_repetition(text):
         return True
     if is_non_lexical_interjection(text):
+        return True
+    if is_non_lexical_letter_run(text):
         return True
     tokens = _tokenize_for_lexical_check(text)
     if tokens and all(t in NON_LEXICAL_SINGLE_TOKENS for t in tokens):

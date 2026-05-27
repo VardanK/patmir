@@ -8,10 +8,9 @@
 - **Languages:** ~100 (Whisper-large coverage)
 - **License / gating:** MIT (Whisper base) + community port
 - **Integration surface:** see `patmir/pipeline/stages/asr/whisper_mlx.py`
-- **Status in pipeline:** **offline fallback** (was active Phase 1.3 → 2026-05-26; superseded by `openrouter_gpt_audio` — see ADR `2026-05-26-cloud-asr-via-openrouter.md`)
-- **Last evaluated:** 2026-05-26 (Phase 2 verification on masha-2-5min)
-- **Our experience:** Solid quality on EN and RU sources. The Phase 2 gap-filler + hallucination blocklist together recovered 11 dialogue lines in a 70 s laughter-dominated region the first pass missed.
-- **When to use:** when `OPENROUTER_API_KEY` is unavailable, when running fully offline, or when the cloud route is degraded. Flip `[pipeline].asr = "whisper_large_v3_mlx_fp16"` to revert.
+- **Status in pipeline:** **active** (Phase 1.3 → 2026-05-26 morning; cloud `openrouter_gpt_audio` activated 2026-05-26 morning, reverted 2026-05-26 evening after ear-test showed cloud was not materially better and occasionally truncated the first sentence — see ADR `2026-05-26-cloud-asr-via-openrouter.md`).
+- **Last evaluated:** 2026-05-26 evening (masha-2-5min full pipeline run after revert).
+- **Our experience:** Solid quality on EN and RU sources. The Phase 2 gap-filler + hallucination blocklist together recovered 11 dialogue lines in a 70 s laughter-dominated region the first pass missed. 2026-05-26 update: non-lexical filter extended to catch single-token "letter-runs" Whisper produces for long screams (a 200-char `'Аааааа...'` was killing downstream ElevenLabs TTS).
 - **Notes:**
   - Word-level timestamps work but require `word_timestamps=true`.
   - Detected source language is captured in `Transcript.language`; the runner uses this to route to the right translator language pair.
