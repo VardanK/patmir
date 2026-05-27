@@ -13,7 +13,7 @@ The single source of truth is `patmir.toml [pipeline]`. This table mirrors it fo
 | asr       | `whisper_large_v3_mlx_fp16`      | `mlx-whisper large-v3` (fp16)               | mlx    | VAD post-filter + gap-filler for laughter-dominated regions + hallucination blocklist + non-lexical letter-run filter (catches single-token `'Аааааа...'` mega-words from screams). Cloud `openrouter_gpt_audio` (+ Voxtral / GPT Audio Mini / GPT-4o Audio Preview alternates, ElevenLabs Scribe documented future option) was active 2026-05-26 morning → evening; reverted because the cloud route was not materially better than local on the masha ear-test and occasionally truncated the first sentence. Flip `[pipeline].asr = "openrouter_gpt_audio"` to use the cloud route. |
 | translate | `openrouter_gemini_flash`        | `google/gemini-3.5-flash` via OpenRouter    | cloud  | Casual-register system prompt + per-sentence emotion hint; 3.5-flash locked 2026-05-26 evening after A/B vs 3.1-flash-lite (3.5 produced more emotive/playful Armenian). Claude Opus 4.7 is not a viable alternate (user-rejected). GPT-5 registered but unreliable (None-content errors). NLLB-3.3B is the offline fallback — flip `[pipeline].translate` to revert. Requires `OPENROUTER_API_KEY`. |
 | tts       | `elevenlabs_multilingual_v2`     | `eleven_v3` (ElevenLabs) + `language_code="hy"` | cloud  | **Only `eleven_v3` accepts Armenian as a `language_code`** — older multilingual models (v2 / turbo_v2_5 / flash_v2_5) reject `hy` and silently produce English-phoneme Armenian. Per-speaker IVC clones (one upload per character, reused across emotions, cleaned up on exit); per-emotion `voice_settings` (stability + style) mapped per bin in the candidate; default "Rachel" voice for speakers without a clean ref. Requires `ELEVENLABS_API_KEY` with `text_to_speech` + `voices_read` + `create_instant_voice_clone` scopes. OpenRouter Gemini Flash TTS stays registered as a cloud alternate; OmniVoice MLX is the offline fallback — flip `[pipeline].tts` to revert. |
-| mux       | `ffmpeg_pad_stretch`             | n/a (ffmpeg + pyrubberband)                 | cpu    | `stretch_cap=0.20`, `music_bed_gain=0.6`, 50 ms afade in/out on synthesized track |
+| mux       | `ffmpeg_pad_stretch`             | n/a (ffmpeg + pyrubberband)                 | cpu    | `stretch_cap=0.20`, `music_bed_gain=0.6`, 50 ms afade in/out on synthesized track, per-sentence RMS loudness-match against source vocals (±12 dB cap) |
 | output    | `mkv_default`                    | n/a (ffmpeg mux)                            | cpu    | Armenian default audio, original retained, Armenian SRT default subs   |
 
 ## Pipeline options (`patmir.toml [pipeline.options]`)
@@ -24,7 +24,9 @@ The single source of truth is `patmir.toml [pipeline]`. This table mirrors it fo
 | `asr_int8`          | true    | ASR runs in int8 quantization when supported              |
 | `keep_intermediate` | true    | Don't delete per-sentence WAVs, transcripts, etc. after run |
 | `music_bed_gain`    | 0.6     | Accompaniment level under the AR voice (1.0 = unchanged)  |
-| `voice_gain_db`     | 0.0     | Extra dB applied to the AR voice over its native level    |
+| `voice_gain_db`     | -3.0    | Global trim on top of the per-sentence RMS loudness match. Negative = quieter. Set to `-3.0` on 2026-05-27 after ear-test on masha-2-5min (default `0.0` was too hot once the per-sentence match was added). |
+| `min_ref_seconds`   | 1.5     | Shortest clean turn (after 100 ms edge trim) that qualifies as a `(speaker, emotion)` ref clip. Lowered from 3.0 → 1.5 on 2026-05-27 — ElevenLabs IVC accepts ≥1 s, and 3.0 was excluding most of `SPEAKER_00`'s short cartoon-pace turns on the masha clip. |
+| `sentence_afade_seconds` | 0.05 | Per-sentence fade in/out on synthesized track (voice-leak guard, quality issue #4) |
 
 ## How to swap a model
 

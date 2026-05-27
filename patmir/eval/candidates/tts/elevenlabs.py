@@ -51,6 +51,10 @@ _DEFAULT_VOICE_SETTINGS: dict[str, dict[str, float]] = {
 
 class ElevenLabsTTS:
     id = "elevenlabs_multilingual_v2"
+    # IVC clones from the audio file alone; the reference transcript is
+    # ignored (`del ref_text` in `synthesize` below). The adapter reads this
+    # to decide whether refs with empty `ref_text` are still usable.
+    ref_text_optional = True
 
     def __init__(
         self,
@@ -104,6 +108,15 @@ class ElevenLabsTTS:
         # emotion clips for the same speaker reuse the same upload.
         self._speaker_voice: dict[str, str] = {}
         self._uploaded_voice_ids: list[str] = []
+        # Per-speaker call counters and the first ref WAV path seen for each
+        # speaker — surfaced through `summarize()` so the adapter can write a
+        # per-job voice_cloning_summary.json.
+        self._speaker_lines: dict[str, int] = {}
+        self._speaker_first_ref: dict[str, str] = {}
+        self._ivc_error_by_speaker: dict[str, str] = {}
+        # Count of sentences that errored out during synthesis (timeout, 5xx,
+        # decode failure) and were replaced with a silent placeholder.
+        self._silent_lines: int = 0
         if self.cleanup_voices:
             atexit.register(self._cleanup)
 
@@ -164,6 +177,58 @@ class ElevenLabsTTS:
                 # Best-effort cleanup; don't raise out of atexit.
                 pass
 
+    # ─── observability ─────────────────────────────────────────────────────
+
+    def summarize(self) -> dict:
+        """Return a per-job summary of voice-cloning decisions.
+
+        The adapter calls this at the end of synthesis and writes the result
+        to `<job_dir>/tts/voice_cloning_summary.json`. Speakers fall into:
+
+        - `cloned`            — IVC succeeded; uses `voice_id`.
+        - `fallback_default`  — IVC upload failed; uses `default_voice_id`.
+        - `no_ref_provided`   — adapter found no ref for this speaker; default voice.
+        - `no_speaker`        — `_no_ref` bucket: sentences with no speaker_id.
+        """
+        speakers: dict[str, dict] = {}
+        for speaker_id, lines in self._speaker_lines.items():
+            if speaker_id == "_no_ref":
+                speakers["_no_speaker"] = {
+                    "status": "no_speaker",
+                    "voice_id": self.default_voice_id,
+                    "lines": lines,
+                }
+                continue
+            if speaker_id in self._speaker_voice:
+                speakers[speaker_id] = {
+                    "status": "cloned",
+                    "voice_id": self._speaker_voice[speaker_id],
+                    "ref_audio": self._speaker_first_ref.get(speaker_id),
+                    "lines": lines,
+                }
+            elif speaker_id in self._ivc_failed_speakers:
+                speakers[speaker_id] = {
+                    "status": "fallback_default",
+                    "voice_id": self.default_voice_id,
+                    "ref_audio": self._speaker_first_ref.get(speaker_id),
+                    "reason": self._ivc_error_by_speaker.get(speaker_id, "unknown"),
+                    "lines": lines,
+                }
+            else:
+                # Sentences with no ref WAV looked up by the adapter.
+                speakers[speaker_id] = {
+                    "status": "no_ref_provided",
+                    "voice_id": self.default_voice_id,
+                    "lines": lines,
+                }
+        return {
+            "candidate_id": self.id,
+            "model_id": self.model_id,
+            "default_voice_id": self.default_voice_id,
+            "speakers": speakers,
+            "silent_fallback_lines": self._silent_lines,
+        }
+
     # ─── synth ─────────────────────────────────────────────────────────────
 
     def synthesize(
@@ -185,8 +250,10 @@ class ElevenLabsTTS:
         del ref_text, guidance_scale
 
         voice_id = self.default_voice_id
+        speaker_id = Path(str(ref_audio)).parent.name if ref_audio is not None else "_no_ref"
+        self._speaker_lines[speaker_id] = self._speaker_lines.get(speaker_id, 0) + 1
         if ref_audio is not None:
-            speaker_id = Path(str(ref_audio)).parent.name
+            self._speaker_first_ref.setdefault(speaker_id, str(ref_audio))
             if speaker_id in self._ivc_failed_speakers:
                 # Already known to fail (tier issue, etc.) — skip retry,
                 # quietly use the default voice for this speaker's lines.
@@ -196,6 +263,7 @@ class ElevenLabsTTS:
                     voice_id = self._voice_id_for_ref(ref_audio)
                 except Exception as exc:
                     self._ivc_failed_speakers.add(speaker_id)
+                    self._ivc_error_by_speaker[speaker_id] = f"{type(exc).__name__}: {exc}"
                     print(
                         f"elevenlabs: IVC upload failed for {speaker_id}; "
                         f"falling back to default voice {self.default_voice_id} for this speaker. "
@@ -219,17 +287,32 @@ class ElevenLabsTTS:
         }
         if self.language_code:
             payload["language_code"] = self.language_code
-        resp = self._client.post(
-            f"{_API_BASE}/text-to-speech/{voice_id}",
-            headers={**self._headers, "Content-Type": "application/json"},
-            params={"output_format": self.output_format},
-            json=payload,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"elevenlabs synth failed ({resp.status_code}, voice_id={voice_id}): "
-                f"{resp.text[:500]}"
+        try:
+            resp = self._client.post(
+                f"{_API_BASE}/text-to-speech/{voice_id}",
+                headers={**self._headers, "Content-Type": "application/json"},
+                params={"output_format": self.output_format},
+                json=payload,
             )
+        except httpx.HTTPError as exc:
+            # A single slow request (read timeout / connection reset) used to
+            # kill the entire pipeline mid-TTS — losing 20+ already-synthesized
+            # sentences and the cached IVC voice_ids. Treat it as a per-sentence
+            # failure: emit silence for this line, record it in `summarize()`,
+            # let the pipeline finish so the rest of the job is recoverable.
+            print(
+                f"elevenlabs: synth request errored for text={text[:60]!r} "
+                f"({type(exc).__name__}: {exc}); returning silent WAV for this line."
+            )
+            self._silent_lines += 1
+            return _silent_wav(seconds=1.0, sample_rate=44100)
+        if resp.status_code != 200:
+            print(
+                f"elevenlabs: synth HTTP {resp.status_code} for text={text[:60]!r} "
+                f"(voice_id={voice_id}): {resp.text[:200]}; returning silent WAV."
+            )
+            self._silent_lines += 1
+            return _silent_wav(seconds=1.0, sample_rate=44100)
 
         audio_bytes = resp.content
         if self.output_format.startswith("mp3"):

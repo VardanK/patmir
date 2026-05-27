@@ -127,8 +127,8 @@ def load_pipeline_config(config_path: Path, *, skip_before: str | None = None) -
         asr_int8=bool(opts_raw.get("asr_int8", True)),
         keep_intermediate=bool(opts_raw.get("keep_intermediate", True)),
         music_bed_gain=float(opts_raw.get("music_bed_gain", 0.6)),
-        voice_gain_db=float(opts_raw.get("voice_gain_db", 0.0)),
-        min_ref_seconds=float(opts_raw.get("min_ref_seconds", 3.0)),
+        voice_gain_db=float(opts_raw.get("voice_gain_db", -3.0)),
+        min_ref_seconds=float(opts_raw.get("min_ref_seconds", 1.5)),
         sentence_afade_seconds=float(opts_raw.get("sentence_afade_seconds", 0.05)),
         emotion_guidance=emotion_guidance,
     )

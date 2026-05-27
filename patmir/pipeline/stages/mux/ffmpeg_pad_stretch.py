@@ -7,6 +7,11 @@ For each synthesized sentence:
   4. Position the AR voice at the sentence's source start.
   5. Allow overrun if it doesn't fit — drift accepted; lip sync is not a goal.
 
+Per sentence, also scale the AR voice so its RMS matches the source vocals'
+RMS in the same window (capped at ±12 dB). Keeps shouted lines shouted and
+quiet lines quiet, so the cloned voice doesn't sit at a single flat level
+out of step with the rest of the scene.
+
 Then mix:
   out = accompaniment * music_bed_gain + voice * voice_gain
 with a peak normalize to prevent clipping. Voice tracks live at the same
@@ -33,6 +38,13 @@ from patmir.pipeline.stage import (
 
 
 _NO_STRETCH_BAND = (0.98, 1.02)
+# Cap on the per-sentence loudness-match gain so a mostly-silent source
+# window can't blast the AR voice to clipping (or, conversely, suppress it
+# to silence). ±12 dB → linear factor between ~0.25× and ~4×.
+_LEVEL_MATCH_GAIN_CAP_DB = 12.0
+# Minimum RMS (linear, on float32 audio in [-1, 1]) below which we treat the
+# signal as "essentially silent" and skip the match. Roughly -60 dBFS.
+_LEVEL_MATCH_RMS_FLOOR = 1e-3
 
 
 class FFmpegPadStretch:
@@ -101,6 +113,28 @@ class FFmpegPadStretch:
                 end_sample = n_samples
 
             mono = audio  # voice is mono
+
+            # Per-sentence loudness match: scale the AR voice so its RMS in
+            # this sentence's window matches the source vocals' RMS in the
+            # same source window. Keeps a shouted line shouted and a quiet
+            # line quiet, instead of every cloned line landing at ElevenLabs'
+            # default loudness. Skipped when the vocals stem isn't available
+            # or the source window is effectively silent (the AR voice plays
+            # at its native level, with `voice_gain_db` as the only trim).
+            match_gain = 1.0
+            if vocals_arr is not None:
+                src_start_sample = int(s.source_start * sr)
+                src_end_sample = min(int(s.source_end * sr), n_samples)
+                if src_end_sample > src_start_sample:
+                    src_window = vocals_arr[src_start_sample:src_end_sample]
+                    src_rms = float(np.sqrt(np.mean(src_window ** 2))) if src_window.size else 0.0
+                    synth_rms = float(np.sqrt(np.mean(mono ** 2))) if mono.size else 0.0
+                    if src_rms > _LEVEL_MATCH_RMS_FLOOR and synth_rms > _LEVEL_MATCH_RMS_FLOOR:
+                        raw = src_rms / synth_rms
+                        cap_lin = 10.0 ** (_LEVEL_MATCH_GAIN_CAP_DB / 20.0)
+                        match_gain = max(1.0 / cap_lin, min(cap_lin, raw))
+                        mono = mono * match_gain
+
             # Apply per-sentence afade in/out on the AR voice — see issue #4.
             n_aud = len(mono)
             if sentence_fade > 0 and n_aud > 2 * sentence_fade:

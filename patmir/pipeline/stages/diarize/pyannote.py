@@ -85,7 +85,7 @@ class PyannoteDiarize:
         device: str = "auto",
         min_speakers: int = 0,
         max_speakers: int = 8,
-        min_ref_seconds: float = 3.0,
+        min_ref_seconds: float = 1.5,
         hf_token_env: str = "HF_TOKEN",
     ) -> None:
         from pyannote.audio import Pipeline  # lazy (heavy)
@@ -183,6 +183,6 @@ def build(config: dict[str, Any]) -> PyannoteDiarize:
         device=config.get("device", "auto"),
         min_speakers=int(config.get("min_speakers", 0)),
         max_speakers=int(config.get("max_speakers", 8)),
-        min_ref_seconds=float(config.get("min_ref_seconds", 3.0)),
+        min_ref_seconds=float(config.get("min_ref_seconds", 1.5)),
         hf_token_env=config.get("hf_token_env", "HF_TOKEN"),
     )

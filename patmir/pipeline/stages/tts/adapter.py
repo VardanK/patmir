@@ -47,6 +47,12 @@ class SentenceTTS:
             self._supports_ref = False
             self._supports_guidance = False
             self._supports_emotion = False
+        # IVC-style candidates (ElevenLabs) clone from audio alone and don't
+        # need the reference transcript. They set `ref_text_optional = True`
+        # so we treat refs with empty `ref_text` as usable for them.
+        # Zero-shot candidates that require the transcript (OmniVoice, Piper)
+        # leave the default and still gate on a non-empty ref_text.
+        self._ref_text_optional = bool(getattr(inner, "ref_text_optional", False))
 
     def _lookup_ref(self, diarization: Diarization | None, speaker_id: str | None, emotion: str | None):
         """Fallback chain (Phase 2.x): preserve speaker identity first,
@@ -69,7 +75,11 @@ class SentenceTTS:
             return None
 
         def _is_usable(r) -> bool:
-            return r is not None and r.ref_text.strip() != ""
+            if r is None:
+                return False
+            if self._ref_text_optional:
+                return True
+            return r.ref_text.strip() != ""
 
         emo = emotion or "neutral"
         ref = diarization.refs.get((speaker_id, emo))
@@ -137,6 +147,7 @@ class SentenceTTS:
 
         out = SynthesizedAudio(sentences=sentences, sample_rate=sample_rate)
         _write_index(ctx.job_dir, out)
+        _maybe_write_cloning_summary(out_dir, self.inner)
         return out
 
 
@@ -163,6 +174,22 @@ def _write_index(job_dir: Path, synth: SynthesizedAudio) -> None:
         ],
     }
     (job_dir / "synthesized.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _maybe_write_cloning_summary(tts_dir: Path, inner: Any) -> None:
+    """Write `tts/voice_cloning_summary.json` if the candidate exposes
+    `summarize()`. Candidates without IVC (Piper) skip this silently."""
+    summarize = getattr(inner, "summarize", None)
+    if not callable(summarize):
+        return
+    try:
+        summary = summarize()
+    except Exception as exc:
+        print(f"tts: candidate summarize() raised {type(exc).__name__}: {exc}")
+        return
+    (tts_dir / "voice_cloning_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False)
+    )
 
 
 def build(config: dict[str, Any]) -> SentenceTTS:

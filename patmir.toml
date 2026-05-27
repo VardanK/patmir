@@ -455,8 +455,8 @@ stretch_cap            = 0.20    # max ±20% time-stretch ratio per sentence (pr
 asr_int8               = true
 keep_intermediate      = true
 music_bed_gain         = 0.6     # accompaniment level under the AR voice (1.0 = unchanged)
-voice_gain_db          = 0.0     # extra dB applied to the AR voice over its native level
-min_ref_seconds        = 3.0     # shortest clean turn that qualifies as a (speaker, emotion) ref clip
+voice_gain_db          = -3.0    # global trim on top of the per-sentence RMS match (negative = quieter)
+min_ref_seconds        = 1.5     # shortest clean turn that qualifies as a (speaker, emotion) ref clip (ElevenLabs IVC accepts ≥1 s; 1.5 leaves headroom)
 sentence_afade_seconds = 0.05    # per-sentence fade in/out on the AR voice (suppresses boundary bleed — quality issue #4)
 
 # Maps emotion2vec's 9 classes → 5 ref-clip bins. Each key is a SER class

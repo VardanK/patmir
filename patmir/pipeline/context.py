@@ -35,12 +35,13 @@ class PipelineOptions:
     # so the dialogue sits above the music). The voice itself is normalized
     # to roughly match the original dialogue loudness.
     music_bed_gain: float = 0.6
-    # Extra dB applied to the AR voice over its native level. 0 = identity.
-    voice_gain_db: float = 0.0
+    # Global trim (dB) on top of the mux per-sentence RMS loudness match.
+    # Negative = quieter. -3.0 came out of the 2026-05-27 masha-2-5min ear-test.
+    voice_gain_db: float = -3.0
     # Minimum duration (seconds) a turn must be — after 100 ms inward trim
     # on each side — to qualify as a reference clip for OmniVoice cloning.
     # Used by ref_picker, which runs in the runner post-emotion stage.
-    min_ref_seconds: float = 3.0
+    min_ref_seconds: float = 1.5
     # Per-sentence afade duration (seconds) applied to the synthesized track
     # at sentence boundaries in mux. Suppresses the original-voice bleed at
     # boundaries reported as quality issue #4.

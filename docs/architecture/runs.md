@@ -20,6 +20,7 @@ Every job creates a fresh directory under `runs/`, named `<YYYYMMDD-HHMMSS>-<sou
 | `sentences.json`      | asr      | Same sentences as in `transcript.json` but flat (legacy convenience).                    |
 | `translated.json`     | translate | `TranslatedTranscript` — source + target text per sentence + timing + speaker_id (+ emotion). |
 | `synthesized.json`    | tts      | Per-sentence WAV paths, durations, source timings, target text.                          |
+| `tts/voice_cloning_summary.json` | tts | Per-speaker voice-cloning decisions for IVC candidates (ElevenLabs): `cloned` / `fallback_default` / `no_ref_provided`, with the voice_id, ref audio path, and line count. Written only when the candidate exposes `summarize()`. Open this file first when investigating "wrong character" reports. |
 | `dub.wav`             | mux      | Single concatenated Armenian voice track (resampled to source's SR; per-sentence afade in/out applied). |
 | `dub.meta.json`       | mux      | Duration, sample rate, options used (stretch_cap, music_bed_gain, voice_gain_db).        |
 | `out.mkv`             | output   | Final MKV — Armenian default audio, original retained as secondary, Armenian SRT as default subtitle track. |
@@ -38,9 +39,10 @@ runs/<job>/
 ├── emotion/                  # Phase 2.x
 │   └── segments.json         # Per-turn emotion predictions (start, end, emotion, confidence)
 └── tts/
-    ├── 0.wav                 # One file per synthesized sentence
-    ├── 1.wav
-    └── ...
+    ├── 0000.wav              # One file per synthesized sentence
+    ├── 0001.wav
+    ├── ...
+    └── voice_cloning_summary.json  # Per-speaker IVC decisions (ElevenLabs); absent for non-IVC candidates
 ```
 
 ## How to debug a failed run

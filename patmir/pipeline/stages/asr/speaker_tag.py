@@ -180,21 +180,24 @@ def backfill_ref_text(diarization: Diarization, transcript: Transcript) -> None:
     """Fill each SpeakerRef.ref_text in place by joining ASR words whose
     midpoint falls inside the reference window. Mutates `diarization.refs`.
 
-    Refs whose backfilled text is empty or entirely non-lexical (laughter,
-    bird chirps, single-word interjections) are removed from the refs map
-    — the TTS adapter then falls back through the lookup chain
-    (exact → speaker-neutral → global default).
+    Refs are never removed here — even when the backfilled text is empty or
+    entirely non-lexical (laughter, screams, single interjections). Whether a
+    ref-without-text is usable depends on the active TTS candidate:
+
+    - OmniVoice / Piper need `ref_text` (zero-shot cloning takes a reference
+      transcript). The adapter's `_is_usable` check skips empty-text refs for
+      those candidates.
+    - ElevenLabs IVC only needs the audio. Deleting the ref here used to make
+      it fall through to the global default voice for that entire speaker.
+
+    The deletion path is therefore moved to the adapter, where the
+    candidate's `ref_text_optional` attribute decides the gating.
 
     `diarization.refs` is keyed by `(speaker_id, emotion_bin)` in Phase 2.x.
     """
-    drop: list[tuple[str, str]] = []
-    for key, ref in diarization.refs.items():
+    for ref in diarization.refs.values():
         words = [
             w for w in transcript.words
             if ref.source_start <= 0.5 * (w.start + w.end) < ref.source_end
         ]
         ref.ref_text = " ".join(w.text for w in words).strip()
-        if not ref.ref_text or is_non_lexical(ref.ref_text):
-            drop.append(key)
-    for key in drop:
-        del diarization.refs[key]
