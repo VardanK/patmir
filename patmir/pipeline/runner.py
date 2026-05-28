@@ -35,7 +35,15 @@ def run_job(
     resume_job_dir: Path | None = None,
     resume_from: str | None = None,
     source_lang: str | None = None,
+    on_job_dir_created: Any = None,
 ) -> Manifest:
+    """Run the full pipeline.
+
+    `on_job_dir_created`, when given, is invoked exactly once with
+    `(job_dir, job_id)` immediately after the per-job directory exists —
+    lets a wrapper (e.g. the FastAPI server) bind a JobRecord to the
+    run_job_id without waiting for the whole pipeline to finish.
+    """
     runs_root = runs_root or Path.cwd() / "runs"
 
     if resume_job_dir is not None:
@@ -45,6 +53,13 @@ def run_job(
     else:
         job_dir, job_id = _make_job_dir(source, runs_root)
         manifest = Manifest(job_id=job_id, source_path=str(source))
+
+    if on_job_dir_created is not None:
+        try:
+            on_job_dir_created(job_dir, job_id)
+        except Exception:  # noqa: BLE001
+            # The callback is informational; never let it crash the pipeline.
+            pass
 
     if source_lang:
         manifest.source_lang = source_lang

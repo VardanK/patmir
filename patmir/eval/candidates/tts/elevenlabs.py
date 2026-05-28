@@ -307,12 +307,61 @@ class ElevenLabsTTS:
             self._silent_lines += 1
             return _silent_wav(seconds=1.0, sample_rate=44100)
         if resp.status_code != 200:
-            print(
-                f"elevenlabs: synth HTTP {resp.status_code} for text={text[:60]!r} "
-                f"(voice_id={voice_id}): {resp.text[:200]}; returning silent WAV."
+            # Cloned-voice rejections (captcha / celebrity match / ToS) fail
+            # with HTTP 403 + code=voice_access_denied or detected_captcha_voice.
+            # These only ever fire for IVC-cloned voices, never for the
+            # default library voice. Retry once with the default voice so
+            # the dub isn't silenced for an entire video just because the
+            # clone tripped the captcha (e.g. real-celebrity ref clips).
+            is_voice_block = (
+                resp.status_code == 403
+                and voice_id != self.default_voice_id
+                and ("voice_access_denied" in resp.text or "detected_captcha" in resp.text)
             )
-            self._silent_lines += 1
-            return _silent_wav(seconds=1.0, sample_rate=44100)
+            if is_voice_block:
+                if speaker_id not in self._ivc_failed_speakers:
+                    self._ivc_failed_speakers.add(speaker_id)
+                    self._ivc_error_by_speaker[speaker_id] = (
+                        f"voice_access_denied (HTTP 403, captcha/ToS) — clone "
+                        f"of speaker {speaker_id} rejected; using default voice."
+                    )
+                    print(
+                        f"elevenlabs: cloned voice {voice_id} for {speaker_id} "
+                        f"rejected by captcha/ToS; retrying with default voice "
+                        f"{self.default_voice_id} for this and subsequent lines."
+                    )
+                try:
+                    retry = self._client.post(
+                        f"{_API_BASE}/text-to-speech/{self.default_voice_id}",
+                        headers={**self._headers, "Content-Type": "application/json"},
+                        params={"output_format": self.output_format},
+                        json=payload,
+                    )
+                except httpx.HTTPError as exc:
+                    print(
+                        f"elevenlabs: retry with default voice errored "
+                        f"({type(exc).__name__}: {exc}); returning silent WAV."
+                    )
+                    self._silent_lines += 1
+                    return _silent_wav(seconds=1.0, sample_rate=44100)
+                if retry.status_code == 200:
+                    resp = retry
+                    voice_id = self.default_voice_id
+                else:
+                    print(
+                        f"elevenlabs: retry with default voice also failed "
+                        f"HTTP {retry.status_code}: {retry.text[:200]}; "
+                        f"returning silent WAV."
+                    )
+                    self._silent_lines += 1
+                    return _silent_wav(seconds=1.0, sample_rate=44100)
+            else:
+                print(
+                    f"elevenlabs: synth HTTP {resp.status_code} for text={text[:60]!r} "
+                    f"(voice_id={voice_id}): {resp.text[:200]}; returning silent WAV."
+                )
+                self._silent_lines += 1
+                return _silent_wav(seconds=1.0, sample_rate=44100)
 
         audio_bytes = resp.content
         if self.output_format.startswith("mp3"):

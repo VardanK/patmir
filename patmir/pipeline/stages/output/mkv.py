@@ -1,16 +1,21 @@
 """Output stage — MKV remux with Armenian as default audio.
 
 Builds the final container:
-  - Video stream: copied from source (no re-encode).
+  - Video stream (when the source has one): copied from source (no re-encode).
   - Audio track 0: Armenian (AAC-encoded from `dub.wav`), language=hye, default.
   - Audio track 1: original audio from the source, language=<detected>, copied.
   - Subtitle track 0: Armenian SRT generated from the translated transcript.
+
+When the source has no video stream (e.g. the local server pulls
+audio-only YouTube downloads), the video map + codec flags are omitted and
+the output is an audio + subtitle MKV.
 
 Designed so MP4 output is a sibling module later — only the ffmpeg flags
 change (and MP4 sub-track handling differs).
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -39,17 +44,24 @@ class MKVOutput:
         _write_srt(srt_path, translated.sentences)
         ctx.progress("output", 0.2, "wrote SRT")
 
+        has_video = _has_video_stream(source_video)
         src_lang_tag = translated.source_lang or "und"
-        cmd = [
+        cmd: list[str] = [
             "ffmpeg", "-y",
             "-i", str(source_video),
             "-i", str(muxed.path),
             "-i", str(srt_path),
-            "-map", "0:v:0",
+        ]
+        if has_video:
+            cmd += ["-map", "0:v:0"]
+        cmd += [
             "-map", "1:a:0",
             "-map", "0:a:0?",
             "-map", "2:s:0",
-            "-c:v", "copy",
+        ]
+        if has_video:
+            cmd += ["-c:v", "copy"]
+        cmd += [
             "-c:a:0", "aac",
             "-b:a:0", "192k",
             "-c:a:1", "copy",
@@ -67,6 +79,31 @@ class MKVOutput:
         subprocess.run(cmd, check=True, capture_output=True)
         ctx.progress("output", 1.0, str(out_video))
         return OutputArtifacts(video=out_video, subtitles=srt_path)
+
+
+def _has_video_stream(path: Path) -> bool:
+    """True when ffprobe reports at least one video stream on `path`.
+
+    Audio-only sources (yt-dlp's `bestaudio/best`) return `False`, in which
+    case the output stage emits an audio + subtitle MKV.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v",
+                "-show_entries", "stream=codec_type",
+                "-of", "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        data = json.loads(result.stdout or "{}")
+        return bool(data.get("streams"))
+    except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError):
+        return False
 
 
 def _write_srt(path: Path, sentences: list[TranslatedSentence]) -> None:

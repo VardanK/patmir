@@ -5,6 +5,7 @@ Subcommands:
   patmir runs ls
   patmir runs show <ts>
   patmir ui [--port 8765]
+  patmir submit <video|--url URL>
 
 Progress is read from `<job_dir>/progress.jsonl` in a background thread and
 rendered as one line per stage in the terminal.
@@ -55,6 +56,18 @@ def main(argv: list[str] | None = None) -> int:
     p_ui = sub.add_parser("ui", help="Launch the local FastAPI progress UI.")
     p_ui.add_argument("--port", type=int, default=8765)
     p_ui.add_argument("--runs-root", type=Path, default=RUNS_ROOT)
+    p_ui.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+
+    p_submit = sub.add_parser(
+        "submit",
+        help="POST a file or URL to the local Patmir server. Server must be running (patmir ui).",
+    )
+    p_submit.add_argument("video", nargs="?", type=Path,
+                          help="Local video file. Omit when using --url.")
+    p_submit.add_argument("--url", type=str, default=None,
+                          help="Video URL (e.g. YouTube). Cannot be combined with a file path.")
+    p_submit.add_argument("--source-lang", type=str, default=None)
+    p_submit.add_argument("--server", type=str, default="http://127.0.0.1:8765")
 
     args = parser.parse_args(argv)
     if args.cmd == "dub":
@@ -65,7 +78,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.runs_cmd == "show":
             return cmd_runs_show(args.job_id)
     if args.cmd == "ui":
-        return cmd_ui(args.port, args.runs_root)
+        return cmd_ui(args.port, args.runs_root, args.config)
+    if args.cmd == "submit":
+        return cmd_submit(args)
     parser.print_help()
     return 1
 
@@ -147,14 +162,68 @@ def cmd_runs_show(job_id: str) -> int:
     return 0
 
 
-def cmd_ui(port: int, runs_root: Path) -> int:
+def cmd_ui(port: int, runs_root: Path, config: Path) -> int:
     try:
         from patmir.ui.app import serve
+        from patmir.ui import auth as ui_auth
     except ImportError as exc:
         print(f"UI extra not installed: {exc}", file=sys.stderr)
         print("  pip install -e '.[ui]'", file=sys.stderr)
         return 2
-    serve(port=port, runs_root=runs_root)
+    cfg = load_pipeline_config(config)
+    token = ui_auth.ensure_token()
+    print(f"patmir ui — bind 127.0.0.1:{port}", file=sys.stderr)
+    print(f"  config:  {config}", file=sys.stderr)
+    print(f"  runs:    {runs_root}", file=sys.stderr)
+    print(f"  token:   {token}  (paste into the Chrome extension options page)",
+          file=sys.stderr)
+    serve(port=port, runs_root=runs_root, cfg=cfg, token=token)
+    return 0
+
+
+def cmd_submit(args: argparse.Namespace) -> int:
+    import urllib.request
+
+    if bool(args.video) == bool(args.url):
+        print("error: pass exactly one of <video> or --url", file=sys.stderr)
+        return 2
+
+    try:
+        from patmir.ui import auth as ui_auth
+    except ImportError as exc:
+        print(f"UI extra not installed: {exc}", file=sys.stderr)
+        return 2
+
+    token = ui_auth.ensure_token()
+    body: dict[str, str] = {}
+    if args.video:
+        path = args.video.expanduser().resolve()
+        if not path.is_file():
+            print(f"error: {path} not found", file=sys.stderr)
+            return 2
+        body["source_path"] = str(path)
+    else:
+        body["source_url"] = args.url
+    if args.source_lang:
+        body["source_lang"] = args.source_lang
+
+    req = urllib.request.Request(
+        f"{args.server.rstrip('/')}/jobs",
+        data=json.dumps(body).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError) as exc:
+        print(f"error: could not reach {args.server} — is `patmir ui` running?", file=sys.stderr)
+        print(f"  {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(data, indent=2, ensure_ascii=False))
     return 0
 
 

@@ -10,6 +10,15 @@ ingest → separate → diarize → emotion → asr → translate → tts → mu
 
 Order is defined in `stage.py:STAGE_ORDER`. Resume-from-stage is supported via `patmir dub <video> --resume-from <stage>` (loads prior artifacts from disk).
 
+## Ingest sources
+
+Two entry points feed the same pipeline:
+
+- **Local file path** (CLI: `patmir dub <video>`, or `patmir submit <video>` to the local server) — the `ffmpeg` ingest candidate reads PCM from the file directly.
+- **URL** (Chrome extension or `patmir submit --url <URL>`) — the local FastAPI server (`patmir ui`) pre-downloads with yt-dlp to `~/.patmir/downloads/<cache_key>/source.<ext>` and then runs the same `ffmpeg` ingest candidate on the downloaded file. A dedicated `yt_dlp` ingest candidate is on the roadmap (slice 3 of the D1 spec) so the URL doesn't have to be fully downloaded before the pipeline starts.
+
+Successful runs are materialized into a global cache at `~/.patmir/cache/<key>/dub.wav` keyed by source + pipeline-config hash; subsequent submissions of the same URL/file under the same config return instantly. See `decisions/2026-05-27-low-friction-translation-d1.md`.
+
 ## Data flow (ASCII)
 
 ```

@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Patmir — Options</title>
+  <style>
+    body { font: 13px -apple-system, system-ui, sans-serif; margin: 24px; max-width: 520px; }
+    h1 { font-size: 16px; }
+    label { display: block; margin-top: 14px; font-weight: 500; }
+    input[type=text] { width: 100%; padding: 6px 8px; font-family: ui-monospace, monospace; box-sizing: border-box; }
+    button { margin-top: 14px; padding: 8px 14px; }
+    .hint { color: #666; font-size: 12px; margin-top: 6px; }
+    .ok { color: #1e8e3e; }
+    .err { color: #c5221f; }
+  </style>
+</head>
+<body>
+  <h1>Patmir extension — options</h1>
+  <p>Connect this extension to your local Patmir server. The token is auto-generated the first time you run <code>patmir ui</code> and printed on stderr.</p>
+
+  <label for="server">Server URL</label>
+  <input id="server" type="text" placeholder="http://127.0.0.1:8765" />
+  <div class="hint">Loopback only. Defaults to <code>http://127.0.0.1:8765</code>.</div>
+
+  <label for="token">Bearer token</label>
+  <input id="token" type="text" placeholder="paste the hex token printed by `patmir ui`" />
+  <div class="hint">Stored locally in <code>chrome.storage.local</code>. Never sent to anywhere but your local server.</div>
+
+  <label style="display:flex;align-items:center;gap:8px;margin-top:18px;font-weight:normal;">
+    <input id="autoplay" type="checkbox" />
+    <span>Auto-play cached dubs</span>
+  </label>
+  <div class="hint">When a YouTube video has already been translated, play the dub automatically. You can still stop it from the popup; the choice is remembered per video.</div>
+
+  <button id="save">Save</button>
+  <span id="status" style="margin-left:10px;"></span>
+
+  <script src="options.js"></script>
+</body>
+</html>

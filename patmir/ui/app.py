@@ -1,10 +1,15 @@
-"""Local FastAPI progress UI.
+"""Local FastAPI server.
 
-Localhost-only, no auth. Lists runs under `runs/`, shows per-stage status from
-each manifest, and streams `progress.jsonl` over Server-Sent Events for live
-updates while a job is running.
+Two surfaces live here:
 
-  patmir ui --port 8765
+* The original read-only progress UI (HTML + SSE over `runs/`) — unchanged.
+* The Phase-2-finalization job-submission API used by the Chrome extension
+  and the `patmir submit` CLI: `POST /jobs`, `GET /cache/lookup`,
+  `GET /jobs/{id}`, `GET /cache/{key}/dub.wav`, `GET /cache/{key}/metadata.json`.
+
+Bound to `127.0.0.1` only; bearer-token auth gates every new endpoint. The
+existing `/`, `/run/{id}`, `/run/{id}/progress` routes stay open for the
+browser progress UI on the same loopback origin.
 """
 from __future__ import annotations
 
@@ -12,20 +17,57 @@ import asyncio
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
+from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.stage import STAGE_ORDER
+from patmir.ui import auth, cache as cache_mod
+from patmir.ui.jobs import JobManager, JobSpec
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
+# Cache-key length is 16 hex chars; constrain the path param so a stray
+# request can't walk paths under the cache root.
+_CACHE_KEY_RE = r"^[0-9a-f]{16}$"
 
-def _create_app(runs_root: Path) -> FastAPI:
+
+def _create_app(
+    runs_root: Path,
+    cache_root: Path,
+    cfg: PipelineConfig,
+    token: str,
+) -> FastAPI:
     app = FastAPI(title="Patmir")
     runs_root = runs_root.resolve()
+    cache_root = cache_root.resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    require_token = auth.TokenAuth(token)
+    manager = JobManager(cfg, runs_root=runs_root, cache_root=cache_root)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^chrome-extension://.*$|^moz-extension://.*$|^http://(127\.0\.0\.1|localhost)(:\d+)?$",
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+        max_age=600,
+    )
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        await manager.start()
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        await manager.stop()
+
+    # ---------- legacy progress UI (unchanged) -----------------------------
 
     def _safe_job_dir(job_id: str) -> Path:
         candidate = (runs_root / job_id).resolve()
@@ -52,11 +94,7 @@ def _create_app(runs_root: Path) -> FastAPI:
                     "lang": m.source_lang or "?",
                     "stages": [(n, m.stage(n).state) for n in STAGE_ORDER],
                 })
-        return TEMPLATES.TemplateResponse(
-            request,
-            "index.html",
-            {"runs": rows},
-        )
+        return TEMPLATES.TemplateResponse(request, "index.html", {"runs": rows})
 
     @app.get("/run/{job_id}", response_class=HTMLResponse)
     def run_detail(request: Request, job_id: str):
@@ -93,7 +131,6 @@ def _create_app(runs_root: Path) -> FastAPI:
                             if line.strip():
                                 yield f"data: {line.strip()}\n\n"
                         pos = f.tell()
-                # Done condition: read manifest, stop if all stages are terminal.
                 mp = job_dir / "manifest.json"
                 if mp.exists():
                     m = Manifest.from_path(mp)
@@ -123,11 +160,108 @@ def _create_app(runs_root: Path) -> FastAPI:
             raise HTTPException(status_code=404, detail="no transcript yet")
         return json.loads(path.read_text())
 
+    # ---------- D1: cache + jobs API ---------------------------------------
+
+    def _safe_cache_dir(key: str) -> Path:
+        candidate = (cache_root / key).resolve()
+        if cache_root not in candidate.parents:
+            raise HTTPException(status_code=400, detail="invalid cache_key")
+        if not candidate.is_dir():
+            raise HTTPException(status_code=404, detail="no such cache entry")
+        return candidate
+
+    @app.get("/cache/lookup", dependencies=[Depends(require_token)])
+    def cache_lookup(url: str = Query(..., min_length=4)):
+        entry = manager.lookup_cache_by_url(url)
+        if entry is None:
+            return JSONResponse({
+                "cached": False,
+                "cache_key": manager.cache_key_for_url(url),
+            })
+        return JSONResponse({
+            "cached": True,
+            "cache_key": entry.cache_key,
+            "duration": entry.duration,
+            "created_at": entry.created_at,
+            "source_url": entry.source_url,
+        })
+
+    @app.post("/jobs", dependencies=[Depends(require_token)])
+    async def jobs_submit(payload: dict):
+        try:
+            spec = JobSpec(
+                source_url=payload.get("source_url"),
+                source_path=payload.get("source_path"),
+                source_lang=payload.get("source_lang"),
+                force=bool(payload.get("force", False)),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            rec = await manager.submit(spec)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return rec.to_public()
+
+    @app.get("/jobs/{job_id}", dependencies=[Depends(require_token)])
+    def jobs_get(job_id: str):
+        rec = manager.get(job_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="unknown job_id")
+        return rec.to_public()
+
+    @app.get("/cache/{cache_key}/dub.wav", dependencies=[Depends(require_token)])
+    def cache_dub(cache_key: str, request: Request):
+        if not _is_valid_key(cache_key):
+            raise HTTPException(status_code=400, detail="invalid cache_key")
+        cache_dir = _safe_cache_dir(cache_key)
+        path = cache_dir / "dub.wav"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="no dub.wav")
+        return FileResponse(
+            path,
+            media_type="audio/wav",
+            headers={"Cache-Control": "private, immutable, max-age=31536000"},
+        )
+
+    @app.get("/cache/{cache_key}/metadata.json", dependencies=[Depends(require_token)])
+    def cache_metadata(cache_key: str):
+        if not _is_valid_key(cache_key):
+            raise HTTPException(status_code=400, detail="invalid cache_key")
+        cache_dir = _safe_cache_dir(cache_key)
+        path = cache_dir / "metadata.json"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="no metadata")
+        return JSONResponse(json.loads(path.read_text()))
+
     return app
 
 
-def serve(port: int = 8765, runs_root: Path | None = None) -> None:
+def _is_valid_key(key: str) -> bool:
+    import re
+    return re.fullmatch(_CACHE_KEY_RE, key or "") is not None
+
+
+def serve(
+    *,
+    port: int = 8765,
+    runs_root: Path | None = None,
+    cache_root: Path | None = None,
+    cfg: PipelineConfig | None = None,
+    token: str | None = None,
+) -> None:
     import uvicorn
 
-    app = _create_app(runs_root or Path("runs"))
+    if cfg is None:
+        from patmir.pipeline.config import load_pipeline_config
+        cfg = load_pipeline_config(Path("patmir.toml"))
+    if token is None:
+        token = auth.ensure_token()
+
+    app = _create_app(
+        runs_root=runs_root or Path("runs"),
+        cache_root=cache_root or cache_mod.DEFAULT_CACHE_ROOT,
+        cfg=cfg,
+        token=token,
+    )
     uvicorn.run(app, host="127.0.0.1", port=port)
