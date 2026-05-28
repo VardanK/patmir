@@ -105,6 +105,34 @@ timeout_seconds = 60.0
 # per sentence), and drops per-call cost ~30×. Verified 2026-05-26.
 reasoning   = { effort = "minimal" }
 
+# Batched + structured-output variant of the same Gemini Flash backend.
+# Translates N sentences per call (default 20) with a 2-sentence sliding
+# overlap of already-translated context, and enforces a strict JSON-schema
+# response (`{translations: [{idx, text}]}`). Speaker_id + emotion are
+# injected as input metadata so the LLM keeps each character's vocabulary
+# coherent across the chunk; the output schema only carries `idx + text`,
+# so emotion/speaker/timing can never be lost — they're zipped back in by
+# `idx` in the adapter from the source `Sentence`. Falls back to
+# per-sentence translation for any chunk whose response fails validation
+# (count mismatch, missing idx, empty text, transport error).
+#
+# Registered enabled=true but NOT the active default — flip
+# `[pipeline].translate = "openrouter_gemini_flash_batch"` to A/B-test it
+# against the per-sentence translator on the same source clip.
+[[eval.translation.candidates]]
+id              = "openrouter_gemini_flash_batch"
+enabled         = true
+module          = "patmir.eval.candidates.translation.openrouter_batch"
+model           = "google/gemini-3.5-flash"
+api_key_env     = "OPENROUTER_API_KEY"
+max_tokens      = 4096        # batched output needs more headroom than 512
+temperature     = 0.2
+top_p           = 0.9
+timeout_seconds = 120.0
+chunk_size      = 20
+overlap         = 2
+reasoning       = { effort = "minimal" }
+
 [[eval.translation.candidates]]
 id          = "openrouter_claude_opus"
 enabled     = false
