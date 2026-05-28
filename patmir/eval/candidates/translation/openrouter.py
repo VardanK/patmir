@@ -74,9 +74,17 @@ class OpenRouterTranslator:
         # makes translate stages crawl serially and burn cost. We default
         # to `effort=minimal` which forces 0 reasoning tokens on models
         # that mandate thinking (Gemini 3.5+ refuses `enabled=false`).
+        # `thinking`: DeepSeek-native control (`{type: "disabled"}` turns off
+        # chain-of-thought). OpenRouter passes provider-specific fields through.
+        # Use this instead of `reasoning.effort` for DeepSeek models — they
+        # ignore OpenRouter's reasoning abstraction and stay in thinking mode
+        # by default, which on V4 Pro adds ~12 s per call. Verified 2026-05-27.
         # Set `reasoning=None` to opt out of sending the parameter (some
         # legacy models don't accept it).
         reasoning: dict | None = None,
+        # DeepSeek-native control passed straight through OpenRouter. Set
+        # `{"type": "disabled"}` to skip chain-of-thought.
+        thinking: dict | None = None,
         # Optional OpenRouter attribution headers (recommended by their docs).
         referer: str = "https://github.com/patmir-dub",
         title: str = "Patmir Armenian Dubbing",
@@ -94,6 +102,7 @@ class OpenRouterTranslator:
         self.temperature = temperature
         self.top_p = top_p
         self.reasoning = reasoning
+        self.thinking = thinking
         self.base_url = base_url.rstrip("/")
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -131,6 +140,8 @@ class OpenRouterTranslator:
         }
         if self.reasoning is not None:
             payload["reasoning"] = self.reasoning
+        if self.thinking is not None:
+            payload["thinking"] = self.thinking
         resp = self._client.post(
             f"{self.base_url}/chat/completions",
             headers=self.headers,
@@ -143,12 +154,21 @@ class OpenRouterTranslator:
             )
         data = resp.json()
         try:
-            content = data["choices"][0]["message"]["content"]
+            message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(
                 f"openrouter translator: unexpected response shape from {self.model}: "
                 f"{str(data)[:500]}"
             ) from exc
+        # Some reasoning-enabled models (DeepSeek V4 Pro, others) occasionally
+        # return `content: null` while the answer lives in `reasoning` or
+        # `reasoning_content`. Fall through in order so the contract still
+        # returns a usable string instead of crashing the translate loop.
+        content = message.get("content")
+        if not content:
+            content = message.get("reasoning_content") or message.get("reasoning") or ""
+        if not isinstance(content, str):
+            content = ""
         return _strip_thinking(content).strip()
 
 
@@ -172,6 +192,7 @@ def build(config: dict[str, Any]) -> OpenRouterTranslator:
         timeout_seconds=float(config.get("timeout_seconds", 60.0)),
         base_url=config.get("base_url", _BASE_URL),
         reasoning=config.get("reasoning"),
+        thinking=config.get("thinking"),
         referer=config.get("referer", "https://github.com/patmir-dub"),
         title=config.get("title", "Patmir Armenian Dubbing"),
     )

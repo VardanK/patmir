@@ -123,6 +123,26 @@ api_key_env = "OPENROUTER_API_KEY"
 max_tokens  = 512
 temperature = 0.2
 
+# DeepSeek V4 Pro — REJECTED 2026-05-27 after benchmark on masha-2-5min.
+# Even with `thinking={type: "disabled"}` (the DeepSeek-native passthrough,
+# since OpenRouter's `reasoning.effort` is ignored by this model), 4/10
+# sample sentences leaked chain-of-thought into the `content` field and
+# avg latency was 10.9 s/sentence (~10× Gemini 3.5 Flash). Cheap on paper
+# but production-unusable for the per-sentence translate loop. Entry left
+# disabled so the verdict is discoverable; flip `enabled = true` and revisit
+# only if DeepSeek ships a fix for the no-thinking-mode-content-leak bug.
+[[eval.translation.candidates]]
+id          = "openrouter_deepseek_v4_pro"
+enabled     = false
+module      = "patmir.eval.candidates.translation.openrouter"
+model       = "deepseek/deepseek-v4-pro"
+api_key_env = "OPENROUTER_API_KEY"
+max_tokens  = 512
+temperature = 0.2
+top_p       = 0.9
+timeout_seconds = 60.0
+thinking    = { type = "disabled" }
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Translation candidates added post-Phase-0 — registered, not yet enabled.
 # Picked up by the GPU re-eval pass. See Phase 1 spec for details.
@@ -215,6 +235,47 @@ temperature = 0.1
 top_p       = 0.9
 repetition_penalty = 1.15
 no_think    = true
+
+# Google TranslateGemma — REJECTED 2026-05-27 for the cartoon-dub use case.
+# Pure translation model (Gemma 3 base, structured chat template with
+# `source_lang_code` / `target_lang_code` only, NO system-prompt surface,
+# NO emotion or register control). 27B 4-bit MLX smoke-test on 10 masha
+# sentences:
+#   - Latency: ~37 s/sentence at max_tokens=256 on MPS (vs Gemini ~1 s).
+#     Fixable via short max_tokens + stop-on-`(`, would land ~6 s/sentence.
+#   - Quality: register is formal/literary (`Ցանկանո՞ւմ ես փորձել` vs
+#     Gemini's `Ուզո՞ւմ ես փորձես`), and the model occasionally appends a
+#     parenthesized transliteration (`Փխ, ինչ անհաճոյ։ (Phkh, inch a…)`)
+#     which we can't suppress without the missing system-prompt surface.
+# Net: doesn't match the casual-Yerevan dub register the project targets.
+# Entries left registered (disabled) so the verdict is discoverable; flip
+# `enabled = true` and the active translate id to use one.
+[[eval.translation.candidates]]
+id          = "translategemma_27b_mlx_4bit"
+enabled     = false
+module      = "patmir.eval.candidates.translation.translategemma_mlx"
+model_id    = "mlx-community/translategemma-27b-it-4bit"
+target_lang = "hy"
+max_tokens  = 512
+temperature = 0.0
+
+[[eval.translation.candidates]]
+id          = "translategemma_12b_mlx_4bit"
+enabled     = false
+module      = "patmir.eval.candidates.translation.translategemma_mlx"
+model_id    = "mlx-community/translategemma-12b-it-4bit"
+target_lang = "hy"
+max_tokens  = 512
+temperature = 0.0
+
+[[eval.translation.candidates]]
+id          = "translategemma_4b_mlx_4bit"
+enabled     = false
+module      = "patmir.eval.candidates.translation.translategemma_mlx"
+model_id    = "mlx-community/translategemma-4b-it-4bit"
+target_lang = "hy"
+max_tokens  = 512
+temperature = 0.0
 
 # Unsloth Dynamic v2.0 4-bit variant of Qwen3.6-27B — selective high-precision
 # quantization keeps more bits in sensitive layers (where low-resource language
@@ -442,9 +503,9 @@ response_format = "mp3"
 [pipeline]
 ingest    = "ffmpeg"
 separate  = "htdemucs"
-diarize   = "pyannote_3_1"
+diarize   = "elevenlabs_scribe_v2"
 emotion   = "emotion2vec_plus_base"
-asr       = "whisper_large_v3_mlx_fp16"
+asr       = "elevenlabs_scribe_v2"
 translate = "openrouter_gemini_flash"
 tts       = "elevenlabs_multilingual_v2"
 mux       = "ffmpeg_pad_stretch"
@@ -511,14 +572,32 @@ device = "auto"          # auto → mps on Apple Silicon
 [[stages.diarize.candidates]]
 id              = "pyannote_3_1"
 module          = "patmir.pipeline.stages.diarize.pyannote"
-model_id        = "pyannote/speaker-diarization-3.1"
+model_id        = "pyannote/speaker-diarization-community-1"   # 2026-05-27 swap from 3.1 → community-1 (newer embeddings; better short-turn resolution for cartoon dialogue)
 device          = "auto"   # auto → cuda > mps > cpu; pyannote MPS coverage is partial, set "cpu" if it crashes
-min_speakers    = 0        # 0 = let pyannote estimate
-max_speakers    = 8
+min_speakers    = 0        # 0 = let pyannote estimate; ignored when num_speakers > 0
+max_speakers    = 8        # ignored when num_speakers > 0
+num_speakers    = 4        # exact speaker count for masha-2-5min (4 distinct characters). Set to 0 to let pyannote infer.
 hf_token_env    = "HF_TOKEN"
 # Note: ref-clip slicing is no longer done in this stage — it runs in the
 # runner after the `emotion` stage, so per-(speaker, emotion) ref clips
 # can be picked. `min_ref_seconds` lives under `[pipeline.options]` now.
+
+# Scribe v2 — cloud-side diarizer (and the ASR for the same job; see
+# `[[stages.asr.candidates]]` below). One HTTPS call returns words + per-word
+# `speaker_id`; we collapse same-speaker runs into turns. Picked 2026-05-27
+# after pyannote community-1 still merged a short (~1 s) female line into the
+# surrounding male's bucket on masha-2-5min. Scribe v2 advertises 98%
+# speaker-label accuracy; better on cartoon-pace short turns.
+# Result is cached at `<job>/scribe/result.json` so the asr candidate
+# (matching id) doesn't repeat the upload.
+[[stages.diarize.candidates]]
+id                     = "elevenlabs_scribe_v2"
+module                 = "patmir.pipeline.stages.diarize.elevenlabs_scribe"
+api_key_env            = "ELEVENLABS_API_KEY"
+model_id               = "scribe_v2"
+num_speakers           = 4         # exact speaker count for masha-2-5min. Set to 0 to let Scribe infer.
+# diarization_threshold = 0.22     # default; lower → more clusters / looser merges
+timeout_seconds        = 600.0
 
 # ─── Emotion (speech emotion recognition; Phase 2.x) ──────────────────────────
 # Runs on the Demucs vocal stem per diarization turn. Outputs feed two
@@ -597,19 +676,18 @@ timeout_seconds = 240.0
 max_tokens      = 4096
 temperature     = 0.0
 
-# ElevenLabs Scribe v2 — documented-but-not-used future option. Per-project
-# policy: tier-gated until ear-tested + budget-sanctioned (mirrors how the
-# ElevenLabs Multilingual v2 TTS is shelved). NOTE: Scribe is actually on
-# the ElevenLabs Free tier — the gate here is policy, not API. No candidate
-# module is implemented; the toml entry is documentation-only. Native word
-# timestamps + diarization (up to 32 speakers); 3 GB / 10 hr per request.
+# ElevenLabs Scribe v2 — native word timestamps + diarization (up to 32
+# speakers) in one HTTPS call. Used 2026-05-27 onward as both the asr and
+# diarize candidate; result is cached at `<job>/scribe/result.json` so the
+# two stages share a single upload. See the matching diarize candidate
+# above and ADR `2026-05-27-scribe-v2-for-asr-and-diarize.md`.
 [[stages.asr.candidates]]
-enabled         = false
-id              = "elevenlabs_scribe_v2"
-module          = "patmir.pipeline.stages.asr.elevenlabs_scribe"  # NOT IMPLEMENTED
-model           = "scribe-v2"
-api_key_env     = "ELEVENLABS_API_KEY"
-timeout_seconds = 180.0
+id                     = "elevenlabs_scribe_v2"
+module                 = "patmir.pipeline.stages.asr.elevenlabs_scribe"
+api_key_env            = "ELEVENLABS_API_KEY"
+model_id               = "scribe_v2"
+num_speakers           = 4         # match the diarize candidate's value
+timeout_seconds        = 600.0
 
 [[stages.asr.candidates]]
 id            = "faster_whisper_large_v3_turbo"

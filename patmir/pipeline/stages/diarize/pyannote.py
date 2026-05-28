@@ -85,6 +85,7 @@ class PyannoteDiarize:
         device: str = "auto",
         min_speakers: int = 0,
         max_speakers: int = 8,
+        num_speakers: int = 0,
         min_ref_seconds: float = 1.5,
         hf_token_env: str = "HF_TOKEN",
     ) -> None:
@@ -115,16 +116,24 @@ class PyannoteDiarize:
         self.pipeline.to(torch.device(self.device))
         self.min_speakers = min_speakers
         self.max_speakers = max_speakers
+        self.num_speakers = num_speakers
         self.min_ref_seconds = min_ref_seconds
 
     def diarize(self, separated: SeparatedAudio, ctx: JobContext) -> Diarization:
         ctx.progress("diarize", 0.05, f"loaded pyannote on {self.device}")
 
         kwargs: dict[str, Any] = {}
-        if self.min_speakers and self.min_speakers > 0:
-            kwargs["min_speakers"] = self.min_speakers
-        if self.max_speakers and self.max_speakers > 0:
-            kwargs["max_speakers"] = self.max_speakers
+        # `num_speakers` (exact count) takes precedence over min/max. Used
+        # when the source is known to have exactly N speakers — pyannote's
+        # clustering otherwise tends to over-merge short cartoon turns into
+        # whichever cluster has the most data.
+        if self.num_speakers and self.num_speakers > 0:
+            kwargs["num_speakers"] = self.num_speakers
+        else:
+            if self.min_speakers and self.min_speakers > 0:
+                kwargs["min_speakers"] = self.min_speakers
+            if self.max_speakers and self.max_speakers > 0:
+                kwargs["max_speakers"] = self.max_speakers
 
         ctx.progress("diarize", 0.10, "running diarization")
         result = self.pipeline(str(separated.vocals), **kwargs)
@@ -183,6 +192,7 @@ def build(config: dict[str, Any]) -> PyannoteDiarize:
         device=config.get("device", "auto"),
         min_speakers=int(config.get("min_speakers", 0)),
         max_speakers=int(config.get("max_speakers", 8)),
+        num_speakers=int(config.get("num_speakers", 0)),
         min_ref_seconds=float(config.get("min_ref_seconds", 1.5)),
         hf_token_env=config.get("hf_token_env", "HF_TOKEN"),
     )

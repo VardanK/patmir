@@ -24,9 +24,10 @@
 
 | Candidate id                 | OpenRouter model                | Status   | When to switch                                              |
 | ---------------------------- | ------------------------------- | -------- | ----------------------------------------------------------- |
-| `openrouter_gemini_flash`    | `google/gemini-2.5-flash`       | **active** | Default — cheap + competitive on multilingual.            |
+| `openrouter_gemini_flash`    | `google/gemini-3.5-flash`       | **active** | Default — cheap + competitive on multilingual. 3.5 picked over 3.1-flash-lite 2026-05-26 evening A/B (more emotive output). |
 | `openrouter_claude_opus`     | `anthropic/claude-opus-4.7`     | alt      | Strongest on register / nuance; most expensive.             |
 | `openrouter_gpt5`            | `openai/gpt-5`                  | alt      | Comparable to Claude; cheaper. Slightly weaker on Eastern Armenian. |
+| `openrouter_deepseek_v4_pro` | `deepseek/deepseek-v4-pro`      | rejected (2026-05-27) | Cheap on paper ($0.435/M in, $0.87/M out — ~3× Gemini output cost). Benchmarked on masha-2-5min: **4/10 chain-of-thought leaks into the `content` field even with `thinking={type: "disabled"}`** (DeepSeek-native passthrough; the model ignores OpenRouter's `reasoning.effort=minimal`). **Avg latency 10.9 s/sentence**, ~10× Gemini 3.5 Flash. Production-unusable for the per-sentence translate loop until DeepSeek fixes the no-thinking-mode content-leak bug. |
 
 To swap, change `[pipeline].translate` in `patmir.toml`. To add a new model, copy a `[[eval.translation.candidates]]` block and change `id` + `model`.
 

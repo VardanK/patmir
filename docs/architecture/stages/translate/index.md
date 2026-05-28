@@ -33,6 +33,10 @@ class TranslateStage(Protocol):
 - **[gpt-cloud](gpt-cloud.md)** — disabled. Needs an explicit local-exhaustion ADR before activation.
 - **[claude-cloud](claude-cloud.md)** — disabled. Same gate.
 
+### Rejected
+
+- **[translategemma](translategemma.md)** — Google's translation-specialized Gemma 3 family (4B/12B/27B). Rejected 2026-05-27 — no register/style control surface (literary output) and ~37 s/sentence on the 27B 4-bit MLX build at default `max_tokens`. Candidates registered as `enabled = false`.
+
 ## Sentence-level mechanics
 
 The translate adapter (`stages/translate/adapter.py`) iterates the source sentences, calls the inner translator's `translate(text, source_lang=...)`, and constructs `TranslatedSentence`s passing `speaker_id` (and Phase 2.x: `emotion`) through unchanged. Inner translators are stateless per call — no cross-sentence context unless a candidate adds it explicitly.
