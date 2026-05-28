@@ -17,8 +17,8 @@
       guidance_scale: float | None = None,    # Phase 2.x — per-call emotion-driven strength
   ) -> bytes  # WAV bytes
   ```
-- **Status in pipeline:** **active** (locked — see ADR)
-- **Last evaluated:** 2026-05-26 (Phase 2 verification on `samples/masha-2-5min.mkv`)
+- **Status in pipeline:** **active** (re-activated 2026-05-27 PM after ElevenLabs' captcha system blocked cloned voices of real celebrities on YouTube content — see `current.md`)
+- **Last evaluated:** 2026-05-27 (re-activation; prior eval 2026-05-26 on `samples/masha-2-5min.mkv`)
 - **Our experience:**
   - Produces watchable EA output via zero-shot ref-clip cloning. Phase 2 verification: 5 speakers, 3 cloned + 2 Piper-fallback, 36 dubbed sentences. Each character has a distinguishable Armenian voice.
   - q8 quant is ~25% faster than fp16 with no audible quality loss in ear-tests.

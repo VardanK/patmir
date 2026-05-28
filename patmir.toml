@@ -507,7 +507,7 @@ diarize   = "elevenlabs_scribe_v2"
 emotion   = "emotion2vec_plus_base"
 asr       = "elevenlabs_scribe_v2"
 translate = "openrouter_gemini_flash"
-tts       = "elevenlabs_multilingual_v2"
+tts       = "omnivoice_mlx_q8"
 mux       = "ffmpeg_pad_stretch"
 output    = "mkv_default"
 

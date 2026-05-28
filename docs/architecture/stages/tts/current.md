@@ -2,43 +2,47 @@
 
 ```toml
 [pipeline]
-tts = "elevenlabs_multilingual_v2"
+tts = "omnivoice_mlx_q8"
 
 [[eval.tts.candidates]]
-id               = "elevenlabs_multilingual_v2"
-enabled          = true
-module           = "patmir.eval.candidates.tts.elevenlabs"
-model_id         = "eleven_multilingual_v2"
-api_key_env      = "ELEVENLABS_API_KEY"
-default_voice_id = "21m00Tcm4TlvDq8ikWAM"   # "Rachel" — fallback when no IVC ref
-cleanup_voices   = true
-timeout_seconds  = 90.0
-output_format    = "mp3_44100_128"
+id            = "omnivoice_mlx_q8"
+enabled       = true
+module        = "patmir.eval.candidates.tts.omnivoice_mlx"
+repo_id       = "lightsofapollo/omnivoice-mlx-q8-g64"
+ref_audio     = "eval_runs/20260524-160019/tts/piper_hye/hy-cartoon-01.wav"
+ref_text      = "Արկածի գնանք։"
+num_steps     = 32
+guidance_scale = 2.0
+language      = "None"
+lang_code     = "None"
 ```
 
-API key in `.env` (auto-loaded by `patmir/env.py`): `ELEVENLABS_API_KEY=...`. The key must carry the `text_to_speech` + `voices_read` + `create_instant_voice_clone` permission scopes — IVC scope is the one that's easy to miss when creating a scoped key.
+MLX-native int8 quantized OmniVoice — `~1 GB` on disk, `~25%` faster RTF on Apple Silicon than the fp16 PyTorch variant, no GPU API key needed. Local-first compliant.
 
-OpenRouter Gemini TTS (`openrouter_gemini_flash_tts`) stays registered as a cloud alternate — flip `[pipeline].tts = "openrouter_gemini_flash_tts"` to revert. OmniVoice MLX (`omnivoice_mlx_q8`) stays as the offline-fallback path. ElevenLabs Scribe v2 ASR is still registered `enabled = false` (separate stage).
+`ElevenLabs Multilingual v2` (`eleven_v3` with `language_code="hy"`) stays registered as the cloud alternate — flip `[pipeline].tts = "elevenlabs_multilingual_v2"` to revert. The in-code per-speaker fallback-to-default-voice retry on HTTP 403 `voice_access_denied` / `detected_captcha_voice` stays in `patmir/eval/candidates/tts/elevenlabs.py` so the ElevenLabs path is still usable for content the captcha system doesn't flag.
+
+OpenRouter Gemini TTS (`openrouter_gemini_flash_tts`) is a second cloud alternate. Piper `hy_AM-gor-medium` is the **no-ref** fallback for any speaker without a usable reference clip.
 
 ## Phase 2.x emotion + voice routing
 
-ElevenLabs combines per-speaker cloning + per-emotion expression in one shot:
+OmniVoice has **no explicit emotion knob**. Emotion transfer is routed through:
 
-- **Per-speaker voice (IVC):** the candidate uploads each `diarize/refs/<speaker>/*.wav` clip via `/v1/voices/add` and caches the resulting `voice_id` for that speaker. All emotions for the same speaker reuse the same upload (one IVC voice per character). Uploads are deleted at process exit (`atexit`) to free slots.
-- **Per-emotion expression:** `voice_settings.stability` (lower → more variation) + `voice_settings.style` (higher → more dramatic). Mapped per bin in `_DEFAULT_VOICE_SETTINGS` inside the candidate:
-  - `neutral` → stab 0.55 / style 0.20
-  - `happy`   → stab 0.35 / style 0.55
-  - `sad`     → stab 0.55 / style 0.40
-  - `angry`   → stab 0.25 / style 0.70
-  - `fearful` → stab 0.30 / style 0.60
-- **Adapter call passes:** `ref_audio` (chooses IVC voice), `emotion` (chooses voice_settings preset). `ref_text` and `guidance_scale` are accepted for adapter uniformity and ignored — ElevenLabs has no ref-transcript input and `guidance_scale` is an OmniVoice concept.
+1. **Per-`(speaker, emotion_bin)` ref clip selection** — `diarize/refs/<speaker>/<emotion>.wav` (sliced post-emotion by `ref_picker.pick_refs`). The TTS adapter looks up `refs[(speaker, emotion)]` per sentence; falls back to `refs[(speaker, "neutral")]`, then the global default ref, then `piper_hye`.
+2. **Per-emotion `guidance_scale`** — pulled from `[emotion_guidance]` in `patmir.toml` and passed per call. Higher scale = more of the ref clip's prosody bleeds into the synth.
+3. **Reference clip determines tone** — emotion fidelity is bounded by what's audible in the source character's range; a flat character can't be made angry. Accepted constraint (ADR `2026-05-26-emotion-routed-through-ref-clip-binning`).
+
+## Adapter call passes
+
+`ref_audio` (per-sentence ref clip), `ref_text` (transcript of that ref clip, filled by `backfill_ref_text` from ASR — OmniVoice **requires** this), `emotion` (drives the guidance_scale lookup), `guidance_scale` (resolved per-call from `[emotion_guidance]`).
+
+Refs with empty `ref_text` are not usable by OmniVoice — the adapter falls back to the global default ref for those sentences (a known limitation logged as a TODO; see the audit notes in the closed `quality-issues.md` #1 entry).
 
 ## Fallback chain
 
-- If IVC upload fails for a specific speaker (key tier, voice-slot cap, etc.), that speaker's lines fall back to `default_voice_id` (Rachel) and a single warning is logged. All other speakers keep their IVC clones.
-- If `refs` has no entry for a `speaker_id` at all (rare — a character with no qualifying turn), the adapter switches that sentence to the **piper_hye** fallback candidate.
+- `refs[(speaker, emotion)]` → `refs[(speaker, "neutral")]` → global default ref clip (`ref_audio` in the candidate config) → `piper_hye`.
+- Per-sentence synth timeout no longer kills the run; on failure the sentence becomes a silent WAV and the rest of the pipeline continues.
 
 ## Notes
 
-- Output format `mp3_44100_128` works on every tier; the candidate decodes MP3 → WAV (PCM-16 mono 44.1k) via ffmpeg subprocess (~50 ms / sentence; ffmpeg is already a project dep). Override to `pcm_44100` on Creator+ to skip the decode.
-- ElevenLabs voice cleanup runs on process exit; if the run is killed (SIGKILL), the IVC slots leak and need manual cleanup via `/v1/voices/{voice_id}` DELETE on the dashboard.
+- MLX requires Apple Silicon; do not run this candidate on x86. The fp16 PyTorch `omnivoice` candidate is the cross-platform alternative (heavier).
+- ElevenLabs in-code 403 fallback stays in place so the cloud path remains usable for non-celebrity content; nothing depends on it being the default.
