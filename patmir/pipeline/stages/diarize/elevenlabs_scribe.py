@@ -111,5 +111,7 @@ def build(config: dict[str, Any]) -> ScribeV2Diarize:
             else None
         ),
         timeout_seconds=float(config.get("timeout_seconds", 600.0)),
+        upload_sample_rate=int(config.get("upload_sample_rate", 16000)),
+        upload_mono=bool(config.get("upload_mono", True)),
     )
     return ScribeV2Diarize(client=client)

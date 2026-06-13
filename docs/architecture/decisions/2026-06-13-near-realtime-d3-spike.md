@@ -105,6 +105,25 @@ Settled while building; recorded here so they're not re-litigated:
     memory + `spike/d3_throughput/test_positive_match.py`. Positive (returning speaker matches) and negative
     (new speaker → new voice) paths both validated on the real source.
 
+## 2026-06-14 — Scribe upload downsampled to 16 kHz mono (perf fix)
+
+First watch-along dogfood showed "minutes" to first audio. Per-stage timing on
+the real source found the gate was **diarize/ASR (Scribe), not TTS**: ~169s for
+a 60s prelude, ~82–110s per 30s section (≈2.8× realtime) — the ASR stage then
+reads the shared cache instantly. This contradicted the spike's "Scribe 0.10×
+realtime." A size sweep settled it: Scribe runs at ~0.7–1.1× realtime on a
+**16 kHz mono** upload (30s→20s, 60s→64s, 120s→110s) but ~2.8× on the **44.1 kHz
+stereo** Demucs vocal stem the pipeline was actually sending (≈6× bigger file).
+The spike's fast number held only because its probe happened to feed light audio.
+
+Fix: `ScribeV2Client` now transcodes the upload to 16 kHz mono before POSTing
+(knobs `upload_sample_rate`=16000, `upload_mono`=true; word timestamps are in
+seconds so the timeline is unaffected). ~3× faster diarize/ASR for **both** modes
+(Quality + watch-along), no quality change (STT models run at 16 kHz internally).
+This removes Scribe as the watch-along throughput gate. (The streaming runner is
+still sequential per section — pipelining stages across sections remains the
+open follow-up for steady-state headroom.)
+
 ## Revisit triggers
 
 - ElevenLabs cost runs high on full episodes → lean on the OmniVoice-8 local path or cache-and-rewatch.
