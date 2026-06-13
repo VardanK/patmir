@@ -17,11 +17,20 @@
     .error { color: #c5221f; font-size: 12px; margin-top: 8px; }
     .hint { color: #888; font-size: 11px; margin-top: 6px; }
     a { color: #1a73e8; text-decoration: none; }
+    .modes { display: flex; gap: 6px; margin-bottom: 10px; }
+    .modes button { margin-top: 0; flex: 1; padding: 6px 4px; font-size: 12px; }
+    .modes button.active { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+    .mode-note { color: #888; font-size: 11px; margin: -4px 0 8px; }
   </style>
 </head>
 <body>
   <h1>Patmir — Eastern Armenian dub</h1>
   <div class="url" id="url">…</div>
+  <div class="modes" id="modes">
+    <button id="mode-quality" data-mode="quality">Quality</button>
+    <button id="mode-watch-along" data-mode="watch-along">Watch-along</button>
+  </div>
+  <div class="mode-note" id="mode-note"></div>
   <div id="content">
     <div class="status" id="status">Checking…</div>
     <button id="cta" class="primary" disabled>—</button>

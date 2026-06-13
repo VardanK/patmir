@@ -4,8 +4,20 @@
 
 Accepted, 2026-06-13. Reopens the D3 path that `2026-05-27-low-friction-translation-d1.md`
 rejected. Throughput spike passed; Slice 2 (streaming runner) + Slice 3 (streaming client)
-are now scheduled. Watch-along ships as an **additive mode**, not a replacement — D1 Quality
-mode stays the default and untouched.
+are now **both built**. Watch-along ships as an **additive mode**, not a replacement — D1
+Quality mode stays the default and untouched.
+
+**Slice 3 (#10, streaming client) — DONE 2026-06-13.** `patmir/pipeline/streaming/`
+gained `coverage.py` (merged dubbed-interval tracker) + `scheduler.py` (playhead-driven
+`StreamScheduler`) + `dub_prelude_window` (reuse prelude analysis for the opening dub).
+`patmir/ui/stream.py` (`StreamManager`) runs prelude→scheduler in the background and writes
+each section to the per-section stream cache. Server gained `mode` on `POST /jobs` +
+`/cache/lookup`, and `/stream/<key>/{sections,section/<i>.wav,playhead}`. `mode` is folded
+into the cache key (non-default only → existing quality caches unbusted). Extension gained a
+Quality/Watch-along popup toggle + a content-script chunked Web Audio feed (offset-addressed
+sections, buffer-gated playback, playhead/seek/pause reporting). Pure logic unit-tested
+(coverage/scheduler/cache-mode/stream-cache); full suite 97/97. Live in-browser E2E needs
+`.env` (ElevenLabs + OpenRouter keys) + the real source clip.
 
 ## Context
 

@@ -28,6 +28,7 @@ from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.stage import STAGE_ORDER
 from patmir.ui import auth, cache as cache_mod
 from patmir.ui.jobs import JobManager, JobSpec
+from patmir.ui.stream import StreamManager
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -41,6 +42,7 @@ def _create_app(
     cache_root: Path,
     cfg: PipelineConfig,
     token: str,
+    config_path: Path = Path("patmir.toml"),
 ) -> FastAPI:
     app = FastAPI(title="Patmir")
     runs_root = runs_root.resolve()
@@ -49,6 +51,9 @@ def _create_app(
 
     require_token = auth.TokenAuth(token)
     manager = JobManager(cfg, runs_root=runs_root, cache_root=cache_root)
+    streamer = StreamManager(
+        config_path, jobs=manager, runs_root=runs_root, cache_root=cache_root
+    )
 
     app.add_middleware(
         CORSMiddleware,
@@ -65,6 +70,7 @@ def _create_app(
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        await streamer.stop()
         await manager.stop()
 
     # ---------- legacy progress UI (unchanged) -----------------------------
@@ -171,12 +177,22 @@ def _create_app(
         return candidate
 
     @app.get("/cache/lookup", dependencies=[Depends(require_token)])
-    def cache_lookup(url: str = Query(..., min_length=4)):
+    def cache_lookup(url: str = Query(..., min_length=4), mode: str = Query("quality")):
+        if mode == "watch-along":
+            manifest = streamer.lookup_cache_by_url(url)
+            return JSONResponse({
+                "cached": bool(manifest and manifest.get("complete")),
+                "partial": bool(manifest and not manifest.get("complete")),
+                "cache_key": streamer.cache_key_for_url(url),
+                "mode": "watch-along",
+                "sections": len((manifest or {}).get("sections", [])),
+            })
         entry = manager.lookup_cache_by_url(url)
         if entry is None:
             return JSONResponse({
                 "cached": False,
                 "cache_key": manager.cache_key_for_url(url),
+                "mode": "quality",
             })
         return JSONResponse({
             "cached": True,
@@ -184,6 +200,7 @@ def _create_app(
             "duration": entry.duration,
             "created_at": entry.created_at,
             "source_url": entry.source_url,
+            "mode": "quality",
         })
 
     @app.post("/jobs", dependencies=[Depends(require_token)])
@@ -194,21 +211,66 @@ def _create_app(
                 source_path=payload.get("source_path"),
                 source_lang=payload.get("source_lang"),
                 force=bool(payload.get("force", False)),
+                mode=payload.get("mode", "quality"),
             )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
-            rec = await manager.submit(spec)
+            if spec.mode == "watch-along":
+                rec = await streamer.submit(spec)
+            else:
+                rec = await manager.submit(spec)
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return rec.to_public()
 
     @app.get("/jobs/{job_id}", dependencies=[Depends(require_token)])
     def jobs_get(job_id: str):
-        rec = manager.get(job_id)
+        # Watch-along records live in the StreamManager; their ids are prefixed
+        # `stream-`. Try the matching manager first, fall back to the other.
+        rec = (streamer.get(job_id) if job_id.startswith("stream-") else manager.get(job_id))
+        if rec is None:
+            rec = manager.get(job_id) or streamer.get(job_id)
         if rec is None:
             raise HTTPException(status_code=404, detail="unknown job_id")
         return rec.to_public()
+
+    # ---------- D3: watch-along streaming ----------------------------------
+
+    @app.get("/stream/{cache_key}/sections", dependencies=[Depends(require_token)])
+    def stream_sections_list(cache_key: str):
+        if not _is_valid_key(cache_key):
+            raise HTTPException(status_code=400, detail="invalid cache_key")
+        manifest = streamer.sections_manifest(cache_key)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="no such stream")
+        return JSONResponse(manifest)
+
+    @app.get("/stream/{cache_key}/section/{index}.wav", dependencies=[Depends(require_token)])
+    def stream_section_wav(cache_key: str, index: int):
+        if not _is_valid_key(cache_key):
+            raise HTTPException(status_code=400, detail="invalid cache_key")
+        path = streamer.section_file(cache_key, index)
+        if path is None:
+            raise HTTPException(status_code=404, detail="no such section")
+        return FileResponse(
+            path,
+            media_type="audio/wav",
+            headers={"Cache-Control": "private, immutable, max-age=31536000"},
+        )
+
+    @app.post("/stream/{cache_key}/playhead", dependencies=[Depends(require_token)])
+    def stream_playhead(cache_key: str, payload: dict):
+        if not _is_valid_key(cache_key):
+            raise HTTPException(status_code=400, detail="invalid cache_key")
+        try:
+            t = float(payload.get("t", 0.0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="bad playhead t") from exc
+        ok = streamer.set_playhead(cache_key, t, bool(payload.get("paused", False)))
+        if not ok:
+            raise HTTPException(status_code=404, detail="no active stream")
+        return JSONResponse({"ok": True})
 
     @app.get("/cache/{cache_key}/dub.wav", dependencies=[Depends(require_token)])
     def cache_dub(cache_key: str, request: Request):
@@ -249,12 +311,13 @@ def serve(
     cache_root: Path | None = None,
     cfg: PipelineConfig | None = None,
     token: str | None = None,
+    config_path: Path = Path("patmir.toml"),
 ) -> None:
     import uvicorn
 
     if cfg is None:
         from patmir.pipeline.config import load_pipeline_config
-        cfg = load_pipeline_config(Path("patmir.toml"))
+        cfg = load_pipeline_config(config_path)
     if token is None:
         token = auth.ensure_token()
 
@@ -263,5 +326,6 @@ def serve(
         cache_root=cache_root or cache_mod.DEFAULT_CACHE_ROOT,
         cfg=cfg,
         token=token,
+        config_path=config_path,
     )
     uvicorn.run(app, host="127.0.0.1", port=port)

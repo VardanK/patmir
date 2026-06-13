@@ -105,6 +105,47 @@ def _remap_and_trim_transcript(job_dir: Path, mapping: dict[str, str], section_e
     tpath.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def dub_prelude_window(
+    cfg: PipelineConfig,
+    prelude,
+    *,
+    runs_root: Path | None = None,
+) -> SectionResult:
+    """Produce the opening dub for the prelude window, reusing the prelude's
+    already-completed analysis (no second Demucs/Scribe pass).
+
+    The prelude analyzed `[0, window_end]` and assigned each Scribe-local
+    speaker label a registry voice keyed by that same label — so the transcript
+    needs no local→global remap. We just trim it to the VAD-snapped window end,
+    then resume translate→tts→mux with the registry voices. This is section 0;
+    the streaming runner picks up at `window_end`.
+    """
+    runs_root = runs_root or Path.cwd() / "runs"
+    job_dir = prelude.job_dir
+    end_rel = prelude.window_end
+
+    # Identity remap is a no-op (prelude labels == registry keys); trim only.
+    _remap_and_trim_transcript(job_dir, {}, end_rel)
+
+    run_job(
+        job_dir, cfg, runs_root=runs_root,
+        resume_job_dir=job_dir, resume_from="translate", stop_after="mux",
+        extra={"voice_assignments": prelude.registry.assignments()},
+    )
+
+    dub = job_dir / "dub.wav"
+    out_chunk = job_dir / "section_dub.wav"
+    if dub.exists():
+        _trim_wav(dub, end_rel, out_chunk)
+    else:
+        out_chunk = None  # type: ignore[assignment]
+
+    return SectionResult(
+        index=0, start=0.0, end=end_rel, dub_wav=out_chunk, job_dir=job_dir,
+        local_to_global={}, new_speakers=list(prelude.registry.known_speakers()),
+    )
+
+
 def process_section(
     source: Path,
     cfg: PipelineConfig,

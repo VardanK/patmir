@@ -108,6 +108,53 @@ Two operations run inside the runner, *not* as their own stages, because they br
 1. **`pick_refs`** — after `emotion` returns, runner calls `pick_refs(turns, overlaps, predictions, ...)` to slice per-`(speaker, emotion_bin)` reference WAVs. The result is written back into `state["diarize"].refs`. Runs in the runner so `diarize` doesn't need to know about emotion.
 2. **`apply_speaker_tags` + `apply_emotion_tags` + `_backfill_ref_text`** — fire immediately after the ASR candidate returns its `Transcript`. They mutate the transcript (attach `speaker_id` + `emotion`) and backfill `SpeakerRef.ref_text` (which couldn't be filled at diarize time because ASR hadn't run yet).
 
+## Execution models (batch vs watch-along)
+
+The same 9 stages run under two execution models, selected per submission by a
+`mode` field (folded into the cache key, so the two never collide):
+
+- **Quality mode (D1, default)** — `run_job` runs all stages strictly in order
+  over the whole video and caches one final `dub.wav`. Best quality, one-time
+  wait, instant rewatch. The runner loop is `runner.py` (sequential).
+- **Watch-along mode (D3, additive)** — the dub is produced in VAD-snapped
+  sections and streamed behind a short buffer while the viewer watches; each
+  section is written into the cache as it lands (free rewatch). See ADR
+  `decisions/2026-06-13-near-realtime-d3-spike.md`. Active TTS is the
+  ElevenLabs `eleven_v3` preset-voice pool (`elevenlabs_pool`, no IVC cloning),
+  which clears realtime; OmniVoice with a low `num_steps` is the offline fallback.
+
+Watch-along control flow (`patmir/pipeline/streaming/` + `patmir/ui/stream.py`):
+
+```
+run_prelude(first ~60s)            establish the cast: profile speakers
+   │                               (gender/age), assign pool voices, store
+   │                               ECAPA embeddings → populated SpeakerRegistry
+   ▼
+dub_prelude_window()               reuse the prelude analysis → opening dub
+   │                               (section 0, no second Demucs/Scribe pass)
+   ▼
+StreamScheduler.run()              playhead-driven loop:
+   │  ├ Coverage tracks dubbed [start,end) intervals
+   │  ├ next section = nearest undubbed point AT/AHEAD of the playhead
+   │  │   (seek → jump there; paused → keep filling forward; else backfill)
+   │  └ process_section(start) → analyze→ECAPA identity-resolve against the
+   │      registry→remap+trim transcript→translate→tts→mux → section chunk
+   ▼
+append_section() → cache           each chunk written to ~/.patmir/cache/<key>/
+                                    section_NNN.wav + sections.json as it lands
+```
+
+Cross-section speaker identity is ECAPA-TDNN cosine matching (threshold 0.12,
+multi-embedding per speaker) so a character keeps one voice across sections and
+across seeks. The browser client polls `/stream/<key>/sections`, fetches each
+section WAV, and schedules it on the Web Audio clock at its global `start`
+offset, pausing the `<video>` to buffer when the playhead outruns production.
+
+NOTE (perf follow-up): `process_section` calls `run_job` twice per section
+(analysis, then translate→tts→mux), rebuilding stage models each call. A
+warm-model loop (build stages once, process sections in place) is an open
+optimization, not a correctness issue.
+
 ## Audio artifacts written per job
 
 See `docs/architecture/runs.md` for the full file map.

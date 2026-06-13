@@ -6,10 +6,13 @@
 // `chrome-extension://<id>` origin and is exempt.
 //
 // Messages handled:
-//   { type: "cache:lookup", url }              → { cached, cache_key, ... }
-//   { type: "jobs:submit",  url? | source_path? } → { job_id, status, ... }
+//   { type: "cache:lookup", url, mode? }       → { cached, cache_key, ... }
+//   { type: "jobs:submit",  url? | source_path?, mode? } → { job_id, status, ... }
 //   { type: "jobs:get",     job_id }           → JobRecord
-//   { type: "cache:dub-wav", cache_key }       → { bytes: Uint8Array }
+//   { type: "cache:dub-wav", cache_key }       → { bytesB64 }
+//   { type: "stream:sections", cache_key }     → { sections, complete, ... }
+//   { type: "stream:section-wav", cache_key, index } → { bytesB64 }
+//   { type: "stream:playhead", cache_key, t, paused } → { ok }
 
 const DEFAULT_SERVER = "http://127.0.0.1:8765";
 
@@ -48,12 +51,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
       if (msg.type === "cache:lookup") {
-        const r = await api("/cache/lookup?url=" + encodeURIComponent(msg.url));
+        let path = "/cache/lookup?url=" + encodeURIComponent(msg.url);
+        if (msg.mode) path += "&mode=" + encodeURIComponent(msg.mode);
+        const r = await api(path);
         sendResponse({ ok: true, data: await r.json() });
       } else if (msg.type === "jobs:submit") {
         const body = { source_url: msg.url };
         if (msg.source_lang) body.source_lang = msg.source_lang;
         if (msg.force) body.force = true;
+        if (msg.mode) body.mode = msg.mode;
         const r = await api("/jobs", { method: "POST", body: JSON.stringify(body) });
         sendResponse({ ok: true, data: await r.json() });
       } else if (msg.type === "jobs:get") {
@@ -67,6 +73,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // message channel is reliable. ~33% overhead is acceptable for
         // ~30-60 MB WAVs on a local loopback round trip.
         sendResponse({ ok: true, bytesB64: bytesToBase64(new Uint8Array(buf)) });
+      } else if (msg.type === "stream:sections") {
+        const r = await api("/stream/" + encodeURIComponent(msg.cache_key) + "/sections");
+        sendResponse({ ok: true, data: await r.json() });
+      } else if (msg.type === "stream:section-wav") {
+        const r = await api("/stream/" + encodeURIComponent(msg.cache_key) +
+          "/section/" + encodeURIComponent(msg.index) + ".wav");
+        const buf = await r.arrayBuffer();
+        sendResponse({ ok: true, bytesB64: bytesToBase64(new Uint8Array(buf)) });
+      } else if (msg.type === "stream:playhead") {
+        const r = await api("/stream/" + encodeURIComponent(msg.cache_key) + "/playhead", {
+          method: "POST",
+          body: JSON.stringify({ t: msg.t, paused: !!msg.paused }),
+        });
+        sendResponse({ ok: true, data: await r.json() });
       } else if (msg.type === "ping") {
         sendResponse({ ok: true, pong: true });
       } else {

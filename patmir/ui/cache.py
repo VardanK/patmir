@@ -131,9 +131,18 @@ def _stable_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(entry, sort_keys=True, ensure_ascii=False))
 
 
-def cache_key(source_id: str, cfg: PipelineConfig) -> str:
+# The default (D1) mode. Folded into the cache key only when non-default, so
+# existing quality-mode cache entries keep their keys (no one-time cache bust)
+# while watch-along caches under a distinct key — the two modes never collide.
+DEFAULT_MODE = "quality"
+
+
+def cache_key(source_id: str, cfg: PipelineConfig, mode: str = DEFAULT_MODE) -> str:
     cfg_hash = config_hash(cfg)
-    digest = hashlib.sha256(f"{source_id}|{cfg_hash}".encode()).hexdigest()
+    payload = f"{source_id}|{cfg_hash}"
+    if mode and mode != DEFAULT_MODE:
+        payload += f"|{mode}"
+    digest = hashlib.sha256(payload.encode()).hexdigest()
     return digest[:16]
 
 
@@ -159,8 +168,10 @@ def lookup(cache_root: Path, key: str) -> CacheEntry | None:
     )
 
 
-def lookup_by_url(cache_root: Path, url: str, cfg: PipelineConfig) -> CacheEntry | None:
-    """Resolve a URL to a cache entry under the current pipeline config.
+def lookup_by_url(
+    cache_root: Path, url: str, cfg: PipelineConfig, mode: str = DEFAULT_MODE
+) -> CacheEntry | None:
+    """Resolve a URL to a cache entry under the current pipeline config + mode.
 
     Two layers: the `by-url.json` index lets us list keys ever produced for a
     given canonical URL; we then check whether any of those keys' config_hash
@@ -169,7 +180,7 @@ def lookup_by_url(cache_root: Path, url: str, cfg: PipelineConfig) -> CacheEntry
     """
     canonical = canonicalize_url(url)
     src_id = f"url:{canonical}"
-    expected_key = cache_key(src_id, cfg)
+    expected_key = cache_key(src_id, cfg, mode)
     return lookup(cache_root, expected_key)
 
 
@@ -289,3 +300,111 @@ def pipeline_summary(cfg: PipelineConfig) -> dict[str, Any]:
         name: {"id": cfg.entries.get(name, {}).get("id", "")}
         for name in STAGE_ORDER
     }
+
+
+# ── watch-along (D3) per-section stream cache ──────────────────────────────
+#
+# A watch-along job streams dub in VAD-snapped sections instead of one final
+# `dub.wav`. Each section's slice-relative WAV is written into the same
+# `cache_root/<key>/` dir as `section_<NNN>.wav`, indexed by `sections.json`.
+# Writing as we stream means a rewatch finds every section already on disk and
+# plays instantly — the cache-synergy point of #10. The two layers (quality
+# `dub.wav` vs watch-along `section_*.wav`) live under different keys (mode in
+# the key) so they never collide.
+
+STREAM_MANIFEST = "sections.json"
+
+
+def stream_cache_dir(cache_root: Path, key: str) -> Path:
+    d = cache_root / key
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _stream_manifest_path(cache_root: Path, key: str) -> Path:
+    return cache_root / key / STREAM_MANIFEST
+
+
+def read_stream_manifest(cache_root: Path, key: str) -> dict[str, Any] | None:
+    path = _stream_manifest_path(cache_root, key)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def init_stream_manifest(
+    cache_root: Path,
+    key: str,
+    *,
+    source_id: str,
+    source_url: str | None,
+    duration: float | None,
+    pipeline_summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Create (or reset) the section manifest for a watch-along job."""
+    cache_dir = stream_cache_dir(cache_root, key)
+    manifest = {
+        "cache_key": key,
+        "cache_version": CACHE_VERSION,
+        "mode": "watch-along",
+        "source_id": source_id,
+        "source_url": source_url,
+        "duration": duration,
+        "complete": False,
+        "created_at": time.time(),
+        "pipeline": pipeline_summary,
+        "sections": [],
+    }
+    _write_stream_manifest(cache_root, key, manifest)
+    if source_url:
+        register_url(cache_root, canonicalize_url(source_url), key)
+    return manifest
+
+
+def _write_stream_manifest(cache_root: Path, key: str, manifest: dict[str, Any]) -> None:
+    path = _stream_manifest_path(cache_root, key)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+    tmp.replace(path)
+
+
+def append_section(
+    cache_root: Path,
+    key: str,
+    *,
+    index: int,
+    start: float,
+    end: float,
+    src_wav: Path,
+) -> dict[str, Any]:
+    """Copy a finished section's WAV into the cache and add it to the manifest.
+
+    Sections are keyed by their global `start` so an out-of-order section (e.g.
+    one produced after a seek) replaces any prior section at the same start
+    rather than duplicating it. Returns the updated manifest.
+    """
+    cache_dir = stream_cache_dir(cache_root, key)
+    fname = f"section_{index:03d}.wav"
+    shutil.copy2(src_wav, cache_dir / fname)
+    manifest = read_stream_manifest(cache_root, key) or {
+        "cache_key": key, "complete": False, "sections": [],
+    }
+    sections = [s for s in manifest.get("sections", []) if abs(s.get("start", -1) - start) > 0.5]
+    sections.append({"index": index, "start": start, "end": end, "file": fname})
+    sections.sort(key=lambda s: s["start"])
+    manifest["sections"] = sections
+    _write_stream_manifest(cache_root, key, manifest)
+    return manifest
+
+
+def finalize_stream(cache_root: Path, key: str) -> None:
+    """Mark a watch-along stream complete (whole video dubbed → free rewatch)."""
+    manifest = read_stream_manifest(cache_root, key)
+    if manifest is None:
+        return
+    manifest["complete"] = True
+    manifest["finalized_at"] = time.time()
+    _write_stream_manifest(cache_root, key, manifest)

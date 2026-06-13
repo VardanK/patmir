@@ -1,9 +1,14 @@
 // Patmir popup.
 //
-// Three states (UI):
-//   "Translate this"   — no cache entry, click to enqueue
-//   "Translating… N%"  — job in flight; polls every 2 s
-//   "Play dub"         — cache hit; toggles playback in the active tab
+// Two dub modes (toggle at top, persisted in chrome.storage.local):
+//   "Quality"     — D1 batch pipeline → cached dub.wav → best quality, one-time
+//                   wait, instant rewatch. Unchanged from the original flow.
+//   "Watch-along" — D3 streaming: a first-chunk prelude then per-section dub
+//                   streamed behind a short buffer while you watch. Sections
+//                   are written to the cache as they land, so a rewatch is free.
+//
+// The mode is sent on every cache lookup + job submit and folded into the cache
+// key server-side, so the two modes cache independently.
 
 const urlEl = document.getElementById("url");
 const statusEl = document.getElementById("status");
@@ -11,15 +16,21 @@ const ctaEl = document.getElementById("cta");
 const secondaryEl = document.getElementById("secondary");
 const errorEl = document.getElementById("error");
 const openOptions = document.getElementById("open-options");
+const modesEl = document.getElementById("modes");
+const modeNoteEl = document.getElementById("mode-note");
+
+const MODE_NOTES = {
+  "quality": "Best quality. One-time wait, then instant.",
+  "watch-along": "Stream the dub while you watch (~20–30s to first audio).",
+};
+
+let mode = "quality";
 
 openOptions.addEventListener("click", async (e) => {
   e.preventDefault();
   try {
     await chrome.runtime.openOptionsPage();
   } catch (err) {
-    // Fallback for the case where the options page isn't declared correctly
-    // in the manifest yet — happens until the user reloads the extension
-    // after manifest changes.
     try {
       const url = chrome.runtime.getURL("options.html");
       await chrome.tabs.create({ url });
@@ -43,9 +54,6 @@ async function sw(msg) {
   return resp.data || resp;
 }
 
-/** Send a message to a tab's content script, lazily injecting the script
- * if it's not already running there (the case for any YouTube tab that
- * was open before the extension was last reloaded). */
 async function tabMessage(tabId, msg) {
   try {
     return await chrome.tabs.sendMessage(tabId, msg);
@@ -54,12 +62,8 @@ async function tabMessage(tabId, msg) {
     if (!/Could not establish connection|Receiving end does not exist/i.test(m)) {
       throw e;
     }
-    // Content script absent — inject it now, then retry once.
     try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ["content.js"],
-      });
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
     } catch (inj) {
       throw new Error("Content script could not be injected: " + String(inj.message || inj));
     }
@@ -68,13 +72,8 @@ async function tabMessage(tabId, msg) {
 }
 
 function setError(text) {
-  if (text) {
-    errorEl.textContent = text;
-    errorEl.hidden = false;
-  } else {
-    errorEl.textContent = "";
-    errorEl.hidden = true;
-  }
+  if (text) { errorEl.textContent = text; errorEl.hidden = false; }
+  else { errorEl.textContent = ""; errorEl.hidden = true; }
 }
 
 function setCta(label, disabled, handler, primary = true) {
@@ -85,23 +84,36 @@ function setCta(label, disabled, handler, primary = true) {
 }
 
 function setSecondary(label, handler) {
-  if (!label) {
-    secondaryEl.hidden = true;
-    secondaryEl.onclick = null;
-    return;
-  }
+  if (!label) { secondaryEl.hidden = true; secondaryEl.onclick = null; return; }
   secondaryEl.hidden = false;
   secondaryEl.textContent = label;
   secondaryEl.onclick = handler || null;
 }
 
+function renderModeToggle() {
+  for (const btn of modesEl.querySelectorAll("button")) {
+    btn.classList.toggle("active", btn.dataset.mode === mode);
+    btn.onclick = async () => {
+      if (mode === btn.dataset.mode) return;
+      mode = btn.dataset.mode;
+      await chrome.storage.local.set({ patmirMode: mode });
+      stopPolling();
+      renderModeToggle();
+      refresh();
+    };
+  }
+  modeNoteEl.textContent = MODE_NOTES[mode] || "";
+}
+
+function stopPolling() {
+  if (pollHandle) { clearInterval(pollHandle); pollHandle = null; }
+  currentJobId = null;
+}
+
 async function refresh() {
   setError(null);
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) {
-    statusEl.textContent = "No active tab.";
-    return;
-  }
+  if (!tab) { statusEl.textContent = "No active tab."; return; }
   activeTabId = tab.id;
   activeUrl = tab.url || "";
   urlEl.textContent = activeUrl;
@@ -109,12 +121,13 @@ async function refresh() {
   if (!/^https?:\/\//.test(activeUrl)) {
     statusEl.textContent = "Patmir works on web video pages.";
     setCta("—", true, null);
+    setSecondary(null, null);
     return;
   }
 
   let lookup;
   try {
-    lookup = await sw({ type: "cache:lookup", url: activeUrl });
+    lookup = await sw({ type: "cache:lookup", url: activeUrl, mode });
   } catch (e) {
     statusEl.textContent = "Server unreachable.";
     setError(String(e.message || e));
@@ -122,12 +135,17 @@ async function refresh() {
     return;
   }
 
+  if (mode === "watch-along") return refreshWatchAlong(lookup);
+  return refreshQuality(lookup);
+}
+
+// ---- Quality mode (D1, unchanged) ------------------------------------
+
+async function refreshQuality(lookup) {
   if (lookup.cached) {
-    // Is the content script currently playing the dub?
     let status = null;
-    try {
-      status = await tabMessage(activeTabId, { type: "patmir:status" });
-    } catch (_) { /* content script may not be loaded on this URL */ }
+    try { status = await tabMessage(activeTabId, { type: "patmir:status" }); }
+    catch (_) { /* content script may not be loaded */ }
     if (status && status.ok && status.playing) {
       statusEl.textContent = "Dub is playing.";
       setCta("Stop dub", false, () => stopInTab());
@@ -147,18 +165,69 @@ async function refresh() {
   }
 }
 
+// ---- Watch-along mode (D3) -------------------------------------------
+
+async function refreshWatchAlong(lookup) {
+  let status = null;
+  try { status = await tabMessage(activeTabId, { type: "patmir:status" }); }
+  catch (_) { /* content script may not be loaded */ }
+  if (status && status.ok && status.playing && status.mode === "watch-along") {
+    statusEl.textContent = "Watch-along playing.";
+    setCta("Stop", false, () => stopInTab());
+    setSecondary(null, null);
+    return;
+  }
+  if (lookup.cached) {
+    statusEl.textContent = "Watch-along ready (cached).";
+    setCta("Play watch-along", false, () => startWatchAlong(lookup.cache_key));
+    setSecondary("Regenerate", () => regenerateJob());
+  } else if (lookup.partial) {
+    statusEl.textContent = "Partially streamed (" + (lookup.sections || 0) + " sections cached).";
+    setCta("Resume watch-along", false, () => startWatchAlong(lookup.cache_key));
+    setSecondary(null, null);
+  } else {
+    statusEl.textContent = "Not dubbed yet.";
+    setCta("Start watch-along", false, () => startWatchAlong(null));
+    setSecondary(null, null);
+  }
+}
+
+/** Submit (if needed) + tell the content script to begin streaming playback. */
+async function startWatchAlong(cacheKey) {
+  setError(null);
+  setCta("Starting…", true, null);
+  setSecondary(null, null);
+  try {
+    const rec = await sw({ type: "jobs:submit", url: activeUrl, mode });
+    currentJobId = rec.job_id;
+    cacheKey = cacheKey || rec.cache_key;
+    const resp = await tabMessage(activeTabId, { type: "patmir:play-watchalong", cache_key: cacheKey });
+    if (!resp || !resp.ok) throw new Error(resp && resp.error ? resp.error : "Could not start playback.");
+    setCta("Stop", false, () => stopInTab());
+    if (rec.status === "done") {
+      statusEl.textContent = "Watch-along playing (cached).";
+    } else {
+      startPolling(rec);
+    }
+  } catch (e) {
+    setError(String(e.message || e));
+    setCta("Start watch-along", false, () => startWatchAlong(cacheKey));
+  }
+}
+
+// ---- job submit + polling (shared) -----------------------------------
+
 async function submitJob(force = false) {
   setError(null);
   setCta(force ? "Regenerating…" : "Submitting…", true, null);
   setSecondary(null, null);
   try {
-    // Make sure any in-tab playback stops before we drop the cache entry.
     if (force) {
       try { await tabMessage(activeTabId, { type: "patmir:stop" }); } catch (_) { /* ok */ }
     }
-    const rec = await sw({ type: "jobs:submit", url: activeUrl, force });
+    const rec = await sw({ type: "jobs:submit", url: activeUrl, force, mode });
     currentJobId = rec.job_id;
-    if (rec.status === "done" && rec.cache_key && !force) {
+    if (mode === "quality" && rec.status === "done" && rec.cache_key && !force) {
       statusEl.textContent = "Dub is ready (cached).";
       setCta("Play dub", false, () => playInTab(rec.cache_key));
       setSecondary("Regenerate dub", () => regenerateJob());
@@ -171,8 +240,6 @@ async function submitJob(force = false) {
   }
 }
 
-// Two-click arm-and-fire confirmation. `confirm()` / `alert()` are silently
-// blocked in MV3 popups, so we can't use a native dialog.
 let regenArmedAt = 0;
 const REGEN_ARM_WINDOW_MS = 3000;
 function regenerateJob() {
@@ -182,7 +249,6 @@ function regenerateJob() {
     setSecondary("Click again to confirm regenerate", regenerateJob);
     setError("This will delete the current dub and rerun the pipeline (several minutes).");
     setTimeout(() => {
-      // If still armed and the user didn't click, revert label.
       if (Date.now() - regenArmedAt >= REGEN_ARM_WINDOW_MS && secondaryEl && !secondaryEl.hidden) {
         setSecondary("Regenerate dub", regenerateJob);
         setError(null);
@@ -214,19 +280,23 @@ async function pollOnce() {
   if (rec.status === "done") {
     clearInterval(pollHandle);
     pollHandle = null;
-    setCta("Play dub", false, () => playInTab(rec.cache_key));
+    if (mode === "watch-along") {
+      setCta("Stop", false, () => stopInTab());
+    } else {
+      setCta("Play dub", false, () => playInTab(rec.cache_key));
+    }
   } else if (rec.status === "failed") {
     clearInterval(pollHandle);
     pollHandle = null;
     setError(rec.error || "Job failed.");
-    setCta("Retry", false, submitJob);
+    setCta("Retry", false, () => (mode === "watch-along" ? startWatchAlong(rec.cache_key) : submitJob()));
   }
 }
 
 function renderJob(rec) {
+  if (rec.mode === "watch-along") return renderStreamJob(rec);
   const stages = rec.stage_states || {};
   const allOrder = ["download", "ingest", "separate", "diarize", "emotion", "asr", "translate", "tts", "mux", "output"];
-  // Only render stages that exist on this job (download is URL-only).
   const order = allOrder.filter((s) => s in stages);
   const running = order.find((s) => stages[s] === "running");
   const done = order.filter((s) => stages[s] === "done").length;
@@ -241,15 +311,27 @@ function renderJob(rec) {
     } else if (rec.live_stage === running && typeof rec.live_pct === "number") {
       detail = running + " " + Math.round(rec.live_pct * 100) + "%";
     }
-    if (rec.live_msg && rec.live_stage === running) {
-      detail += " — " + rec.live_msg;
-    }
+    if (rec.live_msg && rec.live_stage === running) detail += " — " + rec.live_msg;
     line = "Running — " + detail + "  (" + done + "/" + order.length + ")";
   } else {
     line = "Running…  (" + done + "/" + order.length + ")";
   }
   statusEl.textContent = line;
   setCta("Translating…", true, null);
+  setSecondary(null, null);
+}
+
+function renderStreamJob(rec) {
+  let line;
+  if (rec.status === "queued") line = "Queued…";
+  else if (rec.status === "prelude") line = "Analyzing opening (prelude)…";
+  else if (rec.status === "streaming") {
+    line = "Streaming — " + (rec.sections_done || 0) + " sections dubbed";
+  } else if (rec.status === "done") line = "Watch-along complete (cached).";
+  else line = rec.status;
+  statusEl.textContent = line;
+  // Keep the Stop control live while streaming so the user can bail.
+  setCta("Stop", false, () => stopInTab());
   setSecondary(null, null);
 }
 
@@ -268,18 +350,18 @@ async function playInTab(cacheKey) {
 }
 
 async function stopInTab() {
-  try {
-    await tabMessage(activeTabId, { type: "patmir:stop" });
-  } catch (_) { /* tab navigated away */ }
+  stopPolling();
+  try { await tabMessage(activeTabId, { type: "patmir:stop" }); } catch (_) { /* tab navigated away */ }
   refresh();
 }
 
-// Re-render whenever the active tab's URL changes underneath us (e.g.
-// YouTube SPA navigation between Shorts while the popup is open).
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (tabId === activeTabId && changeInfo.url) {
-    refresh();
-  }
+  if (tabId === activeTabId && changeInfo.url) refresh();
 });
 
-document.addEventListener("DOMContentLoaded", refresh);
+document.addEventListener("DOMContentLoaded", async () => {
+  const { patmirMode = "quality" } = await chrome.storage.local.get("patmirMode");
+  mode = (patmirMode === "watch-along") ? "watch-along" : "quality";
+  renderModeToggle();
+  refresh();
+});

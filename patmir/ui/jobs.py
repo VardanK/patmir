@@ -41,10 +41,16 @@ class JobSpec:
     source_path: str | None = None
     source_lang: str | None = None
     force: bool = False  # if True, invalidate cache + delete downloaded source before running
+    # "quality" (D1 batch, default) or "watch-along" (D3 streaming). The server
+    # routes watch-along specs to the StreamManager; the mode is also folded
+    # into the cache key so the two modes never collide.
+    mode: str = "quality"
 
     def __post_init__(self) -> None:
         if not self.source_url and not self.source_path:
             raise ValueError("source_url or source_path is required")
+        if self.mode not in {"quality", "watch-along"}:
+            raise ValueError(f"unknown mode: {self.mode!r}")
 
 
 @dataclass
