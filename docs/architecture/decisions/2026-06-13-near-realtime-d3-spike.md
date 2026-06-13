@@ -112,9 +112,12 @@ the real source found the gate was **diarize/ASR (Scribe), not TTS**: ~169s for
 a 60s prelude, ~82–110s per 30s section (≈2.8× realtime) — the ASR stage then
 reads the shared cache instantly. This contradicted the spike's "Scribe 0.10×
 realtime." A size sweep settled it: Scribe runs at ~0.7–1.1× realtime on a
-**16 kHz mono** upload (30s→20s, 60s→64s, 120s→110s) but ~2.8× on the **44.1 kHz
-stereo** Demucs vocal stem the pipeline was actually sending (≈6× bigger file).
-The spike's fast number held only because its probe happened to feed light audio.
+**16 kHz mono** upload (30s→20s, 60s→64s, 120s→110s) but the **44.1 kHz stereo**
+Demucs vocal stem the pipeline was sending is ~6× bigger and ~6× slower —
+the 120s slice took **658s (5.48× realtime)** as stereo vs **110s (0.92×)** as
+16k mono (same 444 vs 451 words). Rate is ~constant across chunk size, so there's
+no fixed per-call overhead for bigger chunks to amortize — the file size was the
+whole story. The spike's fast number held only because its probe fed light audio.
 
 Fix: `ScribeV2Client` now transcodes the upload to 16 kHz mono before POSTing
 (knobs `upload_sample_rate`=16000, `upload_mono`=true; word timestamps are in

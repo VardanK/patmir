@@ -2,3 +2,5 @@ Scribe scribe_v2 size sweep — source source.webm
    30s 16k-mono (937KB):   20.4s  rt=0.68x  ok=True words=201
    60s 16k-mono (1874KB):   63.7s  rt=1.06x  ok=True words=365
   120s 16k-mono (3749KB):  110.4s  rt=0.92x  ok=True words=451
+  120s 44k-stereo (20670KB):  658.2s  rt=5.48x  ok=True words=444
+DONE
