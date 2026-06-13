@@ -20,6 +20,13 @@ from dataclasses import dataclass, field
 # can take an `adult` voice before falling back to any gender match).
 AGE_ORDER = ["child", "young", "adult", "elder"]
 
+# Default ECAPA cosine threshold above which two clips are deemed the same
+# speaker. Same-speaker pairs typically score >0.5, different speakers <0.3;
+# 0.40 is a conservative middle that favours NOT merging distinct characters
+# (a false-merge swaps a character's voice, which is more jarring than a
+# false-split that just spawns an extra voice). Tune per content.
+DEFAULT_MATCH_THRESHOLD = 0.40
+
 
 @dataclass(frozen=True)
 class VoiceEntry:
@@ -80,6 +87,7 @@ class SpeakerRegistry:
         self._assigned: dict[str, str] = {}     # speaker_id → voice_id
         self._use_count: dict[str, int] = {v.id: 0 for v in pool}
         self._locked_ref: dict[str, str] = {}    # speaker_id → ref clip (OmniVoice path)
+        self._embeddings: dict[str, object] = {}  # speaker_id → ECAPA embedding (np.ndarray)
 
     # ── ElevenLabs preset-pool path ────────────────────────────────────────
 
@@ -138,7 +146,38 @@ class SpeakerRegistry:
     def locked_ref(self, speaker_id: str) -> str | None:
         return self._locked_ref.get(speaker_id)
 
+    # ── cross-section identity (ECAPA embeddings) ──────────────────────────
+
+    def set_embedding(self, speaker_id: str, embedding) -> None:
+        """Store a voice embedding for a known character (set in the prelude /
+        when a new speaker is first registered)."""
+        if embedding is not None:
+            self._embeddings[speaker_id] = embedding
+
+    def resolve(self, embedding, threshold: float = DEFAULT_MATCH_THRESHOLD) -> str | None:
+        """Return the known speaker_id whose stored embedding best matches
+        `embedding` (cosine ≥ threshold), or None if none qualify → caller
+        registers a new character. Used by the streaming runner (#9) to map a
+        later section's local speaker to an established character.
+        """
+        if embedding is None or not self._embeddings:
+            return None
+        from patmir.pipeline.streaming.embeddings import cosine
+
+        best_id, best_score = None, -1.0
+        for spk, emb in self._embeddings.items():
+            score = cosine(embedding, emb)
+            if score > best_score:
+                best_id, best_score = spk, score
+        return best_id if best_score >= threshold else None
+
+    def has_embedding(self, speaker_id: str) -> bool:
+        return speaker_id in self._embeddings
+
     # ── introspection ─────────────────────────────────────────────────────
 
     def assignments(self) -> dict[str, str]:
         return dict(self._assigned)
+
+    def known_speakers(self) -> list[str]:
+        return list(self._assigned.keys())

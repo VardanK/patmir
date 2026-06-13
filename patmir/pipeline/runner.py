@@ -34,6 +34,7 @@ def run_job(
     runs_root: Path | None = None,
     resume_job_dir: Path | None = None,
     resume_from: str | None = None,
+    stop_after: str | None = None,
     source_lang: str | None = None,
     on_job_dir_created: Any = None,
 ) -> Manifest:
@@ -43,6 +44,11 @@ def run_job(
     `(job_dir, job_id)` immediately after the per-job directory exists —
     lets a wrapper (e.g. the FastAPI server) bind a JobRecord to the
     run_job_id without waiting for the whole pipeline to finish.
+
+    `stop_after`, when given (a stage name in STAGE_ORDER), runs through that
+    stage and then returns — used by the streaming prelude to run only the
+    analysis half (ingest→…→asr, which includes the post-ASR speaker/emotion
+    tagging + ref backfill) without translate/tts/mux/output.
     """
     runs_root = runs_root or Path.cwd() / "runs"
 
@@ -112,6 +118,9 @@ def run_job(
         finally:
             stage_obj = None  # noqa — drop reference
             _free_accelerator_cache()
+
+        if stop_after and name == stop_after:
+            break
 
     return manifest
 

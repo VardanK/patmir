@@ -83,5 +83,36 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(r.locked_ref("S0"), "/clip/a.wav")
 
 
+class ResolveTests(unittest.TestCase):
+    def _reg(self):
+        return SpeakerRegistry(_pool())
+
+    def test_resolve_matches_close_embedding(self):
+        import numpy as np
+        r = self._reg()
+        v = np.array([1.0, 0.0, 0.0], dtype="float32")
+        r.set_embedding("S0", v)
+        # near-identical direction → high cosine → resolves to S0
+        self.assertEqual(r.resolve(np.array([0.98, 0.05, 0.0], dtype="float32")), "S0")
+
+    def test_resolve_rejects_distant_embedding(self):
+        import numpy as np
+        r = self._reg()
+        r.set_embedding("S0", np.array([1.0, 0.0, 0.0], dtype="float32"))
+        # orthogonal → cosine 0 < threshold → no match (caller makes a new speaker)
+        self.assertIsNone(r.resolve(np.array([0.0, 1.0, 0.0], dtype="float32")))
+
+    def test_resolve_empty_registry_is_none(self):
+        import numpy as np
+        self.assertIsNone(self._reg().resolve(np.array([1.0, 0.0, 0.0], dtype="float32")))
+
+    def test_resolve_picks_best_of_several(self):
+        import numpy as np
+        r = self._reg()
+        r.set_embedding("S0", np.array([1.0, 0.0, 0.0], dtype="float32"))
+        r.set_embedding("S1", np.array([0.0, 1.0, 0.0], dtype="float32"))
+        self.assertEqual(r.resolve(np.array([0.1, 0.95, 0.0], dtype="float32")), "S1")
+
+
 if __name__ == "__main__":
     unittest.main()

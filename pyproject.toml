@@ -29,6 +29,7 @@ local = [
   "pyannote.audio>=3.1",  # Phase 2 speaker diarization (SOTA + overlap detection)
   "funasr>=1.1",          # Phase 2.x emotion2vec SER inference (per-turn emotion detection)
   "modelscope>=1.20",     # funasr's model-download dependency
+  "speechbrain>=1.1",     # Phase 3 (D3) ECAPA speaker embeddings for cross-section identity
 ]
 # Cloud baselines (translation ceiling + TTS ceiling).
 cloud = [
