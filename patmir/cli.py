@@ -177,7 +177,7 @@ def cmd_ui(port: int, runs_root: Path, config: Path) -> int:
     print(f"  runs:    {runs_root}", file=sys.stderr)
     print(f"  token:   {token}  (paste into the Chrome extension options page)",
           file=sys.stderr)
-    serve(port=port, runs_root=runs_root, cfg=cfg, token=token)
+    serve(port=port, runs_root=runs_root, cfg=cfg, token=token, config_path=config)
     return 0
 
 
