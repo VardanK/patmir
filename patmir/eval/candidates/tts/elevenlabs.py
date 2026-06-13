@@ -48,6 +48,29 @@ _DEFAULT_VOICE_SETTINGS: dict[str, dict[str, float]] = {
     "fearful": {"stability": 0.30, "similarity_boost": 0.80, "style": 0.60},
 }
 
+# Default preset voice pool for no-clone mode (`clone = false`). On `eleven_v3`
+# any library voice speaks Armenian (language is model-driven, not voice-driven),
+# so these are chosen purely for cartoon-character timbre variety — distinct
+# ages plus the two `characters_animation` voices (Callum, Harry). Each diarized
+# speaker is assigned a gender-matched voice (gender inferred from the speaker's
+# ref-clip pitch) round-robin, and keeps it for the whole video. Override via
+# `[[...]].voice_pool` in patmir.toml (entries may be plain ids or {id, gender}).
+_DEFAULT_VOICE_POOL: list[dict[str, str]] = [
+    {"id": "JBFqnCBsd6RMkjVDRZzb", "gender": "male"},    # George  — middle, warm storyteller
+    {"id": "EXAVITQu4vr4xnSDxMaL", "gender": "female"},  # Sarah   — young
+    {"id": "N2lVS1w4EtoT3dr4eOWO", "gender": "male"},    # Callum  — animation (husky trickster)
+    {"id": "cgSgspJ2msm6clMCkdW9", "gender": "female"},  # Jessica — young, cute
+    {"id": "IKne3meq5aSn9XLyUdCD", "gender": "male"},    # Charlie — young, energetic
+    {"id": "FGY2WhTYpPnrIDTdsKH5", "gender": "female"},  # Laura   — young, quirky
+    {"id": "SOYHLrjzK2X1ezoPC6cr", "gender": "male"},    # Harry   — animation (fierce/rough)
+    {"id": "pqHfZKP75CvOlQylNhV4", "gender": "male"},    # Bill    — old, wise
+]
+
+# Median-F0 boundary (Hz) between male and female timbre. Adult males ~85–155,
+# adult females ~165–255, children skew high → routed to the female sub-pool
+# (a young/cute voice fits a kid acceptably).
+_GENDER_F0_THRESHOLD_HZ = 165.0
+
 
 class ElevenLabsTTS:
     id = "elevenlabs_multilingual_v2"
@@ -76,6 +99,15 @@ class ElevenLabsTTS:
         # IVC upload sample-rate normalization isn't needed — ElevenLabs
         # accepts arbitrary WAV/MP3. The ref clips we slice are 16 kHz mono
         # PCM, which is fine.
+        #
+        # clone=True (default) → Instant Voice Cloning from the source ref clip.
+        # clone=False → no-clone "preset pool" mode: each speaker is assigned a
+        # stable library voice from `voice_pool`. Avoids the intermittent
+        # celebrity-clone block (HTTP 403 voice_access_denied) entirely and
+        # removes the per-speaker IVC upload latency. The recommended mode for
+        # near-realtime watch-along (ADR 2026-06-13-near-realtime-d3-spike).
+        clone: bool = True,
+        voice_pool: list[str] | list[dict[str, str]] | None = None,
     ) -> None:
         api_key = os.environ.get(api_key_env)
         if not api_key:
@@ -94,6 +126,21 @@ class ElevenLabsTTS:
         self.cleanup_voices = cleanup_voices
         self.output_format = output_format
         self.language_code = language_code
+        self.clone = clone
+        # Normalize pool entries to {id, gender, age} dicts. Plain-string
+        # entries (legacy / untagged) become gender/age "any". The gender+age
+        # tags are consumed by the speaker registry (Slice 2 #7), which profiles
+        # each speaker and passes a matched `voice_id` explicitly; the candidate
+        # itself only needs the id list for its standalone round-robin fallback.
+        raw_pool = voice_pool if voice_pool else _DEFAULT_VOICE_POOL
+        self.voice_pool: list[dict[str, str]] = [
+            {"id": e, "gender": "any", "age": "any"} if isinstance(e, str)
+            else {"id": e["id"], "gender": e.get("gender", "any"), "age": e.get("age", "any")}
+            for e in raw_pool
+        ]
+        self._pool_ids: list[str] = [e["id"] for e in self.voice_pool]
+        # Round-robin cursor for assigning pool voices to new speakers.
+        self._pool_cursor = 0
         self._client = httpx.Client(timeout=timeout_seconds)
         self._headers = {"xi-api-key": self.api_key}
         # Speakers whose IVC upload has failed once — skip retry to avoid
@@ -119,6 +166,24 @@ class ElevenLabsTTS:
         self._silent_lines: int = 0
         if self.cleanup_voices:
             atexit.register(self._cleanup)
+
+    # ─── preset-pool voice assignment (no-clone mode) ──────────────────────
+
+    def _pool_voice_for_speaker(self, speaker_id: str) -> str:
+        """Map a speaker to a stable pool voice (round-robin, cached).
+
+        The same speaker_id always returns the same voice for the life of this
+        candidate, so a character keeps one voice across the whole video. New
+        speakers take the next pool slot, wrapping around if there are more
+        speakers than pool voices.
+        """
+        existing = self._speaker_voice.get(speaker_id)
+        if existing is not None:
+            return existing
+        voice_id = self._pool_ids[self._pool_cursor % len(self._pool_ids)]
+        self._pool_cursor += 1
+        self._speaker_voice[speaker_id] = voice_id
+        return voice_id
 
     # ─── IVC voice management ──────────────────────────────────────────────
 
@@ -192,6 +257,15 @@ class ElevenLabsTTS:
         """
         speakers: dict[str, dict] = {}
         for speaker_id, lines in self._speaker_lines.items():
+            if not self.clone:
+                # Preset-pool mode: every speaker has a pool voice assignment
+                # (or the default if it was a no-ref/no-speaker line).
+                speakers[speaker_id] = {
+                    "status": "pool",
+                    "voice_id": self._speaker_voice.get(speaker_id, self.default_voice_id),
+                    "lines": lines,
+                }
+                continue
             if speaker_id == "_no_ref":
                 speakers["_no_speaker"] = {
                     "status": "no_speaker",
@@ -239,9 +313,16 @@ class ElevenLabsTTS:
         ref_text: str | None = None,
         guidance_scale: float | None = None,
         emotion: str | None = None,
+        speaker_id: str | None = None,
+        voice_id: str | None = None,
     ) -> bytes:
-        """Return WAV bytes. `ref_audio` selects an IVC-cloned voice;
-        `emotion` selects the voice_settings preset.
+        """Return WAV bytes. `emotion` selects the voice_settings preset.
+
+        Voice selection depends on mode:
+          - clone=True  → `ref_audio` is IVC-cloned (uploads on first use).
+          - clone=False → preset-pool: `speaker_id` is mapped to a stable pool
+            voice. An explicit `voice_id` (e.g. from the speaker registry)
+            overrides pool assignment in either mode.
 
         `ref_text` and `guidance_scale` accepted for adapter uniformity but
         unused — ElevenLabs has no ref-transcript input and `guidance_scale`
@@ -249,26 +330,36 @@ class ElevenLabsTTS:
         """
         del ref_text, guidance_scale
 
-        voice_id = self.default_voice_id
-        speaker_id = Path(str(ref_audio)).parent.name if ref_audio is not None else "_no_ref"
+        # Identify the speaker: explicit kwarg (registry) wins; else infer from
+        # the ref-clip path (diarize/refs/<speaker>/<emotion>.wav); else no-ref.
+        if speaker_id is None:
+            speaker_id = Path(str(ref_audio)).parent.name if ref_audio is not None else "_no_ref"
         self._speaker_lines[speaker_id] = self._speaker_lines.get(speaker_id, 0) + 1
-        if ref_audio is not None:
-            self._speaker_first_ref.setdefault(speaker_id, str(ref_audio))
-            if speaker_id in self._ivc_failed_speakers:
-                # Already known to fail (tier issue, etc.) — skip retry,
-                # quietly use the default voice for this speaker's lines.
-                pass
-            else:
-                try:
-                    voice_id = self._voice_id_for_ref(ref_audio)
-                except Exception as exc:
-                    self._ivc_failed_speakers.add(speaker_id)
-                    self._ivc_error_by_speaker[speaker_id] = f"{type(exc).__name__}: {exc}"
-                    print(
-                        f"elevenlabs: IVC upload failed for {speaker_id}; "
-                        f"falling back to default voice {self.default_voice_id} for this speaker. "
-                        f"({type(exc).__name__}: {exc})"
-                    )
+
+        if not self.clone:
+            # ── No-clone preset-pool mode ──────────────────────────────────
+            # No upload, no captcha path. Stable voice per speaker.
+            voice_id = voice_id or self._pool_voice_for_speaker(speaker_id)
+        else:
+            # ── IVC clone mode (original behavior) ─────────────────────────
+            voice_id = voice_id or self.default_voice_id
+            if ref_audio is not None:
+                self._speaker_first_ref.setdefault(speaker_id, str(ref_audio))
+                if speaker_id in self._ivc_failed_speakers:
+                    # Already known to fail (tier issue, etc.) — skip retry,
+                    # quietly use the default voice for this speaker's lines.
+                    pass
+                else:
+                    try:
+                        voice_id = self._voice_id_for_ref(ref_audio)
+                    except Exception as exc:
+                        self._ivc_failed_speakers.add(speaker_id)
+                        self._ivc_error_by_speaker[speaker_id] = f"{type(exc).__name__}: {exc}"
+                        print(
+                            f"elevenlabs: IVC upload failed for {speaker_id}; "
+                            f"falling back to default voice {self.default_voice_id} for this speaker. "
+                            f"({type(exc).__name__}: {exc})"
+                        )
 
         settings = self.voice_settings.get(
             emotion or "neutral",
@@ -409,13 +500,23 @@ def _silent_wav(seconds: float, sample_rate: int = 44100) -> bytes:
 
 
 def _mp3_to_wav(mp3_bytes: bytes) -> bytes:
-    """Decode MP3 bytes → WAV bytes (PCM-16 mono 44.1k) via ffmpeg subprocess."""
+    """Decode MP3 bytes → WAV bytes (PCM-16 mono 44.1k) via ffmpeg subprocess.
+
+    Decodes to RAW PCM (`s16le`) and wraps it with Python's `wave` writer
+    rather than asking ffmpeg for `-f wav pipe:1`. ffmpeg can't seek back on a
+    pipe to fill the RIFF/data size field, so its piped WAV header carries a
+    placeholder frame count — `wave.open(...).getnframes()` then reports a
+    bogus multi-hour duration, which the TTS adapter stores as `wav_duration`
+    and mux uses to time-stretch (→ wildly wrong stretch). Wrapping the raw
+    PCM ourselves guarantees a correct header.
+    """
+    sr = 44100
     proc = subprocess.run(
         [
             "ffmpeg", "-loglevel", "error",
             "-f", "mp3", "-i", "pipe:0",
-            "-ac", "1", "-ar", "44100",
-            "-f", "wav", "-c:a", "pcm_s16le",
+            "-ac", "1", "-ar", str(sr),
+            "-f", "s16le", "-c:a", "pcm_s16le",
             "pipe:1",
         ],
         input=mp3_bytes,
@@ -426,7 +527,13 @@ def _mp3_to_wav(mp3_bytes: bytes) -> bytes:
         raise RuntimeError(
             f"elevenlabs: ffmpeg MP3→WAV decode failed: {proc.stderr.decode('utf-8', errors='replace')[:500]}"
         )
-    return proc.stdout
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(proc.stdout)
+    return buf.getvalue()
 
 
 def build(config: dict[str, Any]) -> ElevenLabsTTS:
@@ -439,4 +546,6 @@ def build(config: dict[str, Any]) -> ElevenLabsTTS:
         cleanup_voices=bool(config.get("cleanup_voices", True)),
         output_format=config.get("output_format", "mp3_44100_128"),
         language_code=config.get("language_code", "hy"),
+        clone=bool(config.get("clone", True)),
+        voice_pool=config.get("voice_pool"),
     )

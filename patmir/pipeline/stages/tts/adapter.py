@@ -43,10 +43,16 @@ class SentenceTTS:
             self._supports_ref = "ref_audio" in params and "ref_text" in params
             self._supports_guidance = "guidance_scale" in params
             self._supports_emotion = "emotion" in params
+            # Pool-voice candidates (ElevenLabs no-clone mode) map a stable
+            # voice per character; they need the speaker_id directly rather
+            # than inferring it from the ref-clip path. Clone candidates
+            # (OmniVoice) don't have this param and the probe skips it.
+            self._supports_speaker = "speaker_id" in params
         except (TypeError, ValueError):
             self._supports_ref = False
             self._supports_guidance = False
             self._supports_emotion = False
+            self._supports_speaker = False
         # IVC-style candidates (ElevenLabs) clone from audio alone and don't
         # need the reference transcript. They set `ref_text_optional = True`
         # so we treat refs with empty `ref_text` as usable for them.
@@ -129,6 +135,8 @@ class SentenceTTS:
                 # off this. OmniVoice/Piper don't have this param and the
                 # block is skipped via the signature probe.
                 kwargs["emotion"] = s.emotion
+            if self._supports_speaker:
+                kwargs["speaker_id"] = s.speaker_id
 
             wav_bytes = self.inner.synthesize(s.target_text, **kwargs)
             wav_path = out_dir / f"{s.idx:04d}.wav"

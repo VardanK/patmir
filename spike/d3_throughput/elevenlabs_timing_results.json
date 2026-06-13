@@ -1,0 +1,34 @@
+{
+  "video_duration_s": 127.321,
+  "rows": [
+    {
+      "concurrency": 1,
+      "n": 8,
+      "wall_s": 12.6,
+      "mean_per_sentence_s": 1.57,
+      "output_audio_s": 389566.2,
+      "rtf_compute_per_dub_s": 0.0
+    },
+    {
+      "concurrency": 4,
+      "n": 8,
+      "wall_s": 4.0,
+      "mean_per_sentence_s": 0.88,
+      "output_audio_s": 194787.1,
+      "rtf_compute_per_dub_s": 0.0
+    },
+    {
+      "concurrency": 8,
+      "n": 8,
+      "wall_s": 1.8,
+      "mean_per_sentence_s": 0.57,
+      "output_audio_s": 146092.3,
+      "rtf_compute_per_dub_s": 0.0
+    }
+  ],
+  "silent_fallback_lines": 9,
+  "speaker_status": {
+    "SPEAKER_00": "cloned",
+    "SPEAKER_01": "cloned"
+  }
+}

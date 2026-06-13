@@ -1,0 +1,7 @@
+{
+  "slice_seconds": 20.0,
+  "device": "mps",
+  "wall_s": 10.8,
+  "rtf_vs_slice": 0.54,
+  "vocals_out": "/Users/vardan.kurkchiyan/Projects/patmir/spike/d3_throughput/demucs_slice_vocals.wav"
+}

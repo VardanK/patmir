@@ -1,0 +1,50 @@
+{
+  "video_duration_s": 127.321,
+  "rows": [
+    {
+      "num_steps": 32,
+      "concurrency": 1,
+      "n": 10,
+      "wall_s": 115.5,
+      "mean_per_sentence_s": 11.55,
+      "output_audio_s": 35.2,
+      "rtf_compute_per_dub_s": 3.28
+    },
+    {
+      "num_steps": 16,
+      "concurrency": 1,
+      "n": 10,
+      "wall_s": 59.1,
+      "mean_per_sentence_s": 5.91,
+      "output_audio_s": 35.2,
+      "rtf_compute_per_dub_s": 1.68
+    },
+    {
+      "num_steps": 8,
+      "concurrency": 1,
+      "n": 10,
+      "wall_s": 30.6,
+      "mean_per_sentence_s": 3.06,
+      "output_audio_s": 35.2,
+      "rtf_compute_per_dub_s": 0.87
+    },
+    {
+      "num_steps": 32,
+      "concurrency": 2,
+      "n": 10,
+      "wall_s": 106.8,
+      "mean_per_sentence_s": 20.29,
+      "output_audio_s": 35.2,
+      "rtf_compute_per_dub_s": 3.04
+    },
+    {
+      "num_steps": 32,
+      "concurrency": 4,
+      "n": 10,
+      "wall_s": 107.7,
+      "mean_per_sentence_s": 38.08,
+      "output_audio_s": 35.2,
+      "rtf_compute_per_dub_s": 3.06
+    }
+  ]
+}

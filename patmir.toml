@@ -477,6 +477,42 @@ timeout_seconds  = 90.0
 # `pcm_16000` are Creator+. Override if on a higher tier to skip decode.
 output_format    = "mp3_44100_128"
 
+# ElevenLabs no-clone "preset pool" mode — the recommended TTS for the
+# near-realtime watch-along (D3) mode. Same eleven_v3 model, but instead of
+# IVC-cloning the source speaker (which intermittently trips the celebrity-
+# clone block, HTTP 403 voice_access_denied), each diarized speaker is
+# assigned a stable library voice from `voice_pool` round-robin. No upload,
+# no captcha path, lower first-dub latency. Pool defaults (in the candidate)
+# are 8 cartoon-variety library voices; override here to curate.
+# See ADR `2026-06-13-near-realtime-d3-spike.md`.
+[[eval.tts.candidates]]
+id               = "elevenlabs_pool"
+enabled          = false
+module           = "patmir.eval.candidates.tts.elevenlabs"
+model_id         = "eleven_v3"
+language_code    = "hy"
+api_key_env      = "ELEVENLABS_API_KEY"
+clone            = false
+default_voice_id = "21m00Tcm4TlvDq8ikWAM"   # "Rachel" — fallback for no-speaker lines
+cleanup_voices   = false                     # no uploads in pool mode → nothing to clean
+timeout_seconds  = 90.0
+output_format    = "mp3_44100_128"
+# Entries are {id, gender, age} — the speaker registry (Slice 2 #7) profiles
+# each diarized speaker (gender + age via an age-gender model) and assigns the
+# best gender+age-matched voice. `age` is the SET of buckets a voice can cover
+# (∈ child, young, adult, elder); with only 8 voices, each covers adjacent
+# buckets so the pool stretches across all ages without sounding wrong.
+voice_pool = [
+  { id = "JBFqnCBsd6RMkjVDRZzb", gender = "male",   age = ["young", "adult", "elder"] },  # George  — warm storyteller
+  { id = "EXAVITQu4vr4xnSDxMaL", gender = "female", age = ["young", "adult"] },            # Sarah
+  { id = "N2lVS1w4EtoT3dr4eOWO", gender = "male",   age = ["young", "adult"] },            # Callum  — animation (trickster)
+  { id = "cgSgspJ2msm6clMCkdW9", gender = "female", age = ["child", "young"] },            # Jessica — cute (kid)
+  { id = "IKne3meq5aSn9XLyUdCD", gender = "male",   age = ["child", "young"] },            # Charlie — energetic (boy)
+  { id = "FGY2WhTYpPnrIDTdsKH5", gender = "female", age = ["young", "adult"] },            # Laura   — quirky
+  { id = "SOYHLrjzK2X1ezoPC6cr", gender = "male",   age = ["young", "adult"] },            # Harry   — animation (fierce)
+  { id = "pqHfZKP75CvOlQylNhV4", gender = "male",   age = ["adult", "elder"] },            # Bill    — old, wise
+]
+
 # OpenRouter TTS — frontier cloud TTS via OpenRouter's /v1/audio/speech
 # endpoint (OpenAI-compatible). Reuses the OPENROUTER_API_KEY already set
 # for the translate stage; no separate vendor account or tier wall.
