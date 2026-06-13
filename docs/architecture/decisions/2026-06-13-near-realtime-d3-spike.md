@@ -86,6 +86,12 @@ Settled while building; recorded here so they're not re-litigated:
 - **Cross-section speaker identity (#9) = ECAPA-TDNN embeddings** (`speechbrain/spkrec-ecapa-voxceleb`): embed
   each section's local speakers, cosine-match against the registry's stored per-character embeddings; below
   threshold → new character. Voice mapping stays locked once resolved (no mid-video voice flip).
+  - **Calibration (validated 2026-06-13):** threshold = **0.12**, NOT the literature ~0.25–0.40. On
+    Demucs-separated emotional speech, same-speaker cosine across emotions drops to 0.157 (angry vs neutral)
+    while different speakers stay ≤0.06. Each speaker stores **multiple embeddings** (one per emotion clip;
+    resolve = best match) + online enrichment from matched sections. See `project_ecapa_identity_calibration`
+    memory + `spike/d3_throughput/test_positive_match.py`. Positive (returning speaker matches) and negative
+    (new speaker → new voice) paths both validated on the real source.
 
 ## Revisit triggers
 

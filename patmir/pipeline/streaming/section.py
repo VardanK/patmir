@@ -30,7 +30,7 @@ from pathlib import Path
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.runner import run_job
 from patmir.pipeline.streaming.embeddings import embed
-from patmir.pipeline.streaming.prelude import _one_ref_per_speaker, _snap_window_end
+from patmir.pipeline.streaming.prelude import _primary_ref, _refs_by_speaker, _snap_window_end
 from patmir.pipeline.streaming.registry import SpeakerRegistry
 from patmir.pipeline.streaming.speaker_profile import profile_speaker
 
@@ -65,17 +65,26 @@ def _trim_wav(src: Path, seconds: float, dest: Path) -> None:
 
 
 def _resolve_identities(registry: SpeakerRegistry, job_dir: Path) -> tuple[dict[str, str], list[str]]:
-    """Map this section's local speaker labels to global characters."""
+    """Map this section's local speaker labels to global characters, matching
+    against the registry's stored embeddings (resolve-or-register)."""
     local_to_global: dict[str, str] = {}
     new_speakers: list[str] = []
-    for local_id, ref in _one_ref_per_speaker(job_dir).items():
-        ref_audio = ref["ref_audio"]
-        emb = embed(ref_audio)
-        profile = profile_speaker(ref_audio)
-        gid, is_new = registry.resolve_or_register(emb, profile=profile, ref_audio=ref_audio)
+    for local_id, refs in _refs_by_speaker(job_dir).items():
+        primary = _primary_ref(refs)
+        emb = embed(primary["ref_audio"])
+        profile = profile_speaker(primary["ref_audio"])
+        gid, is_new = registry.resolve_or_register(emb, profile=profile, ref_audio=primary["ref_audio"])
         local_to_global[local_id] = gid
         if is_new:
             new_speakers.append(gid)
+            # seed the rest of this speaker's emotion clips for robust future matching
+            for r in refs:
+                if r is not primary:
+                    registry.set_embedding(gid, embed(r["ref_audio"]))
+        else:
+            # online enrichment: add this section's clips to the matched character
+            for r in refs:
+                registry.set_embedding(gid, embed(r["ref_audio"]))
     return local_to_global, new_speakers
 
 

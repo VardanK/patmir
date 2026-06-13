@@ -20,12 +20,16 @@ from dataclasses import dataclass, field
 # can take an `adult` voice before falling back to any gender match).
 AGE_ORDER = ["child", "young", "adult", "elder"]
 
-# Default ECAPA cosine threshold above which two clips are deemed the same
-# speaker. Same-speaker pairs typically score >0.5, different speakers <0.3;
-# 0.40 is a conservative middle that favours NOT merging distinct characters
-# (a false-merge swaps a character's voice, which is more jarring than a
-# false-split that just spawns an extra voice). Tune per content.
-DEFAULT_MATCH_THRESHOLD = 0.40
+# ECAPA cosine threshold above which two clips are deemed the same speaker.
+# Calibrated 2026-06-13 on Demucs-separated movie speech: same-speaker pairs
+# across emotions ranged 0.157–0.48 (an angry/shouting clip scored only 0.157
+# vs the same speaker's neutral clip — vocal effort moves the embedding a lot),
+# while *different* speakers stayed ≤0.06. 0.12 sits in that gap. We also store
+# MULTIPLE embeddings per speaker (resolve takes the best match across them) so
+# a speaker seen in several emotional states matches more robustly than this
+# single thin margin would allow. Lower than the ECAPA-literature ~0.25 because
+# separated, emotional audio compresses same-speaker similarity.
+DEFAULT_MATCH_THRESHOLD = 0.12
 
 
 @dataclass(frozen=True)
@@ -87,7 +91,7 @@ class SpeakerRegistry:
         self._assigned: dict[str, str] = {}     # speaker_id → voice_id
         self._use_count: dict[str, int] = {v.id: 0 for v in pool}
         self._locked_ref: dict[str, str] = {}    # speaker_id → ref clip (OmniVoice path)
-        self._embeddings: dict[str, object] = {}  # speaker_id → ECAPA embedding (np.ndarray)
+        self._embeddings: dict[str, list] = {}   # speaker_id → list of ECAPA embeddings
         self._id_counter = 0                        # for minting global ids for new speakers
 
     # ── ElevenLabs preset-pool path ────────────────────────────────────────
@@ -150,30 +154,31 @@ class SpeakerRegistry:
     # ── cross-section identity (ECAPA embeddings) ──────────────────────────
 
     def set_embedding(self, speaker_id: str, embedding) -> None:
-        """Store a voice embedding for a known character (set in the prelude /
-        when a new speaker is first registered)."""
+        """Add a voice embedding for a character. Multiple embeddings per
+        speaker (from different turns/emotions) make matching robust to vocal-
+        effort variation — `resolve` scores against the best of them."""
         if embedding is not None:
-            self._embeddings[speaker_id] = embedding
+            self._embeddings.setdefault(speaker_id, []).append(embedding)
 
     def resolve(self, embedding, threshold: float = DEFAULT_MATCH_THRESHOLD) -> str | None:
-        """Return the known speaker_id whose stored embedding best matches
-        `embedding` (cosine ≥ threshold), or None if none qualify → caller
-        registers a new character. Used by the streaming runner (#9) to map a
-        later section's local speaker to an established character.
+        """Return the known speaker_id whose stored embeddings best match
+        `embedding` (max cosine ≥ threshold), or None if none qualify → caller
+        registers a new character. Scores each speaker by the BEST of their
+        stored embeddings so an emotional clip can still match a calm one.
         """
         if embedding is None or not self._embeddings:
             return None
         from patmir.pipeline.streaming.embeddings import cosine
 
         best_id, best_score = None, -1.0
-        for spk, emb in self._embeddings.items():
-            score = cosine(embedding, emb)
+        for spk, embs in self._embeddings.items():
+            score = max((cosine(embedding, e) for e in embs), default=-1.0)
             if score > best_score:
                 best_id, best_score = spk, score
         return best_id if best_score >= threshold else None
 
     def has_embedding(self, speaker_id: str) -> bool:
-        return speaker_id in self._embeddings
+        return bool(self._embeddings.get(speaker_id))
 
     def _mint_id(self) -> str:
         while True:

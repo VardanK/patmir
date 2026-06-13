@@ -67,22 +67,28 @@ def _snap_window_end(job_dir: Path, target: float) -> float:
     return max(ends) if ends else target
 
 
-def _one_ref_per_speaker(job_dir: Path) -> dict[str, dict]:
-    """From diarize/refs.json pick one ref clip per speaker (prefer neutral,
-    else the longest source window)."""
+def _refs_by_speaker(job_dir: Path) -> dict[str, list[dict]]:
+    """Group all of diarize/refs.json by speaker (every emotion clip)."""
     refs_path = job_dir / "diarize" / "refs.json"
     if not refs_path.exists():
         return {}
-    by_speaker: dict[str, dict] = {}
+    grouped: dict[str, list[dict]] = {}
     for r in json.loads(refs_path.read_text()).values():
-        spk = r["speaker_id"]
-        cur = by_speaker.get(spk)
-        better_neutral = r["emotion"] == "neutral" and (cur is None or cur["emotion"] != "neutral")
-        longer = cur is not None and cur["emotion"] != "neutral" and \
-            (r["source_end"] - r["source_start"]) > (cur["source_end"] - cur["source_start"])
-        if cur is None or better_neutral or longer:
-            by_speaker[spk] = r
-    return by_speaker
+        grouped.setdefault(r["speaker_id"], []).append(r)
+    return grouped
+
+
+def _primary_ref(refs: list[dict]) -> dict:
+    """Pick the representative ref for a speaker: neutral if present, else the
+    longest source window (used for voice assignment + profiling)."""
+    neutral = [r for r in refs if r["emotion"] == "neutral"]
+    pool = neutral or refs
+    return max(pool, key=lambda r: r["source_end"] - r["source_start"])
+
+
+def _one_ref_per_speaker(job_dir: Path) -> dict[str, dict]:
+    """One representative ref per speaker (back-compat helper)."""
+    return {spk: _primary_ref(refs) for spk, refs in _refs_by_speaker(job_dir).items()}
 
 
 def run_prelude(
@@ -105,18 +111,21 @@ def run_prelude(
     window_end = _snap_window_end(job_dir, window_seconds)
 
     speakers: dict[str, dict] = {}
-    for spk, ref in _one_ref_per_speaker(job_dir).items():
-        ref_audio = ref["ref_audio"]
-        profile = profile_speaker(ref_audio)
+    for spk, refs in _refs_by_speaker(job_dir).items():
+        primary = _primary_ref(refs)
+        profile = profile_speaker(primary["ref_audio"])
         voice_id = registry.assign_voice(spk, profile)
-        registry.set_embedding(spk, embed(ref_audio))
-        registry.lock_ref(spk, ref_audio)
+        registry.lock_ref(spk, primary["ref_audio"])
+        # Seed one embedding per emotion clip so a speaker seen in several
+        # states matches robustly later (resolve scores against the best).
+        for r in refs:
+            registry.set_embedding(spk, embed(r["ref_audio"]))
         speakers[spk] = {
             "voice_id": voice_id,
             "gender": profile.gender,
             "age": profile.age,
-            "ref_audio": ref_audio,
-            "has_embedding": registry.has_embedding(spk),
+            "ref_audio": primary["ref_audio"],
+            "embeddings": len(registry._embeddings.get(spk, [])),
         }
 
     return PreludeResult(
