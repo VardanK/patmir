@@ -60,7 +60,10 @@
           const disabled = await isVideoDisabled(url);
           const isPlaying = playing || waActive;
           const mode = waActive ? "watch-along" : (playing ? "quality" : null);
-          sendResponse({ ok: true, playing: isPlaying, mode, hasVideo: !!findVideo(), disabled });
+          sendResponse({
+            ok: true, playing: isPlaying, mode, hasVideo: !!findVideo(), disabled,
+            buffering: waActive && waBuffering,
+          });
         } else if (msg.type === "patmir:current-url") {
           sendResponse({ ok: true, url: window.location.href });
         }
@@ -379,8 +382,11 @@
   let waPollHandle = null;
   let waTickHandle = null;
   let waDesiredPlaying = false;   // does the user want playback right now?
-  let waWaiting = false;          // paused by us for buffering (vs. by the user)?
-  let waProgrammatic = false;     // guard so our own pause()/play() don't flip waDesiredPlaying
+  // Guard so our own buffering-pause isn't mistaken for a user pause. The
+  // <video> 'pause' event fires ASYNCHRONOUSLY after video.pause(), so this is
+  // consumed (cleared) inside the pause handler, never reset synchronously.
+  let waProgrammatic = false;
+  let waBuffering = false;        // want to play but the current section isn't ready yet
   let waLastPlayheadPost = 0;
 
   const WA_LOOKAHEAD = 15;        // seconds of sections to prefetch ahead of playhead
@@ -403,7 +409,7 @@
     video.muted = true;
 
     waDesiredPlaying = !video.paused;
-    waWaiting = false;
+    waBuffering = false;
 
     attachWatchAlongListeners();
     attachNavigationListeners();
@@ -430,7 +436,7 @@
     waActive = false;
     waCacheKey = null;
     waDesiredPlaying = false;
-    waWaiting = false;
+    waBuffering = false;
     videoSrcAtStart = null;
     urlAtStart = null;
   }
@@ -487,6 +493,10 @@
     if (!sec.buffer || !audioCtx) return;
     const offset = Math.max(0, c - sec.start);
     if (offset >= sec.buffer.duration - 0.001) return;
+    // Exactly one section sounds at a time. Stop EVERY live node (not just this
+    // section's) before starting the new one, so a section's tail can never
+    // overlap the next section at a boundary, and a re-anchor can't double up.
+    stopAllNodes();
     const now = audioCtx.currentTime;
     const src = audioCtx.createBufferSource();
     src.buffer = sec.buffer;
@@ -497,7 +507,6 @@
     else { when = now + (sec.start - c) / rate; startOffset = 0; }
     try { src.start(when, startOffset); } catch (_) { return; }
     src.onended = () => { if (sec.node === src) sec.node = null; };
-    if (sec.node) { try { sec.node.stop(); } catch (_) { /* ok */ } }
     sec.node = src; sec.startCtx = when; sec.startOffset = startOffset; sec.rate = rate;
   }
 
@@ -532,16 +541,37 @@
 
     const cur = sectionAt(c);
     if (!cur || !cur.buffer) {
-      // Underrun: the dub for the playhead isn't ready yet. Hold the video.
-      if (!video.paused) { waProgrammatic = true; video.pause(); waProgrammatic = false; waWaiting = true; }
+      // Underrun: the dub for the playhead isn't produced yet (still in the
+      // prelude, or the stream hasn't reached here). Freeze the video and
+      // silence any tail node; a later tick resumes once the section lands.
+      waBuffering = true;
+      stopAllNodes();
+      waPause();
       reportPlayhead(true);
       return;
     }
-    if (waWaiting && video.paused) {
-      waProgrammatic = true; video.play().catch(() => {}); waProgrammatic = false; waWaiting = false;
-    }
+    waBuffering = false;
+    // Resume if we (or a stalled autoplay) left the video paused while the
+    // user still wants to watch.
+    if (video.paused) waPlay();
     ensureScheduled(cur, c, rate);
     reportPlayhead(false);
+  }
+
+  /** Pause the <video> for buffering without the pause handler mistaking it
+   * for a user pause. The 'pause' event is async, so the guard is consumed in
+   * the handler; a timeout clears it if (somehow) no event fires. */
+  function waPause() {
+    if (!video || video.paused) return;
+    waProgrammatic = true;
+    setTimeout(() => { waProgrammatic = false; }, 400);
+    video.pause();
+  }
+
+  function waPlay() {
+    if (!video || !video.paused) return;
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+    video.play().catch(() => { /* autoplay gate — retried next tick */ });
   }
 
   function reportPlayhead(force) {
@@ -557,15 +587,13 @@
 
   const waHandlers = {
     play() {
-      if (waProgrammatic) return;
       if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
       waDesiredPlaying = true;
-      waWaiting = false;
       reportPlayhead(true);
       watchAlongTick();
     },
     pause() {
-      if (waProgrammatic) return;     // our own buffering-pause, not the user's
+      if (waProgrammatic) { waProgrammatic = false; return; }  // our buffering-pause
       waDesiredPlaying = false;
       stopAllNodes();
       reportPlayhead(true);

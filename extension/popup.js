@@ -172,7 +172,9 @@ async function refreshWatchAlong(lookup) {
   try { status = await tabMessage(activeTabId, { type: "patmir:status" }); }
   catch (_) { /* content script may not be loaded */ }
   if (status && status.ok && status.playing && status.mode === "watch-along") {
-    statusEl.textContent = "Watch-along playing.";
+    statusEl.textContent = status.buffering
+      ? "Watch-along — buffering (dubbing opening)…"
+      : "Watch-along playing.";
     setCta("Stop", false, () => stopInTab());
     setSecondary(null, null);
     return;
