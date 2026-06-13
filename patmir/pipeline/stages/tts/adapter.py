@@ -48,11 +48,18 @@ class SentenceTTS:
             # than inferring it from the ref-clip path. Clone candidates
             # (OmniVoice) don't have this param and the probe skips it.
             self._supports_speaker = "speaker_id" in params
+            # Streaming mode: the speaker registry owns voice assignment
+            # (gender/age-matched, consistent across sections), so the runner
+            # passes an explicit voice_id per speaker via
+            # `ctx.extra["voice_assignments"]`. Candidates that accept a
+            # `voice_id` kwarg (ElevenLabs pool mode) use it; others skip it.
+            self._supports_voice_id = "voice_id" in params
         except (TypeError, ValueError):
             self._supports_ref = False
             self._supports_guidance = False
             self._supports_emotion = False
             self._supports_speaker = False
+            self._supports_voice_id = False
         # IVC-style candidates (ElevenLabs) clone from audio alone and don't
         # need the reference transcript. They set `ref_text_optional = True`
         # so we treat refs with empty `ref_text` as usable for them.
@@ -113,6 +120,7 @@ class SentenceTTS:
 
         diar = ctx.extra.get("diarization")
         diarization: Diarization | None = diar if isinstance(diar, Diarization) else None
+        voice_assignments = ctx.extra.get("voice_assignments") or {}
 
         for i, s in enumerate(translated.sentences):
             if not s.target_text.strip():
@@ -137,6 +145,8 @@ class SentenceTTS:
                 kwargs["emotion"] = s.emotion
             if self._supports_speaker:
                 kwargs["speaker_id"] = s.speaker_id
+            if self._supports_voice_id and s.speaker_id in voice_assignments:
+                kwargs["voice_id"] = voice_assignments[s.speaker_id]
 
             wav_bytes = self.inner.synthesize(s.target_text, **kwargs)
             wav_path = out_dir / f"{s.idx:04d}.wav"

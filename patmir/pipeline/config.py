@@ -87,7 +87,12 @@ def _build_candidate(entry: dict[str, Any]) -> Any:
         ) from exc
 
 
-def load_pipeline_config(config_path: Path, *, skip_before: str | None = None) -> PipelineConfig:
+def load_pipeline_config(
+    config_path: Path,
+    *,
+    skip_before: str | None = None,
+    overrides: dict[str, str] | None = None,
+) -> PipelineConfig:
     """Load and instantiate the pipeline configuration.
 
     `skip_before`, if set to a stage name, instantiates only that stage and
@@ -95,6 +100,10 @@ def load_pipeline_config(config_path: Path, *, skip_before: str | None = None) -
     heavy) models don't get loaded into memory when we're about to resume
     from a later stage. The runner's `_load_resume_artifact` handles earlier-
     stage outputs from disk, so the actual stage instances are not needed.
+
+    `overrides`, a {stage: candidate_id} map, replaces the `[pipeline]`
+    selectors — used by the streaming/watch-along path to swap in a different
+    candidate (e.g. `tts = "elevenlabs_pool"`) without editing patmir.toml.
     """
     from patmir.pipeline.stage import STAGE_ORDER  # local import to avoid cycle
 
@@ -106,6 +115,9 @@ def load_pipeline_config(config_path: Path, *, skip_before: str | None = None) -
         raise RuntimeError(f"No [pipeline] section in {config_path}.")
 
     selectors = {stage: pipe.get(stage) for stage in _STAGE_NAMESPACE}
+    for stage, cid in (overrides or {}).items():
+        if stage in selectors:
+            selectors[stage] = cid
     missing = [s for s, v in selectors.items() if not v]
     if missing:
         raise RuntimeError(f"[pipeline] is missing selectors for: {missing}")

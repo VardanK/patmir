@@ -88,6 +88,7 @@ class SpeakerRegistry:
         self._use_count: dict[str, int] = {v.id: 0 for v in pool}
         self._locked_ref: dict[str, str] = {}    # speaker_id → ref clip (OmniVoice path)
         self._embeddings: dict[str, object] = {}  # speaker_id → ECAPA embedding (np.ndarray)
+        self._id_counter = 0                        # for minting global ids for new speakers
 
     # ── ElevenLabs preset-pool path ────────────────────────────────────────
 
@@ -173,6 +174,39 @@ class SpeakerRegistry:
 
     def has_embedding(self, speaker_id: str) -> bool:
         return speaker_id in self._embeddings
+
+    def _mint_id(self) -> str:
+        while True:
+            gid = f"spk{self._id_counter}"
+            self._id_counter += 1
+            if gid not in self._assigned and gid not in self._embeddings:
+                return gid
+
+    def resolve_or_register(
+        self,
+        embedding,
+        *,
+        profile: SpeakerProfile,
+        ref_audio: str | None = None,
+        threshold: float = DEFAULT_MATCH_THRESHOLD,
+    ) -> tuple[str, bool]:
+        """Map a section-local speaker (given its embedding + profile) to a
+        global character. Returns (global_speaker_id, is_new). If no known
+        character matches above `threshold`, mint a new global id, assign it a
+        gender/age-matched voice, and store its embedding + locked ref.
+
+        Takes an already-computed `profile`/`embedding` so the registry stays
+        independent of the (heavy) profiling + embedding models.
+        """
+        match = self.resolve(embedding, threshold)
+        if match is not None:
+            return match, False
+        gid = self._mint_id()
+        self.assign_voice(gid, profile)
+        self.set_embedding(gid, embedding)
+        if ref_audio is not None:
+            self.lock_ref(gid, ref_audio)
+        return gid, True
 
     # ── introspection ─────────────────────────────────────────────────────
 

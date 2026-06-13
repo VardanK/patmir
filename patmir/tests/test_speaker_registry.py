@@ -114,5 +114,44 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(r.resolve(np.array([0.1, 0.95, 0.0], dtype="float32")), "S1")
 
 
+class ResolveOrRegisterTests(unittest.TestCase):
+    def _reg(self):
+        return SpeakerRegistry(_pool())
+
+    def test_registers_new_speaker_when_no_match(self):
+        import numpy as np
+        r = self._reg()
+        gid, is_new = r.resolve_or_register(
+            np.array([1.0, 0.0, 0.0], dtype="float32"),
+            profile=SpeakerProfile("male", "adult"), ref_audio="/clip/a.wav",
+        )
+        self.assertTrue(is_new)
+        self.assertTrue(r.has_embedding(gid))
+        self.assertIn(gid, r.assignments())
+        self.assertEqual(r.locked_ref(gid), "/clip/a.wav")
+
+    def test_resolves_existing_without_minting(self):
+        import numpy as np
+        r = self._reg()
+        gid1, _ = r.resolve_or_register(
+            np.array([1.0, 0.0, 0.0], dtype="float32"),
+            profile=SpeakerProfile("male", "adult"))
+        gid2, is_new = r.resolve_or_register(
+            np.array([0.97, 0.04, 0.0], dtype="float32"),  # ~same direction
+            profile=SpeakerProfile("male", "adult"))
+        self.assertFalse(is_new)
+        self.assertEqual(gid1, gid2)
+
+    def test_distinct_speakers_get_distinct_ids(self):
+        import numpy as np
+        r = self._reg()
+        a, _ = r.resolve_or_register(np.array([1.0, 0.0, 0.0], dtype="float32"),
+                                     profile=SpeakerProfile("male", "adult"))
+        b, is_new = r.resolve_or_register(np.array([0.0, 1.0, 0.0], dtype="float32"),
+                                          profile=SpeakerProfile("female", "young"))
+        self.assertTrue(is_new)
+        self.assertNotEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main()

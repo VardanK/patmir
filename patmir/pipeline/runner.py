@@ -36,6 +36,7 @@ def run_job(
     resume_from: str | None = None,
     stop_after: str | None = None,
     source_lang: str | None = None,
+    extra: dict[str, Any] | None = None,
     on_job_dir_created: Any = None,
 ) -> Manifest:
     """Run the full pipeline.
@@ -79,6 +80,10 @@ def run_job(
         options=cfg.options,
         source_lang=manifest.source_lang,
     )
+    if extra:
+        # Seed cross-stage hand-offs (e.g. streaming voice_assignments) before
+        # any stage runs. See JobContext.extra.
+        ctx.extra.update(extra)
 
     start_idx = STAGE_ORDER.index(resume_from) if resume_from else 0
 
