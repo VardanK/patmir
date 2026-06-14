@@ -56,6 +56,12 @@ class PipelineOptions:
     # overrun behavior. Gap below is the minimum silence inserted between lines.
     voice_no_overlap: bool = True
     voice_overlap_gap_seconds: float = 0.06
+    # Max pitch-preserving speed-up applied to a line to help it fit before the
+    # next line, so dense dialogue (translated TTS often ~1.4× longer than the
+    # source) is absorbed by a mix of mild compression AND shifting rather than
+    # pure shifting (which packs lines back-to-back and truncates the tail).
+    # 1.0 disables extra compression (pure ripple). 1.5 ≈ up to 50% faster.
+    voice_max_compress: float = 1.5
     # OmniVoice guidance_scale per emotion bin. The TTS adapter looks this
     # up per sentence and passes it to the inner candidate as a per-call
     # override of the constructor default.

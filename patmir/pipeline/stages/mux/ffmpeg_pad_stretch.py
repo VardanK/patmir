@@ -104,7 +104,13 @@ class FFmpegPadStretch:
         # accumulating across the whole clip. See PipelineOptions.voice_no_overlap.
         no_overlap = bool(getattr(ctx.options, "voice_no_overlap", True))
         overlap_gap = max(0, int(float(getattr(ctx.options, "voice_overlap_gap_seconds", 0.06)) * sr))
+        max_compress = max(1.0, float(getattr(ctx.options, "voice_max_compress", 1.5)))
         voice_cursor = 0
+        placements: list[dict] = []
+        # Next line's source start (samples) per index — the room a line has to
+        # speak before the next one wants to. Last line has unbounded room.
+        next_src = [int(synth.sentences[j + 1].source_start * sr) for j in range(len(synth.sentences) - 1)]
+        next_src.append(n_samples)
         total = len(synth.sentences) or 1
 
         for i, s in enumerate(synth.sentences):
@@ -117,6 +123,16 @@ class FFmpegPadStretch:
             start_sample = _placement_start(
                 int(s.source_start * sr), voice_cursor, overlap_gap, no_overlap
             )
+            # Hybrid: if the line still wouldn't fit before the next line wants
+            # to speak, speed it up (pitch-preserving) toward that gap, capped
+            # at `max_compress`. Whatever still doesn't fit is absorbed by the
+            # ripple (the next line shifts a little). "A little of everything."
+            if no_overlap and max_compress > 1.01:
+                available = next_src[i] - start_sample
+                if available > 0 and len(audio) > available:
+                    ratio = min(len(audio) / available, max_compress)
+                    if ratio > 1.02:
+                        audio = _stretch_audio(audio, sr, ratio)
             end_sample = start_sample + len(audio)
             if start_sample >= n_samples:
                 ctx.progress("mux", (i + 1) / total, f"sentence {i+1}/{total} (past end)")
@@ -159,6 +175,13 @@ class FFmpegPadStretch:
             # Spread mono voice across all bed channels.
             voice_track[start_sample:end_sample, :] += mono[:, None] * voice_lin
             voice_cursor = end_sample
+            placements.append({
+                "idx": s.idx,
+                "source_start": round(s.source_start, 3),
+                "placed_start": round(start_sample / sr, 3),
+                "placed_end": round(end_sample / sr, 3),
+                "drift": round((start_sample - int(s.source_start * sr)) / sr, 3),
+            })
 
             # Duck the original vocals across the full ASR sentence window
             # (not just the TTS span). When TTS is shorter than the source
@@ -200,6 +223,11 @@ class FFmpegPadStretch:
         out_path = ctx.job_dir / "dub.wav"
         sf.write(str(out_path), out_audio, sr, subtype="PCM_16")
         _write_meta(ctx.job_dir, out_path, sr, n_channels)
+        # Sidecar for inspection/debugging: where each line actually landed
+        # (post compress + ripple) and how far it drifted from its source time.
+        (ctx.job_dir / "mux_placements.json").write_text(
+            json.dumps({"sample_rate": sr, "placements": placements}, indent=2)
+        )
         return MuxedAudio(path=out_path, sample_rate=sr)
 
 
@@ -227,9 +255,17 @@ def _stretch_to_window(
     clamped = max(1 - cap, min(1 + cap, desired_ratio))
     if _NO_STRETCH_BAND[0] <= clamped <= _NO_STRETCH_BAND[1]:
         return audio
+    return _stretch_audio(audio, sr, clamped)
+
+
+def _stretch_audio(audio: np.ndarray, sr: int, ratio: float) -> np.ndarray:
+    """Pitch-preserving time-stretch by `ratio` (>1 = faster/shorter). No-op on
+    a near-1 ratio or if rubberband isn't available (returns the input)."""
+    if _NO_STRETCH_BAND[0] <= ratio <= _NO_STRETCH_BAND[1]:
+        return audio
     try:
         import pyrubberband as pyrb  # lazy import
-        return pyrb.time_stretch(audio, sr, clamped)
+        return pyrb.time_stretch(audio, sr, ratio)
     except Exception:
         return audio
 
