@@ -142,6 +142,8 @@ def load_pipeline_config(
         voice_gain_db=float(opts_raw.get("voice_gain_db", -3.0)),
         min_ref_seconds=float(opts_raw.get("min_ref_seconds", 1.5)),
         sentence_afade_seconds=float(opts_raw.get("sentence_afade_seconds", 0.05)),
+        voice_no_overlap=bool(opts_raw.get("voice_no_overlap", True)),
+        voice_overlap_gap_seconds=float(opts_raw.get("voice_overlap_gap_seconds", 0.06)),
         emotion_guidance=emotion_guidance,
     )
 

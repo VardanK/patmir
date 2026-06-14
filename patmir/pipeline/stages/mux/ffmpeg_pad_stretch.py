@@ -4,8 +4,11 @@ For each synthesized sentence:
   1. Compute the source window from ASR timing.
   2. Stretch ratio = wav_duration / window, clamped to ±stretch_cap.
   3. Apply pyrubberband.time_stretch (pitch-preserving) if outside [0.98, 1.02].
-  4. Position the AR voice at the sentence's source start.
-  5. Allow overrun if it doesn't fit — drift accepted; lip sync is not a goal.
+  4. Position the AR voice at the sentence's source start — unless that would
+     overlap the previous line's audio (common when the translated TTS line is
+     longer than the source slot), in which case ripple it to just after the
+     previous line (`voice_no_overlap`, default on). Drift resets at every
+     source pause, so it stays local to a dense burst; lip sync is not a goal.
 
 Per sentence, also scale the AR voice so its RMS matches the source vocals'
 RMS in the same window (capped at ±12 dB). Keeps shouted lines shouted and
@@ -94,6 +97,14 @@ class FFmpegPadStretch:
         # those transitions enough that the bleed becomes inaudible.
         sentence_fade_seconds = float(getattr(ctx.options, "sentence_afade_seconds", 0.05))
         sentence_fade = max(0, int(sentence_fade_seconds * sr))
+        # No-overlap "ripple" placement: a line never starts before the prior
+        # line's audio ends (+ a small gap). `voice_cursor` tracks the end of
+        # the last placed line. A source pause naturally pushes the next line's
+        # source_start past the cursor, so drift resets at every gap instead of
+        # accumulating across the whole clip. See PipelineOptions.voice_no_overlap.
+        no_overlap = bool(getattr(ctx.options, "voice_no_overlap", True))
+        overlap_gap = max(0, int(float(getattr(ctx.options, "voice_overlap_gap_seconds", 0.06)) * sr))
+        voice_cursor = 0
         total = len(synth.sentences) or 1
 
         for i, s in enumerate(synth.sentences):
@@ -103,7 +114,9 @@ class FFmpegPadStretch:
             window = max(0.0, s.source_end - s.source_start)
             audio = _stretch_to_window(audio, sr, window, cap)
 
-            start_sample = int(s.source_start * sr)
+            start_sample = _placement_start(
+                int(s.source_start * sr), voice_cursor, overlap_gap, no_overlap
+            )
             end_sample = start_sample + len(audio)
             if start_sample >= n_samples:
                 ctx.progress("mux", (i + 1) / total, f"sentence {i+1}/{total} (past end)")
@@ -145,6 +158,7 @@ class FFmpegPadStretch:
                 mono[-sentence_fade:] *= fout
             # Spread mono voice across all bed channels.
             voice_track[start_sample:end_sample, :] += mono[:, None] * voice_lin
+            voice_cursor = end_sample
 
             # Duck the original vocals across the full ASR sentence window
             # (not just the TTS span). When TTS is shorter than the source
@@ -154,7 +168,10 @@ class FFmpegPadStretch:
             # union of [source_start, source_end] and [tts_start, tts_end].
             if vocals_arr is not None:
                 src_end_sample = min(int(s.source_end * sr), n_samples)
-                duck_start = start_sample
+                # Duck from the source utterance start (silence the original
+                # speaker there) through the end of wherever the AR voice plays
+                # — with ripple the AR span can sit later than the source window.
+                duck_start = min(start_sample, int(s.source_start * sr))
                 duck_end = max(end_sample, src_end_sample)
                 duck_end = min(duck_end, n_samples)
                 a = min(fade, duck_end - duck_start)
@@ -184,6 +201,15 @@ class FFmpegPadStretch:
         sf.write(str(out_path), out_audio, sr, subtype="PCM_16")
         _write_meta(ctx.job_dir, out_path, sr, n_channels)
         return MuxedAudio(path=out_path, sample_rate=sr)
+
+
+def _placement_start(source_start: int, voice_cursor: int, gap: int, no_overlap: bool) -> int:
+    """Where (in samples) to place a line's voice. With `no_overlap`, never
+    before the previous line's end + `gap`; otherwise at its source time. A
+    source pause makes `source_start > voice_cursor`, so drift resets at gaps."""
+    if no_overlap and source_start < voice_cursor + gap:
+        return voice_cursor + gap
+    return source_start
 
 
 def _stretch_to_window(

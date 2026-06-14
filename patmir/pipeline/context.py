@@ -46,6 +46,16 @@ class PipelineOptions:
     # at sentence boundaries in mux. Suppresses the original-voice bleed at
     # boundaries reported as quality issue #4.
     sentence_afade_seconds: float = 0.05
+    # No-overlap voice placement in mux. When True, a synthesized line never
+    # starts before the previous line's audio has finished — the mux "ripples"
+    # a line later if its translated audio (often longer than the source slot,
+    # e.g. ElevenLabs lines over fast cartoon dialogue) would otherwise pile on
+    # top of the previous one. Drift self-resets at every speech gap (a pause
+    # in the source puts the next line's start past the cursor), so it stays
+    # local to dense bursts. Set False for the old place-at-source-time-with-
+    # overrun behavior. Gap below is the minimum silence inserted between lines.
+    voice_no_overlap: bool = True
+    voice_overlap_gap_seconds: float = 0.06
     # OmniVoice guidance_scale per emotion bin. The TTS adapter looks this
     # up per sentence and passes it to the inner candidate as a per-call
     # override of the constructor default.

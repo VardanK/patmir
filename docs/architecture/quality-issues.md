@@ -17,6 +17,7 @@ Status values:
 
 | # | Title | Owner stage | Status | Notes |
 | - | ----- | ----------- | ------ | ----- |
+| 8 | Same-speaker lines overlap (TTS longer than source slot) | mux | `in-progress: phase3/d3` — fix landed 2026-06-14, awaiting ear-confirm | Surfaced on watch-along of `yt:QGC40AfmgY0` (fast cartoon dialogue): translated ElevenLabs lines run ~2–3.5 s but source slots are ~1 s apart, and mux placed every line at its source time with overrun → up to 4 of the same speaker's lines sounding at once. Fix: `voice_no_overlap` (default on) ripples a line to just after the previous one when it would overlap; drift resets at each source pause (a gap puts the next line's source start past the cursor) so it stays local to a dense burst, and watch-along trims sections at VAD silences where drift is ~0. Verified on `runs/20260614-091215-section`: 8 overlapping placements → 0, section length unchanged. Residual: a dense burst longer than the remaining wall-clock window truncates trailing lines (no free lunch — the dub is intrinsically longer than the source for dense dialogue). Affects both modes (shared mux); revert with `[pipeline.options] voice_no_overlap=false`. |
 
 ## Closed issues
 
