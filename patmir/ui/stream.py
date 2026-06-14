@@ -290,8 +290,12 @@ class StreamManager:
         else:
             rec.sections_done = len(prior.get("sections", []))
 
-        # 1) Prelude — establish the cast + voices + embeddings.
-        prelude = run_prelude(local_path, cfg, runs_root=self._runs_root)
+        # 1) Prelude — establish the cast + voices + embeddings. Window size is
+        # a config knob (smaller → faster first audio, fewer characters up front).
+        prelude = run_prelude(
+            local_path, cfg, runs_root=self._runs_root,
+            window_seconds=cfg.options.prelude_window_seconds,
+        )
         rec.window_end = prelude.window_end
         rec.speakers = prelude.speakers
 

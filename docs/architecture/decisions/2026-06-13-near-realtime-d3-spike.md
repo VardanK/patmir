@@ -127,6 +127,31 @@ This removes Scribe as the watch-along throughput gate. (The streaming runner is
 still sequential per section — pipelining stages across sections remains the
 open follow-up for steady-state headroom.)
 
+## 2026-06-15 — Time-to-first-audio (prelude) reduced
+
+After the Scribe fix, the prelude (analyze + dub the opening before playback)
+still took ~2–2.5 min. Per-stage timing (60s window): separate 35s, diarize 22s
+(was 169s), translate 20–46s, **tts 40s (sequential)**, mux 1.5s. Three changes
+cut it toward ~40–50s, all behind the watch-along streaming config:
+
+- **TTS 3-concurrent.** The shared TTS adapter synthesized per-sentence calls
+  one at a time. It now dispatches them through a thread pool sized by the
+  candidate's `tts_concurrency` (ElevenLabs pool = 3, the tier cap; OmniVoice/MLX
+  stays 1 — single GPU stream). Output order preserved. ~3× on the TTS stage.
+- **Batched translate.** Watch-along's `translate` override is now
+  `openrouter_gemini_flash_batch` (already in the tree); the translate adapter
+  auto-uses its `translate_batch`, so the opening's ~10 sentences translate in
+  one call instead of ~10 round-trips.
+- **Configurable prelude window** (`prelude_window_seconds`, default 60→40):
+  smaller window = less analysis + fewer opening sentences to dub before play,
+  at the cost of fewer characters established up front (later ones register
+  on the fly).
+
+Also fixed same-speaker overlap in mux (quality issue #8): a hybrid that
+compresses a line (pitch-preserving, capped at `voice_max_compress`=1.5×) toward
+the gap to the next line and ripples the remainder — pure ripple alone let drift
+reach ~11s on dense sections.
+
 ## Revisit triggers
 
 - ElevenLabs cost runs high on full episodes → lean on the OmniVoice-8 local path or cache-and-rewatch.

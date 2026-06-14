@@ -62,6 +62,11 @@ class PipelineOptions:
     # pure shifting (which packs lines back-to-back and truncates the tail).
     # 1.0 disables extra compression (pure ripple). 1.5 ≈ up to 50% faster.
     voice_max_compress: float = 1.5
+    # Watch-along only: seconds of the opening analyzed in the prelude to
+    # establish the cast before playback starts. Smaller = faster time-to-first
+    # -audio, but fewer characters are seen up front (later ones register on the
+    # fly mid-stream). 40s balances first-audio latency against cast coverage.
+    prelude_window_seconds: float = 40.0
     # OmniVoice guidance_scale per emotion bin. The TTS adapter looks this
     # up per sentence and passes it to the inner candidate as a per-call
     # override of the constructor default.

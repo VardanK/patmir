@@ -114,7 +114,6 @@ class SentenceTTS:
     def synthesize(self, translated: TranslatedTranscript, ctx: JobContext) -> SynthesizedAudio:
         out_dir = ctx.job_dir / "tts"
         out_dir.mkdir(exist_ok=True)
-        total = len(translated.sentences) or 1
         sentences: list[SynthesizedSentence] = []
         sample_rate = 0
 
@@ -122,7 +121,11 @@ class SentenceTTS:
         diarization: Diarization | None = diar if isinstance(diar, Diarization) else None
         voice_assignments = ctx.extra.get("voice_assignments") or {}
 
-        for i, s in enumerate(translated.sentences):
+        # Build each sentence's synth kwargs up front (cheap, no model calls),
+        # so the actual synthesize() calls — the slow, network-bound part for a
+        # cloud TTS — can be dispatched concurrently below.
+        jobs: list[tuple[Any, dict[str, Any]]] = []
+        for s in translated.sentences:
             if not s.target_text.strip():
                 continue
             ref = self._lookup_ref(diarization, s.speaker_id, s.emotion) if self._supports_ref else None
@@ -147,8 +150,37 @@ class SentenceTTS:
                 kwargs["speaker_id"] = s.speaker_id
             if self._supports_voice_id and s.speaker_id in voice_assignments:
                 kwargs["voice_id"] = voice_assignments[s.speaker_id]
+            jobs.append((s, kwargs))
 
-            wav_bytes = self.inner.synthesize(s.target_text, **kwargs)
+        total = len(jobs) or 1
+        # Concurrency is the candidate's call: ElevenLabs pool mode sets 3
+        # (network-bound, tier cap); OmniVoice/MLX leaves it at 1 (single GPU
+        # stream). Output order is preserved regardless.
+        concurrency = max(1, int(getattr(self.inner, "tts_concurrency", 1)))
+        results: list[bytes | None] = [None] * len(jobs)
+
+        def _synth(idx: int) -> None:
+            s, kwargs = jobs[idx]
+            results[idx] = self.inner.synthesize(s.target_text, **kwargs)
+
+        if concurrency > 1 and len(jobs) > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                futs = {ex.submit(_synth, i): i for i in range(len(jobs))}
+                done = 0
+                for fut in as_completed(futs):
+                    fut.result()  # re-raise any synth error
+                    done += 1
+                    ctx.progress("tts", done / total, f"sentence {done}/{total}")
+        else:
+            for i in range(len(jobs)):
+                _synth(i)
+                ctx.progress("tts", (i + 1) / total, f"sentence {i + 1}/{total}")
+
+        # Write WAVs + build the index in source order.
+        for (s, _kwargs), wav_bytes in zip(jobs, results):
+            if wav_bytes is None:
+                continue
             wav_path = out_dir / f"{s.idx:04d}.wav"
             wav_path.write_bytes(wav_bytes)
             sr, duration = _wav_header_meta(wav_bytes)
@@ -161,7 +193,6 @@ class SentenceTTS:
                 source_end=s.end,
                 target_text=s.target_text,
             ))
-            ctx.progress("tts", (i + 1) / total, f"sentence {i + 1}/{total}")
 
         out = SynthesizedAudio(sentences=sentences, sample_rate=sample_rate)
         _write_index(ctx.job_dir, out)

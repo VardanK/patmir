@@ -27,10 +27,19 @@ from patmir.pipeline.streaming.section import (
 
 
 def streaming_config(config_path: Path) -> PipelineConfig:
-    """Build the watch-along pipeline config: the active pipeline with the
-    no-clone ElevenLabs pool swapped in for TTS (full quality + clears realtime
-    + no celebrity-clone block). See ADR 2026-06-13-near-realtime-d3-spike."""
-    return load_pipeline_config(config_path, overrides={"tts": "elevenlabs_pool"})
+    """Build the watch-along pipeline config. Overrides vs the active pipeline:
+
+      - tts → `elevenlabs_pool`: no-clone preset voices (full quality, clears
+        realtime, no celebrity-clone block), synthesized 3-concurrent.
+      - translate → `openrouter_gemini_flash_batch`: translates the section's
+        sentences in one batched call instead of one round-trip each — cuts the
+        opening's translate time and keeps character voice coherent per scene.
+
+    Both shrink time-to-first-audio. See ADR 2026-06-13-near-realtime-d3-spike."""
+    return load_pipeline_config(config_path, overrides={
+        "tts": "elevenlabs_pool",
+        "translate": "openrouter_gemini_flash_batch",
+    })
 
 
 def source_duration(source: Path) -> float:

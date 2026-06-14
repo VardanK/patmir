@@ -145,6 +145,7 @@ def load_pipeline_config(
         voice_no_overlap=bool(opts_raw.get("voice_no_overlap", True)),
         voice_overlap_gap_seconds=float(opts_raw.get("voice_overlap_gap_seconds", 0.06)),
         voice_max_compress=float(opts_raw.get("voice_max_compress", 1.5)),
+        prelude_window_seconds=float(opts_raw.get("prelude_window_seconds", 40.0)),
         emotion_guidance=emotion_guidance,
     )
 

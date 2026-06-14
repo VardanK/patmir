@@ -108,6 +108,12 @@ class ElevenLabsTTS:
         # near-realtime watch-along (ADR 2026-06-13-near-realtime-d3-spike).
         clone: bool = True,
         voice_pool: list[str] | list[dict[str, str]] | None = None,
+        # Max concurrent synthesize() calls the TTS adapter may run for this
+        # candidate. ElevenLabs tiers cap at 3 concurrent requests (429 above);
+        # the per-sentence calls are network-bound, so 3-way concurrency cuts
+        # the opening/section TTS time ~3×. OmniVoice/MLX leave this at 1 (one
+        # GPU stream — concurrency wouldn't help and risks OOM).
+        concurrency: int = 1,
     ) -> None:
         api_key = os.environ.get(api_key_env)
         if not api_key:
@@ -127,6 +133,8 @@ class ElevenLabsTTS:
         self.output_format = output_format
         self.language_code = language_code
         self.clone = clone
+        # Read by the TTS adapter to parallelize per-sentence synthesis.
+        self.tts_concurrency = max(1, int(concurrency))
         # Normalize pool entries to {id, gender, age} dicts. Plain-string
         # entries (legacy / untagged) become gender/age "any". The gender+age
         # tags are consumed by the speaker registry (Slice 2 #7), which profiles
@@ -548,4 +556,5 @@ def build(config: dict[str, Any]) -> ElevenLabsTTS:
         language_code=config.get("language_code", "hy"),
         clone=bool(config.get("clone", True)),
         voice_pool=config.get("voice_pool"),
+        concurrency=int(config.get("concurrency", 1)),
     )

@@ -27,6 +27,10 @@ The single source of truth is `patmir.toml [pipeline]`. This table mirrors it fo
 | `voice_gain_db`     | -3.0    | Global trim on top of the per-sentence RMS loudness match. Negative = quieter. Set to `-3.0` on 2026-05-27 after ear-test on masha-2-5min (default `0.0` was too hot once the per-sentence match was added). |
 | `min_ref_seconds`   | 1.5     | Shortest clean turn (after 100 ms edge trim) that qualifies as a `(speaker, emotion)` ref clip. Lowered from 3.0 → 1.5 on 2026-05-27 — ElevenLabs IVC accepts ≥1 s, and 3.0 was excluding most of `SPEAKER_00`'s short cartoon-pace turns on the masha clip. |
 | `sentence_afade_seconds` | 0.05 | Per-sentence fade in/out on synthesized track (voice-leak guard, quality issue #4) |
+| `voice_no_overlap`  | true    | Mux never starts a line before the previous line's audio ends (ripples it later). Fixes same-speaker pile-up when TTS is longer than the source slot; drift resets at each speech gap. Quality issue #8. |
+| `voice_overlap_gap_seconds` | 0.06 | Minimum silence inserted between consecutive lines under `voice_no_overlap`. |
+| `voice_max_compress` | 1.5    | Max pitch-preserving speed-up applied to a line to fit it before the next (with `voice_no_overlap`), so dense dialogue is absorbed by compression + small shift instead of large drift/truncation. 1.0 = pure ripple. Quality issue #8. |
+| `prelude_window_seconds` | 40.0 | Watch-along only: seconds of the opening analyzed to establish the cast before playback. Smaller = faster first-audio, fewer characters seen up front. |
 
 ## How to swap a model
 
