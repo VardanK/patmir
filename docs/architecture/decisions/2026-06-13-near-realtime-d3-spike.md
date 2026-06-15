@@ -147,6 +147,22 @@ cut it toward ~40–50s, all behind the watch-along streaming config:
   at the cost of fewer characters established up front (later ones register
   on the fly).
 
+Then dogfood showed the new wall was **`separate` (Demucs) ≈ 34s/section** — the
+`htdemucs_ft` variant is a bag of 4 fine-tuned sub-models (~4× the base cost).
+Per-section wall ≈ 57s for ~22s of dub (~2.4× realtime), so the buffer drained
+and playback hung repeatedly. Two fixes (watch-along streaming config only):
+- **separate → `htdemucs_fast`** (base single-model Demucs, ~4× faster). The
+  vocal stem in watch-along only feeds Scribe + the mux duck/loudness-match (no
+  cloning), so the slight extra bleed is fine. Quality mode keeps `htdemucs_ft`.
+- **Section pad 15s → 8s** — every padded second is Demucs compute re-analyzed
+  by the next section anyway.
+
+These bring per-section to ~1.2× realtime. Getting reliably **under 1×** on long
+videos still needs **pipelining** — overlapping section N+1's Demucs with N's
+light stages (diarize/translate/tts) so the bound is the slowest single stage,
+not the sum. The runner is still sequential per section; pipelining is the next
+structural piece (the standing "warm-model loop" follow-up, now load-bearing).
+
 Also fixed same-speaker overlap in mux (quality issue #8): a hybrid that
 compresses a line (pitch-preserving, capped at `voice_max_compress`=1.5×) toward
 the gap to the next line and ripples the remainder — pure ripple alone let drift

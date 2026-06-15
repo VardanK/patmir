@@ -625,6 +625,17 @@ module = "patmir.pipeline.stages.separate.htdemucs"
 model  = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
 device = "auto"          # auto → mps on Apple Silicon
 
+# Base single-model Demucs — ~4× faster than the _ft 4-model bag (the _ft
+# variant runs four sub-models and averages). Slightly more music/vocal bleed,
+# acceptable for watch-along (where the vocal stem only feeds Scribe + the mux
+# loudness-match/duck — no voice cloning). Watch-along's streaming config
+# overrides separate → this; Quality mode keeps htdemucs_ft.
+[[stages.separate.candidates]]
+id     = "htdemucs_fast"
+module = "patmir.pipeline.stages.separate.htdemucs"
+model  = "htdemucs"
+device = "auto"
+
 # ─── Diarize (who-spoke-when) ─────────────────────────────────────────────────
 # Runs on the Demucs vocal stem; pyannote 3.1 is SOTA on DIHARD/AMI and has
 # native overlap detection that the speaker_tag pass uses to split sentences

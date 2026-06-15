@@ -35,7 +35,10 @@ from patmir.pipeline.streaming.registry import SpeakerRegistry
 from patmir.pipeline.streaming.speaker_profile import profile_speaker
 
 DEFAULT_SECTION_SECONDS = 30.0
-DEFAULT_PAD_SECONDS = 15.0
+# Lookahead past the target so VAD can find the next silence to cut on. Kept
+# small: every padded second is extra Demucs compute that's then re-analyzed by
+# the next section anyway. 8s comfortably covers one trailing utterance.
+DEFAULT_PAD_SECONDS = 8.0
 
 
 @dataclass

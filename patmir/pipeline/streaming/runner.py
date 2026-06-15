@@ -35,8 +35,14 @@ def streaming_config(config_path: Path) -> PipelineConfig:
         sentences in one batched call instead of one round-trip each — cuts the
         opening's translate time and keeps character voice coherent per scene.
 
-    Both shrink time-to-first-audio. See ADR 2026-06-13-near-realtime-d3-spike."""
+      - separate → `htdemucs_fast`: base single-model Demucs, ~4× faster than
+        the `htdemucs_ft` 4-model bag (which was ~34s/section, the throughput
+        wall). Slightly more bleed, fine for watch-along.
+
+    All three shrink per-section time so the stream keeps ahead of playback.
+    See ADR 2026-06-13-near-realtime-d3-spike."""
     return load_pipeline_config(config_path, overrides={
+        "separate": "htdemucs_fast",
         "tts": "elevenlabs_pool",
         "translate": "openrouter_gemini_flash_batch",
     })
