@@ -32,6 +32,7 @@ mis-prioritized section, self-corrects next tick).
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -41,6 +42,14 @@ from patmir.pipeline.streaming.section import SectionResult
 # Minimum forward step when a section reports no usable progress (no VAD gap in
 # the window) — keeps the loop from spinning on the same start.
 _MIN_STEP = 5.0
+# Watch-along only dubs a bounded window AHEAD of the playhead, never the whole
+# video — dubbing minute 30 while you watch minute 2 is wasted ElevenLabs/Scribe
+# spend (each section is paid cloud TTS + STT). When the buffer is full this far
+# ahead, the scheduler idles until the playhead advances.
+DEFAULT_LOOKAHEAD_SECONDS = 120.0
+# If no playhead update arrives for this long, the viewer has left (tab closed,
+# crash) — stop processing so an abandoned stream doesn't keep burning credits.
+DEFAULT_ABANDON_SECONDS = 45.0
 
 
 @dataclass
@@ -49,6 +58,7 @@ class Playhead:
     by the scheduler loop. Plain attributes — atomic enough under the GIL."""
     t: float = 0.0
     paused: bool = False
+    updated_at: float = 0.0   # wall-clock of the last update (abandon detection)
 
 
 class StreamScheduler:
@@ -61,12 +71,22 @@ class StreamScheduler:
         playhead_fn: Callable[[], Playhead],
         on_section: Callable[[SectionResult], None] | None = None,
         section_seconds: float = 30.0,
+        lookahead_seconds: float = DEFAULT_LOOKAHEAD_SECONDS,
+        abandon_seconds: float = DEFAULT_ABANDON_SECONDS,
+        idle_fn: Callable[[], bool] | None = None,
     ) -> None:
         self.duration = duration
         self.process_fn = process_fn
         self.playhead_fn = playhead_fn
         self.on_section = on_section
         self.section_seconds = section_seconds
+        self.lookahead_seconds = lookahead_seconds
+        self.abandon_seconds = abandon_seconds
+        # Called when caught up (nothing urgent to dub). Returns True to keep
+        # waiting for the playhead to advance, False to end the stream. Default
+        # idles briefly and ends on stop() or viewer-abandonment. Injectable for
+        # tests so run() terminates deterministically without wall-clock waits.
+        self._idle_fn = idle_fn or self._default_idle
         self.coverage = Coverage()
         # The prelude already dubbed [0, prelude_end].
         if prelude_end > 0:
@@ -80,23 +100,36 @@ class StreamScheduler:
         return self._stop.is_set()
 
     def _next_start(self) -> float | None:
-        """The global start time of the highest-priority undubbed section, or
-        None if the whole video is dubbed."""
+        """Start time of the highest-priority section to dub now, or None if the
+        buffer is already full to `lookahead_seconds` past the playhead (so we
+        should idle rather than race ahead dubbing the whole video)."""
         ph = self.playhead_fn()
-        # 1) nearest gap ahead of the viewer.
         target = self.coverage.first_uncovered(after=ph.t, until=self.duration - 1.0)
-        if target is not None:
-            return target
-        # 2) viewer's forward region is fully dubbed — backfill the earliest
-        #    remaining gap anywhere so the video finishes (free rewatch cache).
-        return self.coverage.first_uncovered(after=0.0, until=self.duration - 1.0)
+        if target is None:
+            return None
+        # Buffered far enough ahead of the viewer → don't dub further yet.
+        if target > ph.t + self.lookahead_seconds:
+            return None
+        return target
+
+    def _default_idle(self) -> bool:
+        """Idle while caught up. End the stream if stopped or the viewer has
+        stopped sending playhead updates (left)."""
+        ph = self.playhead_fn()
+        if ph.updated_at and (time.time() - ph.updated_at) > self.abandon_seconds:
+            return False
+        # Interruptible 2s wait; returns True (keep waiting) unless stop() fired.
+        return not self._stop.wait(2.0)
 
     def run(self) -> None:
-        """Drive the loop until the video is fully dubbed or `stop()` fires."""
+        """Track the playhead, dubbing a bounded window ahead. Ends on stop(),
+        viewer-abandonment, or when the rest of the video within range is done."""
         while not self._stop.is_set():
             start = self._next_start()
             if start is None:
-                break  # fully covered
+                if not self._idle_fn():
+                    break          # stopped or abandoned
+                continue           # caught up; wait for the playhead to advance
             result = self.process_fn(start)
             if result is None:
                 # Processing failed for this window; force progress so we don't

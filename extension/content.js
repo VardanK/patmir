@@ -421,6 +421,12 @@
 
   function stopWatchAlong() {
     if (!waActive) return;
+    // Tell the server to stop dubbing immediately — otherwise its scheduler
+    // keeps running Scribe + ElevenLabs TTS over the rest of the video (paid)
+    // even though we've stopped watching. Best-effort, fire-and-forget.
+    if (waCacheKey) {
+      chrome.runtime.sendMessage({ type: "stream:stop", cache_key: waCacheKey }).catch(() => {});
+    }
     for (const sec of waSections.values()) {
       if (sec.node) { try { sec.node.stop(); } catch (_) { /* ok */ } sec.node = null; }
     }

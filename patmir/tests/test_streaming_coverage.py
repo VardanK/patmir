@@ -75,9 +75,10 @@ class CoverageTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
-    def _run(self, *, duration, prelude_end, playhead, section_len=30.0):
-        """Drive the scheduler with a fake processor that always advances a
-        fixed section length; returns the ordered list of starts it chose."""
+    # idle_fn=lambda: False → when caught up (buffer full to lookahead), end the
+    # run instead of waiting for the playhead to advance, so tests terminate
+    # deterministically without wall-clock waits.
+    def _run(self, *, duration, prelude_end, playhead, section_len=30.0, lookahead=120.0):
         starts: list[float] = []
 
         def process_fn(start):
@@ -86,24 +87,30 @@ class SchedulerTests(unittest.TestCase):
 
         sched = StreamScheduler(
             duration=duration, prelude_end=prelude_end,
-            process_fn=process_fn,
-            playhead_fn=playhead,
-            section_seconds=section_len,
+            process_fn=process_fn, playhead_fn=playhead,
+            section_seconds=section_len, lookahead_seconds=lookahead,
+            idle_fn=lambda: False,
         )
         sched.run()
         return starts, sched
 
-    def test_forward_fill_from_prelude_end(self):
-        # Playhead pinned at 0; prelude covered [0,60]. Should fill 60→duration.
+    def test_dubs_only_a_bounded_window_ahead(self):
+        # The whole point of the cost fix: with the playhead pinned at 0 and a
+        # 120s lookahead, the scheduler must NOT dub the entire 600s video — only
+        # ~[0, 120] — so it doesn't burn cloud TTS/STT on minutes you never reach.
         ph = Playhead(t=0.0)
-        starts, sched = self._run(duration=180, prelude_end=60, playhead=lambda: ph)
-        self.assertEqual(starts[0], 60)            # starts right after prelude
-        self.assertTrue(sched.coverage.is_complete(180))
+        starts, sched = self._run(duration=600, prelude_end=0, playhead=lambda: ph, lookahead=120)
+        self.assertEqual(starts[0], 0)
+        self.assertLessEqual(max(starts), 120.0 + 1e-6)   # never raced far ahead
+        self.assertFalse(sched.coverage.is_complete(600))  # did NOT dub the whole video
+
+    def test_forward_from_prelude_end(self):
+        ph = Playhead(t=0.0)
+        starts, _ = self._run(duration=600, prelude_end=60, playhead=lambda: ph, lookahead=120)
+        self.assertEqual(starts[0], 60)                    # starts right after prelude
         self.assertTrue(all(b > a for a, b in zip(starts, starts[1:])))  # monotonic
 
     def test_seek_reprioritizes_to_playhead(self):
-        # Viewer seeks far ahead into virgin territory before the forward fill
-        # gets there → the next processed section must be at the playhead.
         state = {"t": 0.0}
         ph_obj = Playhead()
 
@@ -115,22 +122,20 @@ class SchedulerTests(unittest.TestCase):
 
         def process_fn(start):
             starts.append(round(start, 1))
-            # After the first post-prelude section, simulate a seek to 120.
             if len(starts) == 1:
-                state["t"] = 120.0
-            return FakeSection(index=len(starts), start=start, end=min(start + 30, 200))
+                state["t"] = 300.0                         # seek far ahead
+            return FakeSection(index=len(starts), start=start, end=min(start + 30, 600))
 
         sched = StreamScheduler(
-            duration=200, prelude_end=60, process_fn=process_fn,
-            playhead_fn=playhead, section_seconds=30,
+            duration=600, prelude_end=60, process_fn=process_fn,
+            playhead_fn=playhead, section_seconds=30, lookahead_seconds=120,
+            idle_fn=lambda: False,
         )
         sched.run()
-        self.assertEqual(starts[0], 60)            # first forward section
-        self.assertEqual(starts[1], 120.0)         # jumped to the seek target
-        self.assertTrue(sched.coverage.is_complete(200))  # still finishes the rest
+        self.assertEqual(starts[0], 60)
+        self.assertEqual(starts[1], 300.0)                 # jumped to the seek target
 
     def test_no_progress_section_forces_advance(self):
-        # A processor that returns end==start (no VAD gap found) must not spin.
         calls = {"n": 0}
 
         def process_fn(start):
@@ -139,38 +144,45 @@ class SchedulerTests(unittest.TestCase):
 
         ph = Playhead(t=0.0)
         sched = StreamScheduler(
-            duration=90, prelude_end=30, process_fn=process_fn,
-            playhead_fn=lambda: ph, section_seconds=30,
+            duration=600, prelude_end=30, process_fn=process_fn,
+            playhead_fn=lambda: ph, section_seconds=30, lookahead_seconds=120,
+            idle_fn=lambda: False,
         )
         sched.run()
-        self.assertTrue(sched.coverage.is_complete(90))
-        self.assertLess(calls["n"], 20)            # terminated, didn't spin
+        self.assertLess(calls["n"], 40)                    # terminated, didn't spin
 
     def test_failed_section_still_terminates(self):
-        # process_fn returning None (section failed) must force progress.
-        def process_fn(start):
-            return None
-
         ph = Playhead(t=0.0)
         sched = StreamScheduler(
-            duration=60, prelude_end=20, process_fn=process_fn,
-            playhead_fn=lambda: ph, section_seconds=30,
+            duration=600, prelude_end=20, process_fn=lambda start: None,
+            playhead_fn=lambda: ph, section_seconds=30, lookahead_seconds=60,
+            idle_fn=lambda: False,
         )
-        sched.run()
-        self.assertTrue(sched.coverage.is_complete(60))
+        sched.run()                                        # must not hang
+        self.assertFalse(sched.coverage.is_complete(600))
 
     def test_stop_halts_loop(self):
         def process_fn(start):
-            sched.stop()                            # stop after first section
+            sched.stop()                                   # stop after first section
             return FakeSection(index=1, start=start, end=start + 30)
 
         ph = Playhead(t=0.0)
         sched = StreamScheduler(
             duration=600, prelude_end=60, process_fn=process_fn,
-            playhead_fn=lambda: ph, section_seconds=30,
+            playhead_fn=lambda: ph, section_seconds=30, idle_fn=lambda: False,
         )
         sched.run()
         self.assertFalse(sched.coverage.is_complete(600))  # bailed early
+
+    def test_default_idle_abandons_when_playhead_stale(self):
+        # No playhead update for > abandon_seconds → end the stream (viewer left).
+        import time as _t
+        stale = Playhead(t=0.0, updated_at=_t.time() - 999)
+        sched = StreamScheduler(
+            duration=600, prelude_end=0, process_fn=lambda s: None,
+            playhead_fn=lambda: stale, abandon_seconds=45,
+        )
+        self.assertFalse(sched._default_idle())            # abandoned → don't keep waiting
 
 
 if __name__ == "__main__":

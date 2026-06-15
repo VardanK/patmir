@@ -168,6 +168,27 @@ compresses a line (pitch-preserving, capped at `voice_max_compress`=1.5×) towar
 the gap to the next line and ripples the remainder — pure ripple alone let drift
 reach ~11s on dense sections.
 
+## 2026-06-15 — Cost guard (watch-along was dubbing the whole video)
+
+The first build of the scheduler ran to **completion** — it dubbed the entire
+video (backfilling every gap "for free rewatch"), and the client's Stop only
+tore down local playback without telling the server. So a single watch-along
+submit on a 34-min video ran ElevenLabs TTS + per-section Scribe over **all ~68
+sections** regardless of how much was watched, and kept going after the tab
+closed. Result: ~30K ElevenLabs credits burned in a day. (Watch-along is also
+structurally pricier than Quality mode: per-section Scribe ≈ 1 STT call/section
+vs Quality's single whole-file upload.)
+
+Guards added:
+- **Bounded look-ahead** — the scheduler only dubs up to `lookahead_seconds`
+  (120s) past the playhead, then idles; it never races ahead to dub the whole
+  video. The cache now holds what you watched (+buffer), not the full film.
+- **Abandon timeout** — if no playhead update arrives for `abandon_seconds`
+  (45s; the client posts every ~1s while watching), the viewer has left and the
+  scheduler stops.
+- **Explicit stop** — `POST /stream/<key>/stop`; the content script calls it on
+  teardown so dubbing halts immediately on Stop / tab close, not 45s later.
+
 ## Revisit triggers
 
 - ElevenLabs cost runs high on full episodes → lean on the OmniVoice-8 local path or cache-and-rewatch.

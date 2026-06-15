@@ -87,6 +87,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           body: JSON.stringify({ t: msg.t, paused: !!msg.paused }),
         });
         sendResponse({ ok: true, data: await r.json() });
+      } else if (msg.type === "stream:stop") {
+        const r = await api("/stream/" + encodeURIComponent(msg.cache_key) + "/stop", {
+          method: "POST", body: "{}",
+        });
+        sendResponse({ ok: true, data: await r.json() });
       } else if (msg.type === "ping") {
         sendResponse({ ok: true, pong: true });
       } else {

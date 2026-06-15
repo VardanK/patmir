@@ -272,6 +272,14 @@ def _create_app(
             raise HTTPException(status_code=404, detail="no active stream")
         return JSONResponse({"ok": True})
 
+    @app.post("/stream/{cache_key}/stop", dependencies=[Depends(require_token)])
+    def stream_stop(cache_key: str):
+        if not _is_valid_key(cache_key):
+            raise HTTPException(status_code=400, detail="invalid cache_key")
+        # Idempotent: a no-op if the stream already finished or isn't ours.
+        streamer.stop_stream(cache_key)
+        return JSONResponse({"ok": True})
+
     @app.get("/cache/{cache_key}/dub.wav", dependencies=[Depends(require_token)])
     def cache_dub(cache_key: str, request: Request):
         if not _is_valid_key(cache_key):

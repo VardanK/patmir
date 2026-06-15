@@ -204,6 +204,17 @@ class StreamManager:
             return False
         rec.playhead.t = max(0.0, float(t))
         rec.playhead.paused = bool(paused)
+        rec.playhead.updated_at = time.time()  # resets the abandon timer
+        return True
+
+    def stop_stream(self, ck: str) -> bool:
+        """Stop a stream's scheduler immediately (viewer hit Stop / closed the
+        tab). Prevents an abandoned stream from dubbing — and paying ElevenLabs
+        + Scribe for — the rest of the video."""
+        rec = self.get_by_cache_key(ck)
+        if rec is None or rec._scheduler is None:
+            return False
+        rec._scheduler.stop()
         return True
 
     def sections_manifest(self, ck: str) -> dict[str, Any] | None:
@@ -304,7 +315,9 @@ class StreamManager:
         opening = dub_prelude_window(cfg, prelude, runs_root=self._runs_root)
         self._emit(rec, opening)
 
-        # 3) Stream the rest, playhead-driven.
+        # 3) Stream the rest, playhead-driven. Seed the abandon timer so the
+        # scheduler doesn't bail before the client's first playhead POST lands.
+        rec.playhead.updated_at = time.time()
         index_counter = {"n": opening.index}
 
         def _process(start: float) -> SectionResult | None:
