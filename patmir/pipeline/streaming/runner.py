@@ -29,21 +29,27 @@ from patmir.pipeline.streaming.section import (
 def streaming_config(config_path: Path) -> PipelineConfig:
     """Build the watch-along pipeline config. Overrides vs the active pipeline:
 
-      - tts → `elevenlabs_pool`: no-clone preset voices (full quality, clears
-        realtime, no celebrity-clone block), synthesized 3-concurrent.
+      - tts → `omnivoice_mlx_bf16_fast`: bf16 OmniVoice + voice cloning at
+        num_steps=16 (ear-test 2026-06-16: bf16@16 beat q8@16; Piper rejected as
+        too low, num_steps=8 too low). OmniVoice diffusion is serial on MLX so at
+        16 steps (RTF ~0.46) this does NOT clear realtime per-section on its own
+        — watch-along relies on a pre-buffer / section pipelining. Replaced
+        `elevenlabs_pool` (credits exhausted 2026-06-15).
       - translate → `openrouter_gemini_flash_batch`: translates the section's
         sentences in one batched call instead of one round-trip each — cuts the
         opening's translate time and keeps character voice coherent per scene.
 
-      - separate → `htdemucs_fast`: base single-model Demucs, ~4× faster than
-        the `htdemucs_ft` 4-model bag (which was ~34s/section, the throughput
-        wall). Slightly more bleed, fine for watch-along.
+      - separate → `htdemucs_mlx_fast`: base single-model Demucs on MLX, ~4×
+        faster than the `htdemucs_ft` 4-model bag (which was ~34s/section, the
+        throughput wall). Slightly more bleed, fine for watch-along.
 
-    All three shrink per-section time so the stream keeps ahead of playback.
-    See ADR 2026-06-13-near-realtime-d3-spike."""
+    asr + diarize are NOT overridden here — they inherit the now-local
+    [pipeline] defaults (nemotron_mlx + sortformer_mlx). All overrides shrink
+    per-section time so the stream keeps ahead of playback. See ADRs
+    2026-06-13-near-realtime-d3-spike and 2026-06-15-local-asr-diarize-via-mlx-audio."""
     return load_pipeline_config(config_path, overrides={
-        "separate": "htdemucs_fast",
-        "tts": "elevenlabs_pool",
+        "separate": "htdemucs_mlx_fast",
+        "tts": "omnivoice_mlx_bf16_fast",
         "translate": "openrouter_gemini_flash_batch",
     })
 

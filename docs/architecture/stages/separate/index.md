@@ -16,7 +16,8 @@ class SeparateStage(Protocol):
 
 ## Candidates
 
-- **[htdemucs](htdemucs.md)** — active. Demucs `htdemucs_ft` + Silero VAD masking.
+- **[htdemucs-mlx](htdemucs-mlx.md)** — active (2026-06-15). Demucs `htdemucs_ft` on MLX (`demucs-mlx`) + Silero VAD masking. `htdemucs_mlx_fast` (base model) for watch-along.
+- **[htdemucs](htdemucs.md)** — PyTorch fallback. Demucs `htdemucs_ft` (MPS) + Silero VAD masking.
 
 ## See also
 

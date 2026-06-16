@@ -1,8 +1,10 @@
 # OmniVoice MLX (tts)
 
-- **Repo / version:** `lightsofapollo/omnivoice-mlx-q8-g64` (8-bit MLX quantization of OmniVoice)
-- **Parameters / size / runtime memory:** ~1 GB on disk (q8 + g64 group size); fp16 PyTorch variant would be ~3 GB
-- **Quantization available:** q8 (active), fp16 (PyTorch original)
+- **Repo / version:** `mlx-community/OmniVoice-bfloat16` (bf16 MLX OmniVoice) — **active since 2026-06-15**, switched from `lightsofapollo/omnivoice-mlx-q8-g64` (q8). Same `omnivoice_mlx` candidate, only `repo_id` changed.
+- **Parameters / size / runtime memory:** bf16 ~1.23 GB on disk; q8 g64 ~0.6 GB; fp16 PyTorch ~3 GB
+- **Quantization available:** bf16 (active), q8 (prior active — change `repo_id` to revert), fp16 (PyTorch original)
+- **Ear-test + speed (hy line, same ref), 2026-06-16:** quality bf16@32 EXCELLENT > q8@32 > bf16@16 (slight nasal) > q8@16 (inter-word pauses). Speed (mlx-audio, RTF @8/16/32): bf16 0.37/0.46/0.89, q8 0.46/0.67/1.20; load bf16 1.7s vs q8 6.1s. bf16 wins on BOTH quality and speed. (ailuntx runtime, not adopted: fp16 0.35/0.97; q4 —/1.07/1.26.)
+- **Rejected siblings:** `mlx-community/OmniVoice-8bit` (no quant config in config.json → won't load on mlx-audio; its card targets the `ailuntx/OmniVoice-MLX` runtime and disclaims reliable speaker-encoding) and `mlx-community/OmniVoice-bf16` (audio-tokenizer not wired by mlx-audio's load path → `HiggsAudioTokenizer required` on cloning). The `ailuntx/OmniVoice-MLX` runtime works + clones but is no faster (same OmniVoice diffusion), so not adopted.
 - **Apple Silicon (MLX):** ✅ native (this is the MLX port)
 - **CUDA / CPU:** PyTorch original works; MLX port is Apple-only
 - **Languages:** multilingual zero-shot cloning. **Eastern Armenian verified** — `hy_AM` ref clip in → `hy_AM` synthesized speech out, ear-judged on the masha clip.

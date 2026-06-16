@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted, then **superseded for both stages on 2026-06-15** (ElevenLabs credits exhausted → moved local: ASR → `nemotron_mlx`, diarize → `sortformer_mlx`; see `2026-06-15-local-asr-diarize-via-mlx-audio.md`). The `elevenlabs_scribe_v2` candidates stay registered; this ADR's reasoning still applies if credits return and Scribe is reactivated.
 
 ## Context
 

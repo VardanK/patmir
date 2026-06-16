@@ -2,36 +2,46 @@
 
 ```toml
 [pipeline]
-diarize = "elevenlabs_scribe_v2"
+diarize = "sortformer_mlx"
 
 [[stages.diarize.candidates]]
-id                     = "elevenlabs_scribe_v2"
-module                 = "patmir.pipeline.stages.diarize.elevenlabs_scribe"
-api_key_env            = "ELEVENLABS_API_KEY"
-model_id               = "scribe_v2"
-num_speakers           = 4
-timeout_seconds        = 600.0
+id                = "sortformer_mlx"
+module            = "patmir.pipeline.stages.diarize.sortformer_mlx"
+repo_id           = "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp32"
+chunk_duration    = 5.0
+merge_gap_seconds = 0.5
 ```
 
-Shares the API response with the `asr` candidate (same id, also `elevenlabs_scribe_v2`) — single upload per job, cached at `<job>/scribe/result.json`. The diarize candidate uploads first; the asr candidate reads from the cached JSON.
+**Local** (2026-06-15) — NVIDIA Sortformer 4-speaker streaming diarization on
+MLX via `mlx-audio` (`mlx_audio.vad`). Replaced cloud Scribe v2 after ElevenLabs
+credits were exhausted (ADR `2026-06-15-local-asr-diarize-via-mlx-audio`). See
+`sortformer-mlx.md` for the model file.
 
-Picked 2026-05-27 after pyannote (3.1 + community-1) merged short cartoon turns from different characters into one `SPEAKER_NN` on masha-2-5min. Briefly reverted to pyannote community-1 on 2026-05-28 PM after the OmniVoice TTS swap, but ear-test showed the residual short-turn merging is still load-bearing — reverted back to Scribe v2 the same day.
+## How it produces the Diarization
 
-## Cloud cost / scope
+- `mlx_audio.vad.load(repo_id).generate_stream(vocals, chunk_duration=5.0)`
+  yields chunk results, each with `.segments`
+  (`DiarizationSegment(.start, .end, .speaker:int)`).
+- Speaker ints normalized to `SPEAKER_NN`; adjacent same-speaker segments with a
+  gap ≤ `merge_gap_seconds` merged into one `SpeakerTurn`.
+- VAD post-filter drops turns with zero intersection with the separate stage's
+  Silero intervals.
+- **Overlap intervals re-derived** from regions where ≥2 distinct speakers are
+  active — restores the overlap output Scribe dropped (quality issue #5).
+- `refs={}` on return; the runner's `pick_refs` fills per-`(speaker, emotion)`
+  refs after the emotion stage (unchanged).
 
-Diarize + asr share one Scribe upload per job. Cost is per minute of audio uploaded — small for the kinds of clips in scope. Drops the local HF-token gate (no `pyannote/speaker-diarization-community-1` license acceptance flow needed). Trade-off: no overlap-interval output (Scribe v2 doesn't emit overlaps; accepted regression — `quality-issues.md` #5).
+## Constraints
 
-## Local alternate (registered, disabled by selector)
+- **Capped at 4 speakers** (model architecture). Content with >4 distinct
+  speakers will under-cluster — flip to `pyannote_3_1` (≤8) if that bites.
+- End-to-end neural model: no clustering hyperparameters, no HF token / license
+  gate (unlike pyannote).
 
-`pyannote_3_1` stays registered with `model_id = pyannote/speaker-diarization-community-1` (newer embeddings than 3.1). Flip `[pipeline].diarize = "pyannote_3_1"` to revert to fully local diarization. Requires accepting the license on:
+## Fallbacks (registered, disabled by selector)
 
-- `huggingface.co/pyannote/segmentation-3.0`
-- `huggingface.co/pyannote/speaker-diarization-3.1`
-- `huggingface.co/pyannote/speaker-diarization-community-1`
-
-and either `export HF_TOKEN=hf_...` or `hf auth login`.
-
-## Performance
-
-- Scribe v2 upload + diarize/asr response: ~30–60 s for a 5-min clip; cost scales linearly with duration.
-- Pyannote local fallback: ~1–3 min on a 20-min clip on Apple Silicon (MPS partial, some CPU fallback).
+- `pyannote_3_1` (`pyannote/speaker-diarization-community-1`) — local fallback,
+  ≤8 speakers, but merges short cartoon turns (the reason Scribe was adopted in
+  the first place). Needs `HF_TOKEN` + license acceptance on the gated repos.
+  Flip `[pipeline].diarize = "pyannote_3_1"` to revert.
+- `elevenlabs_scribe_v2` (cloud, needs credits) remains registered.

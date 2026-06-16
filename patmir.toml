@@ -398,6 +398,44 @@ speed       = 1.0
 # (Apache-2.0). ~1 GB total resident (vs 3 GB for the PyTorch fp16 above),
 # ~25% faster RTF on Apple Silicon. Same voice-clone interface.
 # Install once: `uv pip install mlx-audio`.
+# ACTIVE batch TTS — OmniVoice bf16 (mlx-community/OmniVoice-bfloat16), num_steps=32.
+# Ear-test 2026-06-16 (hy line, same clean ref) ranked: bf16@32 EXCELLENT >
+# q8@32 almost-excellent > bf16@16 good (slight nasal) > q8@16 good (some
+# unintended inter-word pauses). bf16 also fastest in our pipeline at every step
+# count (RTF 0.46@16 / 0.89@32 vs q8 0.67 / 1.20) and loads+clones via mlx-audio.
+# Watch-along (D3) uses omnivoice_mlx_bf16_fast below.
+[[eval.tts.candidates]]
+id            = "omnivoice_mlx_bf16"
+enabled       = true
+module        = "patmir.eval.candidates.tts.omnivoice_mlx"
+repo_id       = "mlx-community/OmniVoice-bfloat16"
+ref_audio     = "eval_runs/20260524-160019/tts/piper_hye/hy-cartoon-01.wav"
+ref_text      = "Արկածի գնանք։"
+num_steps     = 32
+guidance_scale = 2.0
+language      = "None"
+lang_code     = "None"
+
+# Watch-along (D3) TTS — bf16 weights + voice cloning, num_steps=16 (best of the
+# 16-step options ear-tested; Piper rejected as too low quality, num_steps=8 too
+# low). Used by streaming_config(). NOTE: OmniVoice diffusion is serial on MLX so
+# at 16 steps (RTF ~0.46) this does NOT clear realtime per-section on its own —
+# watch-along relies on a pre-buffer / section pipelining to play smoothly.
+[[eval.tts.candidates]]
+id            = "omnivoice_mlx_bf16_fast"
+enabled       = true
+module        = "patmir.eval.candidates.tts.omnivoice_mlx"
+repo_id       = "mlx-community/OmniVoice-bfloat16"
+ref_audio     = "eval_runs/20260524-160019/tts/piper_hye/hy-cartoon-01.wav"
+ref_text      = "Արկածի գնանք։"
+num_steps     = 16
+guidance_scale = 2.0
+language      = "None"
+lang_code     = "None"
+
+# Prior int8 OmniVoice (lightsofapollo q8 g64) — kept as registered FALLBACK
+# (q8@32 ear-judged "almost excellent"). _q8 = batch (32 steps), _q8_fast = 16.
+# Flip [pipeline].tts / the streaming override back to these to revert off bf16.
 [[eval.tts.candidates]]
 id            = "omnivoice_mlx_q8"
 enabled       = true
@@ -406,6 +444,18 @@ repo_id       = "lightsofapollo/omnivoice-mlx-q8-g64"
 ref_audio     = "eval_runs/20260524-160019/tts/piper_hye/hy-cartoon-01.wav"
 ref_text      = "Արկածի գնանք։"
 num_steps     = 32
+guidance_scale = 2.0
+language      = "None"
+lang_code     = "None"
+
+[[eval.tts.candidates]]
+id            = "omnivoice_mlx_q8_fast"
+enabled       = true
+module        = "patmir.eval.candidates.tts.omnivoice_mlx"
+repo_id       = "lightsofapollo/omnivoice-mlx-q8-g64"
+ref_audio     = "eval_runs/20260524-160019/tts/piper_hye/hy-cartoon-01.wav"
+ref_text      = "Արկածի գնանք։"
+num_steps     = 16
 guidance_scale = 2.0
 language      = "None"
 lang_code     = "None"
@@ -567,12 +617,12 @@ response_format = "mp3"
 
 [pipeline]
 ingest    = "ffmpeg"
-separate  = "htdemucs"
-diarize   = "elevenlabs_scribe_v2"
+separate  = "htdemucs_mlx"
+diarize   = "sortformer_mlx"
 emotion   = "emotion2vec_plus_base"
-asr       = "elevenlabs_scribe_v2"
+asr       = "nemotron_mlx"
 translate = "openrouter_gemini_flash"
-tts       = "omnivoice_mlx_q8"
+tts       = "omnivoice_mlx_bf16"
 mux       = "ffmpeg_pad_stretch"
 output    = "mkv_default"
 
@@ -619,17 +669,34 @@ id     = "ffmpeg"
 module = "patmir.pipeline.stages.ingest.ffmpeg"
 
 # ─── Separate (vocals vs music + sfx) ─────────────────────────────────────────
+# Demucs on MLX (demucs-mlx) — Apple-Silicon-native separation (2026-06-15).
+# Same htdemucs_ft model + output contract as the PyTorch candidate, runs on the
+# Mac GPU via MLX. ACTIVE batch separator. The PyTorch `htdemucs` candidate below
+# stays registered as a fallback — flip [pipeline].separate to revert.
+[[stages.separate.candidates]]
+id      = "htdemucs_mlx"
+module  = "patmir.pipeline.stages.separate.htdemucs_mlx"
+model   = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
+shifts  = 1
+overlap = 0.25
+
+# Base single-model Demucs on MLX — ~4× faster than the _ft 4-model bag.
+# Watch-along's streaming config overrides separate → this.
+[[stages.separate.candidates]]
+id      = "htdemucs_mlx_fast"
+module  = "patmir.pipeline.stages.separate.htdemucs_mlx"
+model   = "htdemucs"
+shifts  = 1
+overlap = 0.25
+
+# PyTorch Demucs (MPS) — fallback for both variants. ~4× faster base model is
+# `htdemucs_fast`. Flip [pipeline].separate / the streaming override to use.
 [[stages.separate.candidates]]
 id     = "htdemucs"
 module = "patmir.pipeline.stages.separate.htdemucs"
 model  = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
 device = "auto"          # auto → mps on Apple Silicon
 
-# Base single-model Demucs — ~4× faster than the _ft 4-model bag (the _ft
-# variant runs four sub-models and averages). Slightly more music/vocal bleed,
-# acceptable for watch-along (where the vocal stem only feeds Scribe + the mux
-# loudness-match/duck — no voice cloning). Watch-along's streaming config
-# overrides separate → this; Quality mode keeps htdemucs_ft.
 [[stages.separate.candidates]]
 id     = "htdemucs_fast"
 module = "patmir.pipeline.stages.separate.htdemucs"
@@ -645,6 +712,21 @@ device = "auto"
 #   - https://huggingface.co/pyannote/segmentation-3.0
 #   - https://huggingface.co/pyannote/speaker-diarization-3.1
 #   - https://huggingface.co/pyannote/speaker-diarization-community-1
+# NVIDIA Sortformer 4-speaker streaming diarization on MLX via mlx-audio.
+# ACTIVE local diarizer (2026-06-15) — replaced cloud Scribe v2 after ElevenLabs
+# credits were exhausted. End-to-end neural diarization (no clustering knobs);
+# resolves short cartoon turns far better than pyannote (the failure that drove
+# the Scribe swap). Emits concurrent speakers, so we re-derive overlap intervals
+# (restores the overlap output Scribe dropped — quality issue #5). Capped at 4
+# speakers (model architecture). pyannote_3_1 below stays the fallback — flip
+# [pipeline].diarize to revert. ADR: 2026-06-15-local-asr-diarize-via-mlx-audio.
+[[stages.diarize.candidates]]
+id                = "sortformer_mlx"
+module            = "patmir.pipeline.stages.diarize.sortformer_mlx"
+repo_id           = "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp32"
+chunk_duration    = 5.0
+merge_gap_seconds = 0.5    # merge adjacent same-speaker segments separated by ≤ this gap into one turn
+
 [[stages.diarize.candidates]]
 id              = "pyannote_3_1"
 module          = "patmir.pipeline.stages.diarize.pyannote"
@@ -869,6 +951,22 @@ aligner_dtype   = "bfloat16"
 # Note: this repo uses the older `weights.npz` filename that mlx-whisper
 # 0.4.3 expects natively. The newer `whisper-large-v3-fp16` repo (with
 # `model.safetensors`) doesn't load through mlx-whisper without a rename.
+# NVIDIA Nemotron 3.5 streaming ASR (FastConformer-RNNT, 0.6B) on MLX via
+# mlx-audio. ACTIVE local ASR (2026-06-15) — replaced cloud Scribe v2 after
+# ElevenLabs credits were exhausted. Returns word/sentence timestamps natively
+# (AlignedResult.sentences[].tokens). Auto-detects language (do NOT force a
+# locale — forcing the wrong one yields phonetic gibberish); we infer ISO 639-1
+# from the transcript script for translation routing. 40 language-locales incl.
+# EN + RU. whisper_large_v3_mlx_fp16 below stays the offline fallback — flip
+# [pipeline].asr to revert if Nemotron's quality disappoints (esp. on Russian).
+# ADR: 2026-06-15-local-asr-diarize-via-mlx-audio.
+[[stages.asr.candidates]]
+id              = "nemotron_mlx"
+module          = "patmir.pipeline.stages.asr.nemotron_mlx"
+repo_id         = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
+language        = "None"   # None/auto = auto-detect (recommended). Set a prompt-dict locale key (e.g. "ru") only if the source language is known.
+vad_filter      = true
+
 [[stages.asr.candidates]]
 id              = "whisper_large_v3_mlx_fp16"
 module          = "patmir.pipeline.stages.asr.whisper_mlx"

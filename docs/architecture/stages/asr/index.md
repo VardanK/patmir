@@ -16,9 +16,11 @@ class ASRStage(Protocol):
 
 ## Candidates
 
-- **[whisper-mlx-large-v3](whisper-mlx-large-v3.md)** — active.
+- **[nemotron-mlx](nemotron-mlx.md)** — active (2026-06-15). Local NVIDIA Nemotron 3.5 streaming ASR via mlx-audio; native word+sentence timing; auto-detect language.
+- **[whisper-mlx-large-v3](whisper-mlx-large-v3.md)** — offline fallback.
 - **[faster-whisper](faster-whisper.md)** — registered as a deferred fallback (CTranslate2 int8).
 - **[qwen3-asr-mlx](qwen3-asr-mlx.md)** — experimental; alt-architecture ASR.
+- `elevenlabs_scribe_v2` — cloud fallback (needs ElevenLabs credits).
 
 ## Side-cars (live next to the candidates)
 

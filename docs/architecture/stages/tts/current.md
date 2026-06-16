@@ -2,13 +2,13 @@
 
 ```toml
 [pipeline]
-tts = "omnivoice_mlx_q8"
+tts = "omnivoice_mlx_bf16"
 
 [[eval.tts.candidates]]
-id            = "omnivoice_mlx_q8"
+id            = "omnivoice_mlx_bf16"
 enabled       = true
 module        = "patmir.eval.candidates.tts.omnivoice_mlx"
-repo_id       = "lightsofapollo/omnivoice-mlx-q8-g64"
+repo_id       = "mlx-community/OmniVoice-bfloat16"
 ref_audio     = "eval_runs/20260524-160019/tts/piper_hye/hy-cartoon-01.wav"
 ref_text      = "Արկածի գնանք։"
 num_steps     = 32
@@ -17,7 +17,9 @@ language      = "None"
 lang_code     = "None"
 ```
 
-MLX-native int8 quantized OmniVoice — `~1 GB` on disk, `~25%` faster RTF on Apple Silicon than the fp16 PyTorch variant, no GPU API key needed. Local-first compliant.
+MLX-native bf16 OmniVoice — **switched from the prior `lightsofapollo/omnivoice-mlx-q8-g64` (q8) on 2026-06-16 after an ear-test.** Ranking (same `hy` line + clean ref): **bf16@32 EXCELLENT > q8@32 (almost excellent) > bf16@16 (good, slight nasal) > q8@16 (good, some inter-word pauses).** bf16 is also faster at every step count in our pipeline — RTF **0.46/0.89 @ 16/32** vs q8 **0.67/1.20** — with a faster load (1.7s vs 6.1s), and loads + voice-clones cleanly through mlx-audio. Active: batch = `omnivoice_mlx_bf16` (32 steps), watch-along = `omnivoice_mlx_bf16_fast` (16 steps). The q8 candidates (`omnivoice_mlx_q8` / `_q8_fast`) stay registered as fallbacks — flip `[pipeline].tts` / the streaming override to revert.
+
+Rejected TTS variants: `mlx-community/OmniVoice-8bit` + `OmniVoice-4bit` (config.json missing the quant block → won't load on mlx-audio; built for the separate `ailuntx/OmniVoice-MLX` runtime), `OmniVoice-bf16` (audio tokenizer not wired → can't clone). The `ailuntx/OmniVoice-MLX` runtime loads + clones but is slower (RTF 0.97 @16 fp16; q4 1.07 @16 / 1.26 @32) — precision is not the speed lever, `num_steps` is. q4@16 was ear-rejected. Piper `hy_AM-gor-medium` was tried for watch-along and rejected (quality too low); it remains the **no-ref** fallback only.
 
 `ElevenLabs Multilingual v2` (`eleven_v3` with `language_code="hy"`) stays registered as the cloud alternate — flip `[pipeline].tts = "elevenlabs_multilingual_v2"` to revert. The in-code per-speaker fallback-to-default-voice retry on HTTP 403 `voice_access_denied` / `detected_captcha_voice` stays in `patmir/eval/candidates/tts/elevenlabs.py` so the ElevenLabs path is still usable for content the captcha system doesn't flag.
 
