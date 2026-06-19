@@ -35,6 +35,14 @@ class PipelineOptions:
     # so the dialogue sits above the music). The voice itself is normalized
     # to roughly match the original dialogue loudness.
     music_bed_gain: float = 0.6
+    # Linear gain on the ORIGINAL VOCALS stem where it survives the duck (i.e.
+    # in gaps between ASR sentences — un-transcribed dialogue, laughs, breaths).
+    # Inside ASR windows the duck zeroes it so the AR dub plays alone; this floor
+    # only governs the gaps. The old behavior folded vocals into the bed at
+    # music_bed_gain (0.6), so any dialogue ASR missed leaked at full music
+    # level (quality issue #9 / #10). 0.12 keeps non-verbal texture faint;
+    # set 0.0 to fully remove the original voice.
+    vocals_bed_gain: float = 0.12
     # Global trim (dB) on top of the mux per-sentence RMS loudness match.
     # Negative = quieter. -3.0 came out of the 2026-05-27 masha-2-5min ear-test.
     voice_gain_db: float = -3.0
@@ -46,6 +54,22 @@ class PipelineOptions:
     # at sentence boundaries in mux. Suppresses the original-voice bleed at
     # boundaries reported as quality issue #4.
     sentence_afade_seconds: float = 0.05
+    # Pin ONE reference clip per speaker (the longest/cleanest, used for every
+    # line regardless of emotion) instead of routing emotion through a
+    # per-(speaker, emotion) ref clip. Per-emotion refs made a character's
+    # cloned voice audibly swap whenever the detected emotion changed — badly so
+    # on chaotic cartoon audio where the per-emotion clips are short, noisy
+    # snippets (screams/laughs). Pinning one ref keeps each character's voice
+    # consistent. Trades away per-line emotion routing (emotion still varies via
+    # guidance_scale). Set False to restore the Phase-2.x emotion-ref binning.
+    tts_pin_speaker_ref: bool = True
+    # Duck the original vocals stem this many seconds BEFORE each line's source
+    # start (and after its end via duck_tail_seconds). ASR word-onset timestamps
+    # land ~0.24s LATE vs the true speech onset, so without a lead the original
+    # speaker is audible at the start of every line before the duck engages
+    # (quality issue #9). The pre-roll silences the bed-vocals before the onset.
+    duck_lead_seconds: float = 0.25
+    duck_tail_seconds: float = 0.10
     # No-overlap voice placement in mux. When True, a synthesized line never
     # starts before the previous line's audio has finished — the mux "ripples"
     # a line later if its translated audio (often longer than the source slot,

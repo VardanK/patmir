@@ -65,6 +65,7 @@ class FFmpegPadStretch:
         cap = ctx.options.stretch_cap
         voice_lin = 10.0 ** (ctx.options.voice_gain_db / 20.0)
         music_lin = ctx.options.music_bed_gain
+        vocals_lin = float(getattr(ctx.options, "vocals_bed_gain", 0.12))
 
         # Music bed = accompaniment + full vocals stem ducked under the TTS
         # audio. Outside TTS spans, the original vocal expressions (laughs,
@@ -97,6 +98,14 @@ class FFmpegPadStretch:
         # those transitions enough that the bleed becomes inaudible.
         sentence_fade_seconds = float(getattr(ctx.options, "sentence_afade_seconds", 0.05))
         sentence_fade = max(0, int(sentence_fade_seconds * sr))
+        # Lead/tail pad (samples) on the duck window. ASR word-onset timestamps
+        # run ~0.24s LATE vs the true speech onset, so ducking only from
+        # source_start lets the original speaker leak at the start of every line
+        # (quality issue #9). Open the duck this many samples early and hold it
+        # past the line end. Only the original VOCALS stem is ducked (not the
+        # music bed), so a generous lead doesn't dip the music.
+        duck_lead = max(0, int(float(getattr(ctx.options, "duck_lead_seconds", 0.25)) * sr))
+        duck_tail = max(0, int(float(getattr(ctx.options, "duck_tail_seconds", 0.10)) * sr))
         # No-overlap "ripple" placement: a line never starts before the prior
         # line's audio ends (+ a small gap). `voice_cursor` tracks the end of
         # the last placed line. A source pause naturally pushes the next line's
@@ -194,8 +203,12 @@ class FFmpegPadStretch:
                 # Duck from the source utterance start (silence the original
                 # speaker there) through the end of wherever the AR voice plays
                 # — with ripple the AR span can sit later than the source window.
-                duck_start = min(start_sample, int(s.source_start * sr))
-                duck_end = max(end_sample, src_end_sample)
+                # Pad earlier by duck_lead (to beat the late ASR onset) and later
+                # by duck_tail so the original is gone before the line and stays
+                # gone just after it (quality issue #9).
+                duck_start = min(start_sample, int(s.source_start * sr)) - duck_lead
+                duck_start = max(0, duck_start)
+                duck_end = max(end_sample, src_end_sample) + duck_tail
                 duck_end = min(duck_end, n_samples)
                 a = min(fade, duck_end - duck_start)
                 if a > 0:
@@ -209,9 +222,15 @@ class FFmpegPadStretch:
 
             ctx.progress("mux", (i + 1) / total, f"sentence {i + 1}/{total}")
 
+        # Accompaniment (music/SFX) plays at music_bed_gain. The original vocals
+        # stem plays only at vocals_bed_gain where it survives the duck (gaps);
+        # inside ASR windows duck_mask is 0 so the AR dub plays alone. Keeping
+        # vocals on a separate, lower gain stops un-transcribed original dialogue
+        # from leaking at full music level (quality issue #9 / #10).
+        out_audio = bed * music_lin
         if vocals_arr is not None:
-            bed = bed + vocals_arr * duck_mask[:, None]
-        out_audio = bed * music_lin + voice_track
+            out_audio = out_audio + vocals_arr * duck_mask[:, None] * vocals_lin
+        out_audio = out_audio + voice_track
 
         # Peak normalize to -1 dBFS to prevent clipping after the sum.
         peak = float(np.max(np.abs(out_audio)))

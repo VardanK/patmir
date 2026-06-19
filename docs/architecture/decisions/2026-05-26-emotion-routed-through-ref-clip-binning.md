@@ -43,3 +43,17 @@ The Qwen3-Instruct-MLX translator candidate also receives the emotion tag in its
 - `agent-os/specs/2026-05-26-<HHMM>-emotion-transfer-and-quality-docs/plan.md`
 - emotion2vec paper: arXiv 2312.15185
 - EMO-SUPERB: arXiv 2402.13018
+
+---
+
+## Update 2026-06-19 — emotion-ref binning relaxed (voice consistency won)
+
+Revisit trigger fired (ear-test failure). On masha + a 2nd watch-along clip,
+per-`(speaker, emotion)` ref binning made each character's cloned voice **swap
+mid-scene** (e.g. `SPEAKER_00` cloned from 4 different short/noisy cartoon
+snippets), and the high per-emotion `guidance_scale` (happy 2.8 / angry 3.0)
+**over-emoted**. Added `tts_pin_speaker_ref=true` (default): the TTS adapter now
+uses ONE ref per speaker (longest/cleanest clip, emotion ignored for ref choice),
+and `[emotion_guidance]` was lowered/flattened to 1.3–1.7. Emotion still varies
+via guidance but the voice stays consistent. The binning path is preserved
+(`tts_pin_speaker_ref=false`). Quality issue #11.

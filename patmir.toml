@@ -617,10 +617,10 @@ response_format = "mp3"
 
 [pipeline]
 ingest    = "ffmpeg"
-separate  = "htdemucs_mlx"
+separate  = "htdemucs_mlx_vocals"
 diarize   = "sortformer_mlx"
 emotion   = "emotion2vec_plus_base"
-asr       = "nemotron_mlx"
+asr       = "whisper_large_v3_mlx_fp16"
 translate = "openrouter_gemini_flash"
 tts       = "omnivoice_mlx_bf16"
 mux       = "ffmpeg_pad_stretch"
@@ -657,11 +657,14 @@ unknown    = "neutral"
 # emotion transfer it was supposed to enable; first ear-test on the masha
 # clip surfaced this.
 [emotion_guidance]
-neutral = 1.8
-sad     = 2.0
-happy   = 2.8
-angry   = 3.0
-fearful = 2.6
+# Lowered + flattened on 2026-06-19 (was 1.8/2.0/2.8/3.0/2.6) — high happy/angry
+# made OmniVoice over-emote (exaggerated, cartoonish). Gentler profile; emotion
+# still varies slightly but the voice stays composed. Tune by ear.
+neutral = 1.3
+sad     = 1.4
+happy   = 1.6
+angry   = 1.7
+fearful = 1.5
 
 # ─── Ingest ───────────────────────────────────────────────────────────────────
 [[stages.ingest.candidates]]
@@ -679,6 +682,19 @@ module  = "patmir.pipeline.stages.separate.htdemucs_mlx"
 model   = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
 shifts  = 1
 overlap = 0.25
+
+# Vocals-specialist single model from the htdemucs_ft bag (sig 04573f0d). The ft
+# bag takes its vocals stem 100% from this sub-model, so vocals are identical to
+# the full bag (~0.998 corr ear-confirmed) while skipping the drums/bass/other
+# models → ~7× faster. accompaniment = mix - vocals. Highest-leverage speedup:
+# separate ~39s/60s → ~8s/60s. ADR 2026-06-19-vocals-only-separation.
+[[stages.separate.candidates]]
+id          = "htdemucs_mlx_vocals"
+module      = "patmir.pipeline.stages.separate.htdemucs_mlx"
+model       = "04573f0d"
+vocals_only = true
+shifts      = 1
+overlap     = 0.25
 
 # Base single-model Demucs on MLX — ~4× faster than the _ft 4-model bag.
 # Watch-along's streaming config overrides separate → this.

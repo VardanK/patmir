@@ -28,9 +28,27 @@ from patmir.pipeline.stages.separate.htdemucs import _split_vocals_with_vad
 class HTDemucsMLX:
     id = "htdemucs_mlx"
 
-    def __init__(self, model_name: str = "htdemucs_ft", shifts: int = 1, overlap: float = 0.25) -> None:
+    def __init__(self, model_name: str = "htdemucs_ft", shifts: int = 1, overlap: float = 0.25,
+                 vocals_only: bool = False) -> None:
         from demucs_mlx import Separator  # lazy import (heavy)
 
+        # Vocals-only mode: run JUST the ft vocals-specialist sub-model instead of
+        # the 4-model htdemucs_ft bag. The bag's vocals stem comes 100% from this
+        # sub-model (its BagOfModels weight matrix is the identity: vocals model →
+        # [0,0,0,1]), so the vocals are mathematically identical while skipping the
+        # drums/bass/other models → ~7× faster. accompaniment is derived as
+        # `mix - vocals` (we don't trust this model's non-vocals stems). The
+        # signature `04573f0d` is htdemucs_ft's vocals sub-model; demucs resolves
+        # it via `get_model("04573f0d")`. See ADR 2026-06-19-vocals-only-separation.
+        self.vocals_only = vocals_only
+        if vocals_only:
+            from demucs_mlx.mlx_registry import MLX_MODEL_REGISTRY
+            if model_name not in MLX_MODEL_REGISTRY:
+                MLX_MODEL_REGISTRY[model_name] = {
+                    "signatures": [model_name],
+                    "is_bag": False,
+                    "description": "htdemucs_ft vocals-specialist single model",
+                }
         self.model_name = model_name
         self.separator = Separator(model=model_name, shifts=shifts, overlap=overlap, split=True)
         self.sample_rate: int = int(self.separator.samplerate)
@@ -64,13 +82,23 @@ class HTDemucsMLX:
         ctx.progress("separate", 0.85, "stems ready")
 
         vocals = stems.get("vocals")
-        accompaniment = None
-        for name, arr in stems.items():
-            if name == "vocals":
-                continue
-            accompaniment = arr if accompaniment is None else accompaniment + arr
-        if accompaniment is None:  # degenerate: model emitted only vocals
-            accompaniment = np.zeros_like(vocals)
+        if self.vocals_only and vocals is not None:
+            # accompaniment = original mix - vocals (the residual), since this
+            # model's own drums/bass/other stems aren't fine-tuned and we don't
+            # need per-instrument stems — just the music bed under the dub.
+            mix, _ = sf.read(str(full_audio), dtype="float32", always_2d=True)  # (samples, ch)
+            mix = mix.T  # (channels, samples)
+            n = min(mix.shape[-1], vocals.shape[-1])
+            vocals = vocals[..., :n]
+            accompaniment = mix[..., :n] - vocals
+        else:
+            accompaniment = None
+            for name, arr in stems.items():
+                if name == "vocals":
+                    continue
+                accompaniment = arr if accompaniment is None else accompaniment + arr
+            if accompaniment is None:  # degenerate: model emitted only vocals
+                accompaniment = np.zeros_like(vocals)
 
         accomp_path = ctx.job_dir / "accompaniment.wav"
         vocals_path = ctx.job_dir / "vocals.wav"
@@ -124,4 +152,5 @@ def build(config: dict[str, Any]) -> HTDemucsMLX:
         model_name=config.get("model", "htdemucs_ft"),
         shifts=int(config.get("shifts", 1)),
         overlap=float(config.get("overlap", 0.25)),
+        vocals_only=bool(config.get("vocals_only", False)),
     )

@@ -2,20 +2,30 @@
 
 ```toml
 [pipeline]
-asr = "nemotron_mlx"
+asr = "whisper_large_v3_mlx_fp16"
 
 [[stages.asr.candidates]]
-id              = "nemotron_mlx"
-module          = "patmir.pipeline.stages.asr.nemotron_mlx"
-repo_id         = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
-language        = "None"   # None/auto = auto-detect (recommended)
-vad_filter      = true
+id      = "whisper_large_v3_mlx_fp16"
+module  = "patmir.pipeline.stages.asr.whisper_mlx"
+repo_id = "mlx-community/whisper-large-v3-mlx"   # full large-v3, fp16
 ```
 
-**Local** (2026-06-15) — NVIDIA Nemotron 3.5 streaming ASR (FastConformer-RNNT,
-0.6B) on MLX via `mlx-audio`. Replaced cloud Scribe v2 after ElevenLabs credits
-were exhausted (ADR `2026-06-15-local-asr-diarize-via-mlx-audio`). See
-`nemotron-mlx.md` for the model file.
+**Whisper large-v3 (MLX, fp16)** — switched back from `nemotron_mlx` on
+2026-06-19 after the first Russian-cartoon ear-test. See `whisper-mlx-large-v3.md`.
+
+### Why not Nemotron / turbo (ear-tested 2026-06-19 on masha)
+
+- **Nemotron 3.5** (active 2026-06-15→06-19): clean on slower Russian (Fallout-RU)
+  but **garbled fast cartoon dialogue** — Devanagari leakage (`कंसर्ट`/`ना`) +
+  mangled words. Fast (~3s/60s) but wrong. Stays registered as a fast alternate.
+- **Whisper large-v3-turbo** (same fp16 precision): its **8×-pruned text decoder
+  (4 layers vs 32)** produced gibberish and captured only ~half the words (173 vs
+  336) on masha — ~1.7× faster but drops ~1/3 of the dialogue → rejected.
+- **Whisper large-v3** (chosen): only local option that transcribes masha cleanly.
+  Costs ~20s/60s warm and under-covers (~16% of speech; missed dialogue masked
+  downstream by `vocals_bed_gain`), but correctness wins (ASR is ~16% of the
+  pipeline). Cloud Scribe v2 was the best overall but out of credits. ADR
+  `2026-06-15-local-asr-diarize-via-mlx-audio` (revert note appended).
 
 ## How it produces the Transcript
 

@@ -67,7 +67,8 @@ class SentenceTTS:
         # leave the default and still gate on a non-empty ref_text.
         self._ref_text_optional = bool(getattr(inner, "ref_text_optional", False))
 
-    def _lookup_ref(self, diarization: Diarization | None, speaker_id: str | None, emotion: str | None):
+    def _lookup_ref(self, diarization: Diarization | None, speaker_id: str | None, emotion: str | None,
+                    pin_speaker_ref: bool = False):
         """Fallback chain (Phase 2.x): preserve speaker identity first,
         emotion match second.
 
@@ -94,6 +95,19 @@ class SentenceTTS:
                 return True
             return r.ref_text.strip() != ""
 
+        # Any usable ref for this speaker, longest source window first.
+        same_speaker = [
+            r for (spk, _bin), r in diarization.refs.items()
+            if spk == speaker_id and _is_usable(r)
+        ]
+        # Pin one ref per speaker: ignore emotion entirely, always use the
+        # longest/cleanest same-speaker clip so the cloned voice never swaps
+        # mid-character. (Emotion still varies via guidance_scale.)
+        if pin_speaker_ref:
+            if same_speaker:
+                return max(same_speaker, key=lambda r: r.source_end - r.source_start)
+            return None
+
         emo = emotion or "neutral"
         ref = diarization.refs.get((speaker_id, emo))
         if _is_usable(ref):
@@ -103,10 +117,6 @@ class SentenceTTS:
             if _is_usable(ref):
                 return ref
         # Any ref for this speaker — pick the longest source window for stability.
-        same_speaker = [
-            r for (spk, _bin), r in diarization.refs.items()
-            if spk == speaker_id and _is_usable(r)
-        ]
         if same_speaker:
             return max(same_speaker, key=lambda r: r.source_end - r.source_start)
         return None
@@ -128,7 +138,8 @@ class SentenceTTS:
         for s in translated.sentences:
             if not s.target_text.strip():
                 continue
-            ref = self._lookup_ref(diarization, s.speaker_id, s.emotion) if self._supports_ref else None
+            pin_ref = bool(getattr(ctx.options, "tts_pin_speaker_ref", True))
+            ref = self._lookup_ref(diarization, s.speaker_id, s.emotion, pin_speaker_ref=pin_ref) if self._supports_ref else None
             ref_audio = ref.ref_audio if ref is not None else None
             ref_text = ref.ref_text if ref is not None else None
 

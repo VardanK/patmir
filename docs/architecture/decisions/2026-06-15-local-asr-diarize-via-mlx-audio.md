@@ -85,3 +85,17 @@ only remaining cloud stage and is unaffected.
   fall back to `piper_hye`; if quality is too low, raise steps.
 - ElevenLabs credits return and Scribe is worth the cost again → flip both stages
   back (candidates stay registered).
+
+---
+
+## Update 2026-06-19 — ASR reverted to Whisper large-v3 for Russian quality
+
+The first Russian-cartoon (masha) ear-test exposed Nemotron 3.5 **garbling fast
+cartoon dialogue** — Devanagari script leakage (`कंसर्ट`/`ना`) + mangled words —
+even though it was clean on slower Russian (Fallout-RU). Flipped `[pipeline].asr`
+back to `whisper_large_v3_mlx_fp16` (the registered offline fallback), which
+transcribes masha cleanly. Whisper large-v3-**turbo** was also ear-tested and
+rejected (8×-pruned decoder → gibberish + ~half the word coverage). Tradeoff
+accepted: Whisper is ~6× slower than Nemotron (~20s/60s) but correct; ASR is only
+~16% of the pipeline. Nemotron stays registered as a fast alternate for
+slower/clearer-speech content. See `stages/asr/current.md`.
