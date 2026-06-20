@@ -404,6 +404,48 @@ speed       = 1.0
 # unintended inter-word pauses). bf16 also fastest in our pipeline at every step
 # count (RTF 0.46@16 / 0.89@32 vs q8 0.67 / 1.20) and loads+clones via mlx-audio.
 # Watch-along (D3) uses omnivoice_mlx_bf16_fast below.
+
+# ACTIVE BATCH TTS (locked 2026-06-20). Higgs Audio v3 (4B) via a native MLX port
+# of the Qwen3 AR backbone (q8) + PyTorch codec on MPS. Eastern-Armenian-capable,
+# zero-shot cloning, and REAL emotion control via inline <|emotion:..|> tags
+# (mapped from the pipeline's 5 bins in the candidate's EMOTION_TAGS). Head-to-head
+# (same sentences+ref): agg RTF 1.10 vs OmniVoice-32's 1.69 — faster AND better.
+# Non-termination guardrail: length-proportional max_new_tokens + reseed-on-overflow,
+# temp 0.8 (lower temps caused MORE overflows, not fewer — measured). q4 rejected
+# (collapses). Watch-along stays OmniVoice-16 (streaming/runner.py override).
+# ADR: decisions/2026-06-20-higgs-v3-tts-mlx-q8.md
+[[eval.tts.candidates]]
+id            = "higgs_v3_mlx_q8"
+enabled       = true
+module        = "patmir.eval.candidates.tts.higgs_v3_mlx"
+repo_id       = "multimodalart/higgs-audio-v3-tts-4b-transformers"
+codec_id      = "bosonai/higgs-audio-v2-tokenizer"
+quant         = "q8"
+temperature   = 0.8
+top_p         = 0.95
+seed          = 0
+max_retries   = 2
+codec_device  = "mps"
+
+# Watch-along (D3) Higgs — same q8 port, but max_retries=1 to bound worst-case
+# per-section latency (a reseed-on-overflow is a full re-gen = a stream stall).
+# Switched watch-along off omnivoice_mlx_bf16_fast 2026-06-20 (streaming/runner.py
+# override) for engine consistency. NOTE: Higgs q8 agg RTF ~1.10 > OmniVoice-16's
+# 0.91, so watch-along leans harder on the pre-buffer; per-speaker prefix-KV
+# caching is the follow-up to bring it comfortably under realtime.
+[[eval.tts.candidates]]
+id            = "higgs_v3_mlx_q8_fast"
+enabled       = true
+module        = "patmir.eval.candidates.tts.higgs_v3_mlx"
+repo_id       = "multimodalart/higgs-audio-v3-tts-4b-transformers"
+codec_id      = "bosonai/higgs-audio-v2-tokenizer"
+quant         = "q8"
+temperature   = 0.8
+top_p         = 0.95
+seed          = 0
+max_retries   = 1
+codec_device  = "mps"
+
 [[eval.tts.candidates]]
 id            = "omnivoice_mlx_bf16"
 enabled       = true
@@ -622,7 +664,7 @@ diarize   = "sortformer_mlx"
 emotion   = "emotion2vec_plus_base"
 asr       = "whisper_large_v3_mlx_fp16"
 translate = "openrouter_gemini_flash"
-tts       = "omnivoice_mlx_bf16"
+tts       = "higgs_v3_mlx_q8"
 mux       = "ffmpeg_pad_stretch"
 output    = "mkv_default"
 

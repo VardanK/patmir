@@ -29,12 +29,15 @@ from patmir.pipeline.streaming.section import (
 def streaming_config(config_path: Path) -> PipelineConfig:
     """Build the watch-along pipeline config. Overrides vs the active pipeline:
 
-      - tts → `omnivoice_mlx_bf16_fast`: bf16 OmniVoice + voice cloning at
-        num_steps=16 (ear-test 2026-06-16: bf16@16 beat q8@16; Piper rejected as
-        too low, num_steps=8 too low). OmniVoice diffusion is serial on MLX so at
-        16 steps (RTF ~0.46) this does NOT clear realtime per-section on its own
-        — watch-along relies on a pre-buffer / section pipelining. Replaced
-        `elevenlabs_pool` (credits exhausted 2026-06-15).
+      - tts → `higgs_v3_mlx_q8_fast`: Higgs Audio v3 (4B) MLX-q8 + voice cloning,
+        with `max_retries=1` to bound per-section latency. Switched off
+        `omnivoice_mlx_bf16_fast` 2026-06-20 for engine consistency with batch
+        (ADR 2026-06-20-higgs-v3-tts-mlx-q8). NOTE: Higgs q8 agg RTF ~1.10 (>
+        OmniVoice-16's 0.91) does NOT clear realtime per-section on its own —
+        watch-along leans on the pre-buffer / section pipelining; per-speaker
+        prefix-KV caching is the follow-up to get it comfortably under realtime.
+        Flip back to `omnivoice_mlx_bf16_fast` here to revert. (OmniVoice replaced
+        `elevenlabs_pool` 2026-06-15; ElevenLabs credits exhausted.)
       - translate → `openrouter_gemini_flash_batch`: translates the section's
         sentences in one batched call instead of one round-trip each — cuts the
         opening's translate time and keeps character voice coherent per scene.
@@ -49,7 +52,7 @@ def streaming_config(config_path: Path) -> PipelineConfig:
     2026-06-13-near-realtime-d3-spike and 2026-06-15-local-asr-diarize-via-mlx-audio."""
     return load_pipeline_config(config_path, overrides={
         "separate": "htdemucs_mlx_fast",
-        "tts": "omnivoice_mlx_bf16_fast",
+        "tts": "higgs_v3_mlx_q8_fast",
         "translate": "openrouter_gemini_flash_batch",
     })
 
