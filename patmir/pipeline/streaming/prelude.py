@@ -98,6 +98,7 @@ def run_prelude(
     window_seconds: float = DEFAULT_WINDOW_SECONDS,
     runs_root: Path | None = None,
     voice_pool: list | None = None,
+    stage_cache: dict | None = None,
 ) -> PreludeResult:
     pool = build_pool(voice_pool) if voice_pool else _default_pool()
     registry = SpeakerRegistry(pool)
@@ -105,7 +106,8 @@ def run_prelude(
     with tempfile.TemporaryDirectory(prefix="patmir-prelude-") as tmp:
         slice_wav = Path(tmp) / "prelude.wav"
         _slice_audio(source, window_seconds, slice_wav)
-        manifest = run_job(slice_wav, cfg, runs_root=runs_root, stop_after="asr")
+        manifest = run_job(slice_wav, cfg, runs_root=runs_root, stop_after="asr",
+                           stage_cache=stage_cache)
         job_dir = (runs_root or Path.cwd() / "runs") / manifest.job_id
 
     window_end = _snap_window_end(job_dir, window_seconds)
@@ -115,7 +117,7 @@ def run_prelude(
         primary = _primary_ref(refs)
         profile = profile_speaker(primary["ref_audio"])
         voice_id = registry.assign_voice(spk, profile)
-        registry.lock_ref(spk, primary["ref_audio"])
+        registry.lock_ref(spk, primary["ref_audio"], primary.get("ref_text", ""))
         # Seed one embedding per emotion clip so a speaker seen in several
         # states matches robustly later (resolve scores against the best).
         for r in refs:

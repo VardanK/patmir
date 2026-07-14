@@ -19,6 +19,7 @@ import importlib
 import inspect
 import io
 import json
+import time
 import wave
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from typing import Any
 from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import (
     Diarization,
+    SpeakerRef,
     SynthesizedAudio,
     SynthesizedSentence,
     TranslatedTranscript,
@@ -66,6 +68,17 @@ class SentenceTTS:
         # Zero-shot candidates that require the transcript (OmniVoice, Piper)
         # leave the default and still gate on a non-empty ref_text.
         self._ref_text_optional = bool(getattr(inner, "ref_text_optional", False))
+        # Stand-in pool state (quality issue #12): stable per-speaker fallback
+        # refs for speakers with no usable clip of their own, spread least-used.
+        self._standin: dict[str, SpeakerRef] = {}
+        self._standin_use: dict[str, int] = {}
+
+    def _usable(self, r) -> bool:
+        if r is None:
+            return False
+        if self._ref_text_optional:
+            return True
+        return r.ref_text.strip() != ""
 
     def _lookup_ref(self, diarization: Diarization | None, speaker_id: str | None, emotion: str | None,
                     pin_speaker_ref: bool = False):
@@ -88,17 +101,10 @@ class SentenceTTS:
         if diarization is None or not speaker_id:
             return None
 
-        def _is_usable(r) -> bool:
-            if r is None:
-                return False
-            if self._ref_text_optional:
-                return True
-            return r.ref_text.strip() != ""
-
         # Any usable ref for this speaker, longest source window first.
         same_speaker = [
             r for (spk, _bin), r in diarization.refs.items()
-            if spk == speaker_id and _is_usable(r)
+            if spk == speaker_id and self._usable(r)
         ]
         # Pin one ref per speaker: ignore emotion entirely, always use the
         # longest/cleanest same-speaker clip so the cloned voice never swaps
@@ -110,26 +116,109 @@ class SentenceTTS:
 
         emo = emotion or "neutral"
         ref = diarization.refs.get((speaker_id, emo))
-        if _is_usable(ref):
+        if self._usable(ref):
             return ref
         if emo != "neutral":
             ref = diarization.refs.get((speaker_id, "neutral"))
-            if _is_usable(ref):
+            if self._usable(ref):
                 return ref
         # Any ref for this speaker — pick the longest source window for stability.
         if same_speaker:
             return max(same_speaker, key=lambda r: r.source_end - r.source_start)
         return None
 
+    def _locked_ref(self, locked_refs: dict, speaker_id: str | None):
+        """Streaming mode: the SpeakerRegistry locks ONE clone ref per global
+        character (first clean clip seen). Prefer it over this section's clips
+        so a character clones from the SAME audio in every section — the ref
+        chosen per section otherwise varies with that section's diarization.
+        Candidates that require a reference transcript skip a lock whose text
+        is unknown and fall back to the normal per-section lookup chain."""
+        if not speaker_id:
+            return None
+        entry = locked_refs.get(speaker_id)
+        if not entry or not entry.get("ref_audio"):
+            return None
+        ref_text = entry.get("ref_text", "")
+        if not self._ref_text_optional and not ref_text.strip():
+            return None
+        return SpeakerRef(
+            speaker_id=speaker_id,
+            ref_audio=Path(entry["ref_audio"]),
+            ref_text=ref_text,
+            source_start=0.0,
+            source_end=0.0,
+        )
+
+    def _pool_ref(self, diarization: Diarization | None, speaker_id: str | None,
+                  pool_cfg: list[dict], profiles: dict):
+        """Stand-in ref for a speaker with no usable clip of its own (quality
+        issue #12). Previously such speakers synthesized with NO reference —
+        an anonymous default voice that also varied run to run. Instead:
+
+          1. a clip from the curated `[[tts_ref_pool]]` (patmir.toml), gender-
+             matched when the speaker's profile is known;
+          2. no pool configured → reuse another character's pinned ref from
+             this job (two characters sharing one voice beats a voice from
+             nowhere — user-approved trade);
+          3. nothing available → None (caller keeps the old default behavior).
+
+        The choice is stable per speaker for this adapter instance and spreads
+        least-used so distinct ref-less speakers land on distinct stand-ins.
+        """
+        if not speaker_id:
+            return None
+        if speaker_id in self._standin:
+            return self._standin[speaker_id]
+
+        candidates: list[SpeakerRef] = []
+        if pool_cfg:
+            gender = str((profiles.get(speaker_id) or {}).get("gender", "any"))
+            tier = [e for e in pool_cfg
+                    if gender == "any" or str(e.get("gender", "any")) in (gender, "any")]
+            for e in (tier or pool_cfg):
+                candidates.append(SpeakerRef(
+                    speaker_id=speaker_id,
+                    ref_audio=Path(e["path"]),
+                    ref_text=str(e.get("text", "")),
+                    source_start=0.0,
+                    source_end=0.0,
+                ))
+        elif diarization is not None:
+            best_by_speaker: dict[str, SpeakerRef] = {}
+            for (spk, _emo), r in sorted(diarization.refs.items()):
+                if spk == speaker_id or not self._usable(r):
+                    continue
+                cur = best_by_speaker.get(spk)
+                if cur is None or (r.source_end - r.source_start) > (cur.source_end - cur.source_start):
+                    best_by_speaker[spk] = r
+            candidates = [best_by_speaker[k] for k in sorted(best_by_speaker)]
+
+        candidates = [r for r in candidates if self._usable(r)]
+        if not candidates:
+            return None
+        chosen = min(candidates, key=lambda r: (self._standin_use.get(str(r.ref_audio), 0), str(r.ref_audio)))
+        self._standin_use[str(chosen.ref_audio)] = self._standin_use.get(str(chosen.ref_audio), 0) + 1
+        self._standin[speaker_id] = chosen
+        return chosen
+
     def synthesize(self, translated: TranslatedTranscript, ctx: JobContext) -> SynthesizedAudio:
         out_dir = ctx.job_dir / "tts"
         out_dir.mkdir(exist_ok=True)
+        # Warm-cached instances (watch-along stage_cache) carry state across
+        # jobs; reset per-job counters so voice_cloning_summary.json is per-job.
+        reset = getattr(self.inner, "reset_summary", None)
+        if callable(reset):
+            reset()
         sentences: list[SynthesizedSentence] = []
         sample_rate = 0
 
         diar = ctx.extra.get("diarization")
         diarization: Diarization | None = diar if isinstance(diar, Diarization) else None
         voice_assignments = ctx.extra.get("voice_assignments") or {}
+        locked_refs = ctx.extra.get("locked_refs") or {}
+        speaker_profiles = ctx.extra.get("speaker_profiles") or {}
+        ref_pool_cfg = list(getattr(ctx.options, "tts_ref_pool", None) or [])
 
         # Build each sentence's synth kwargs up front (cheap, no model calls),
         # so the actual synthesize() calls — the slow, network-bound part for a
@@ -139,7 +228,13 @@ class SentenceTTS:
             if not s.target_text.strip():
                 continue
             pin_ref = bool(getattr(ctx.options, "tts_pin_speaker_ref", True))
-            ref = self._lookup_ref(diarization, s.speaker_id, s.emotion, pin_speaker_ref=pin_ref) if self._supports_ref else None
+            ref = None
+            if self._supports_ref:
+                ref = self._locked_ref(locked_refs, s.speaker_id)
+                if ref is None:
+                    ref = self._lookup_ref(diarization, s.speaker_id, s.emotion, pin_speaker_ref=pin_ref)
+                if ref is None:
+                    ref = self._pool_ref(diarization, s.speaker_id, ref_pool_cfg, speaker_profiles)
             ref_audio = ref.ref_audio if ref is not None else None
             ref_text = ref.ref_text if ref is not None else None
 
@@ -169,10 +264,13 @@ class SentenceTTS:
         # stream). Output order is preserved regardless.
         concurrency = max(1, int(getattr(self.inner, "tts_concurrency", 1)))
         results: list[bytes | None] = [None] * len(jobs)
+        elapsed: list[float | None] = [None] * len(jobs)
 
         def _synth(idx: int) -> None:
             s, kwargs = jobs[idx]
+            t0 = time.perf_counter()
             results[idx] = self.inner.synthesize(s.target_text, **kwargs)
+            elapsed[idx] = time.perf_counter() - t0
 
         if concurrency > 1 and len(jobs) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -189,7 +287,8 @@ class SentenceTTS:
                 ctx.progress("tts", (i + 1) / total, f"sentence {i + 1}/{total}")
 
         # Write WAVs + build the index in source order.
-        for (s, _kwargs), wav_bytes in zip(jobs, results):
+        bench_rows: list[dict[str, Any]] = []
+        for (s, _kwargs), wav_bytes, dt in zip(jobs, results, elapsed):
             if wav_bytes is None:
                 continue
             wav_path = out_dir / f"{s.idx:04d}.wav"
@@ -204,10 +303,23 @@ class SentenceTTS:
                 source_end=s.end,
                 target_text=s.target_text,
             ))
+            if dt is not None:
+                bench_rows.append({
+                    "idx": s.idx,
+                    "elapsed_s": round(dt, 4),
+                    "audio_s": round(duration, 4),
+                    "chars": len(s.target_text),
+                })
 
         out = SynthesizedAudio(sentences=sentences, sample_rate=sample_rate)
         _write_index(ctx.job_dir, out)
         _maybe_write_cloning_summary(out_dir, self.inner)
+        # Per-sentence latency trace — only when running under `patmir bench`
+        # (ctx.extra["bench"]); a normal `patmir dub` leaves no timings file.
+        if ctx.extra.get("bench") and bench_rows:
+            with (out_dir / "timings.jsonl").open("w") as f:
+                for row in bench_rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
         return out
 
 

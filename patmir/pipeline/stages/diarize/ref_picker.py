@@ -40,6 +40,16 @@ REF_SR = 16_000
 EDGE_TRIM_SEC = 0.100
 
 
+def _rms_db(mono: np.ndarray) -> float:
+    """Mean level of a slice in dBFS. Silence → -120 (well below any floor)."""
+    if len(mono) == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(np.square(mono, dtype="float64"))))
+    if rms <= 1e-6:
+        return -120.0
+    return 20.0 * float(np.log10(rms))
+
+
 def _intersects_any(start: float, end: float, overlaps: list[OverlapInterval]) -> bool:
     for ov in overlaps:
         if ov.start < end and ov.end > start:
@@ -98,12 +108,18 @@ def pick_refs(
     speech_vocals: Path,
     refs_dir: Path,
     min_ref_seconds: float,
+    min_rms_db: float = -33.0,
 ) -> dict[tuple[str, Emotion], SpeakerRef]:
     """Pick + slice one reference clip per `(speaker, emotion)` cell.
 
     Cells with no qualifying turn are omitted — the TTS adapter's lookup
     fallback chain handles the missing case (exact → speaker-neutral →
     global default).
+
+    `min_rms_db` is a loudness quality gate: windows quieter than the floor
+    (usually far-field / bleed-dominated audio that clones badly) lose to any
+    eligible window above it. If every window of a cell is below the floor the
+    longest still wins — a quiet ref beats no ref.
     """
     refs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -134,7 +150,11 @@ def pick_refs(
         if not eligible:
             continue
 
-        s, e = max(eligible, key=lambda se: se[1] - se[0])
+        loud = [
+            (s, e) for s, e in eligible
+            if _rms_db(mono_full[max(0, int(s * src_sr)):min(len(mono_full), int(e * src_sr))]) >= min_rms_db
+        ]
+        s, e = max(loud or eligible, key=lambda se: se[1] - se[0])
         i0 = max(0, int(s * src_sr))
         i1 = min(len(mono_full), int(e * src_sr))
         if i1 <= i0:

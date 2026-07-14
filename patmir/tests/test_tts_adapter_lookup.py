@@ -103,5 +103,82 @@ class LookupRefTests(unittest.TestCase):
         self.assertIsNone(self.adapter_text_optional._lookup_ref(None, "SPK", "happy"))
 
 
+class LockedRefTests(unittest.TestCase):
+    """Streaming: `ctx.extra["locked_refs"]` (SpeakerRegistry) takes precedence
+    over per-section refs so a character clones from one clip in every section."""
+
+    def setUp(self):
+        self.adapter_needs_text = SentenceTTS(inner=_NeedsRefText())
+        self.adapter_text_optional = SentenceTTS(inner=_RefTextOptional())
+
+    def test_locked_ref_used(self):
+        locked = {"spk0": {"ref_audio": "/tmp/spk0/locked.wav", "ref_text": "hi"}}
+        ref = self.adapter_text_optional._locked_ref(locked, "spk0")
+        self.assertIsNotNone(ref)
+        self.assertEqual(ref.ref_audio, Path("/tmp/spk0/locked.wav"))
+        self.assertEqual(ref.ref_text, "hi")
+
+    def test_unknown_speaker_falls_through(self):
+        self.assertIsNone(self.adapter_text_optional._locked_ref({}, "spk0"))
+        self.assertIsNone(self.adapter_text_optional._locked_ref(
+            {"spk1": {"ref_audio": "/tmp/x.wav"}}, "spk0"))
+
+    def test_empty_text_blocks_when_candidate_needs_text(self):
+        locked = {"spk0": {"ref_audio": "/tmp/spk0/locked.wav", "ref_text": ""}}
+        self.assertIsNone(self.adapter_needs_text._locked_ref(locked, "spk0"))
+        # ...but is fine for IVC-style candidates (Higgs, ElevenLabs).
+        self.assertIsNotNone(self.adapter_text_optional._locked_ref(locked, "spk0"))
+
+    def test_no_speaker_id_returns_none(self):
+        locked = {"spk0": {"ref_audio": "/tmp/spk0/locked.wav", "ref_text": "hi"}}
+        self.assertIsNone(self.adapter_text_optional._locked_ref(locked, None))
+
+
+class PoolRefTests(unittest.TestCase):
+    """Stand-in pool for ref-less speakers (quality issue #12): configured
+    [[tts_ref_pool]] clips first, else another character's pinned ref — never
+    the anonymous no-ref default while material exists."""
+
+    def setUp(self):
+        self.adapter = SentenceTTS(inner=_RefTextOptional())
+
+    def test_configured_pool_gender_match(self):
+        pool = [
+            {"path": "/pool/m.wav", "gender": "male", "text": "hi"},
+            {"path": "/pool/f.wav", "gender": "female", "text": "hi"},
+        ]
+        profiles = {"spk0": {"gender": "female", "age": "adult"}}
+        ref = self.adapter._pool_ref(None, "spk0", pool, profiles)
+        self.assertEqual(ref.ref_audio, Path("/pool/f.wav"))
+
+    def test_assignment_stable_and_spread(self):
+        pool = [{"path": "/pool/a.wav"}, {"path": "/pool/b.wav"}]
+        r0 = self.adapter._pool_ref(None, "spk0", pool, {})
+        r0_again = self.adapter._pool_ref(None, "spk0", pool, {})
+        r1 = self.adapter._pool_ref(None, "spk1", pool, {})
+        self.assertEqual(r0.ref_audio, r0_again.ref_audio)      # stable per speaker
+        self.assertNotEqual(r0.ref_audio, r1.ref_audio)         # spread least-used
+
+    def test_reuses_other_speakers_ref_without_pool(self):
+        diar = _diar({
+            ("OTHER", "neutral"): _ref("OTHER", "neutral", start=0.0, end=4.0),
+            ("OTHER", "happy"): _ref("OTHER", "happy", start=0.0, end=2.0),
+        })
+        ref = self.adapter._pool_ref(diar, "SPK", [], {})
+        self.assertIsNotNone(ref)
+        self.assertEqual(ref.ref_audio.name, "neutral.wav")     # OTHER's longest clip
+
+    def test_nothing_available_returns_none(self):
+        self.assertIsNone(self.adapter._pool_ref(None, "SPK", [], {}))
+        self.assertIsNone(self.adapter._pool_ref(_diar({}), "SPK", [], {}))
+
+    def test_text_required_gates_pool(self):
+        adapter = SentenceTTS(inner=_NeedsRefText())
+        pool = [{"path": "/pool/a.wav"}]                        # no transcript
+        self.assertIsNone(adapter._pool_ref(None, "SPK", pool, {}))
+        pool_with_text = [{"path": "/pool/a.wav", "text": "hello"}]
+        self.assertIsNotNone(adapter._pool_ref(None, "SPK", pool_with_text, {}))
+
+
 if __name__ == "__main__":
     unittest.main()

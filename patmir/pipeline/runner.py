@@ -38,6 +38,7 @@ def run_job(
     source_lang: str | None = None,
     extra: dict[str, Any] | None = None,
     on_job_dir_created: Any = None,
+    stage_cache: dict[str, Any] | None = None,
 ) -> Manifest:
     """Run the full pipeline.
 
@@ -50,7 +51,16 @@ def run_job(
     stage and then returns — used by the streaming prelude to run only the
     analysis half (ingest→…→asr, which includes the post-ASR speaker/emotion
     tagging + ref backfill) without translate/tts/mux/output.
-    """
+
+    `stage_cache`, when given (a mutable dict owned by the caller), keeps each
+    built stage instance warm across `run_job` calls instead of rebuilding and
+    freeing it every time — the watch-along loop passes one cache for the whole
+    stream, killing the measured 11–13% per-section model-rebuild tax
+    (performance.md roadmap #2). Batch runs leave it None and keep the default
+    one-model-resident-at-a-time behavior; with a cache, ALL stage models stay
+    resident (~9 GB with the current active set — fine on 32 GB, watch this if
+    models grow). `_free_accelerator_cache` still runs between stages either
+    way (it drops scratch allocations, not the cached weights)."""
     runs_root = runs_root or Path.cwd() / "runs"
 
     if resume_job_dir is not None:
@@ -101,8 +111,20 @@ def run_job(
         manifest.to_path(manifest_path)
         ctx.progress(name, 0.0, "start")
         # Build this stage's instance JIT and release it after running so MPS
-        # / CUDA only holds one stage's models in memory at a time.
-        stage_obj = cfg.build_stage(name)
+        # / CUDA only holds one stage's models in memory at a time. Time the
+        # build separately (model load / quantization) so the benchmark can
+        # attribute it — it's the per-section rebuild cost in watch-along.
+        # With a caller-owned `stage_cache` the instance is kept warm instead
+        # (build_s = 0 on hits), trading memory for the rebuild tax.
+        if stage_cache is not None and name in stage_cache:
+            stage_obj = stage_cache[name]
+            st.build_s = 0.0
+        else:
+            _build_t0 = time.time()
+            stage_obj = cfg.build_stage(name)
+            st.build_s = time.time() - _build_t0
+            if stage_cache is not None:
+                stage_cache[name] = stage_obj
         try:
             output = _run_stage(name, stage_obj, state, ctx)
             state[name] = output
@@ -193,6 +215,7 @@ def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobCont
             speech_vocals=speech_for_refs,
             refs_dir=refs_dir,
             min_ref_seconds=ctx.options.min_ref_seconds,
+            min_rms_db=getattr(ctx.options, "ref_min_rms_db", -33.0),
         )
         # Persist the now-filled refs (text empty for now — backfilled post-ASR).
         _write_refs_json(ctx, diar)

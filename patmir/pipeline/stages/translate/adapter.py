@@ -58,32 +58,74 @@ class SentenceTranslator:
                 for s in transcript.sentences
             ]
         else:
-            # Per-sentence path.
+            # Per-sentence path. Sentences are independent (each call carries
+            # only its own text + emotion), so cloud candidates that set
+            # `translate_concurrency` > 1 fire them concurrently — the output
+            # is byte-identical to the serial loop, only the wall time changes
+            # (each round-trip is ~1s TTFT-dominated; serial translate was
+            # 12-15% of batch wall — performance.md roadmap #1). Local
+            # candidates (NLLB on GPU) leave the attribute unset → serial.
             import inspect
+            import time
             try:
                 inner_sig = inspect.signature(self.inner.translate)
                 inner_accepts_emotion = "emotion" in inner_sig.parameters
             except (TypeError, ValueError):
                 inner_accepts_emotion = False
 
-            sentences = []
-            for i, s in enumerate(transcript.sentences):
+            bench = bool(ctx.extra.get("bench"))
+            src = transcript.sentences
+            results: list[str] = [""] * len(src)
+            elapsed: list[float] = [0.0] * len(src)
+
+            def _one(i: int) -> None:
+                s = src[i]
+                t0 = time.perf_counter()
                 if inner_accepts_emotion:
-                    target_text = self.inner.translate(
+                    results[i] = self.inner.translate(
                         s.text, source_lang=source_lang, emotion=s.emotion,
                     )
                 else:
-                    target_text = self.inner.translate(s.text, source_lang=source_lang)
-                sentences.append(TranslatedSentence(
+                    results[i] = self.inner.translate(s.text, source_lang=source_lang)
+                elapsed[i] = time.perf_counter() - t0
+
+            concurrency = max(1, int(getattr(self.inner, "translate_concurrency", 1)))
+            if concurrency > 1 and len(src) > 1:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                    futs = {ex.submit(_one, i): i for i in range(len(src))}
+                    done = 0
+                    for fut in as_completed(futs):
+                        fut.result()  # re-raise any translate error
+                        done += 1
+                        ctx.progress("translate", done / total, f"sentence {done}/{total}")
+            else:
+                for i in range(len(src)):
+                    _one(i)
+                    ctx.progress("translate", (i + 1) / total, f"sentence {i + 1}/{total}")
+
+            sentences = [
+                TranslatedSentence(
                     idx=s.idx,
                     source_text=s.text,
-                    target_text=target_text,
+                    target_text=results[i],
                     start=s.start,
                     end=s.end,
                     speaker_id=s.speaker_id,
                     emotion=s.emotion,
-                ))
-                ctx.progress("translate", (i + 1) / total, f"sentence {i + 1}/{total}")
+                )
+                for i, s in enumerate(src)
+            ]
+            # Per-sentence latency trace — only under `patmir bench`.
+            if bench and src:
+                tdir = ctx.job_dir / "translate"
+                tdir.mkdir(exist_ok=True)
+                with (tdir / "timings.jsonl").open("w") as f:
+                    for i, s in enumerate(src):
+                        f.write(json.dumps(
+                            {"idx": s.idx, "latency_ms": round(elapsed[i] * 1000, 1)},
+                            ensure_ascii=False,
+                        ) + "\n")
 
         out = TranslatedTranscript(
             source_lang=source_lang,

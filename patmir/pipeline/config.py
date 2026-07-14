@@ -150,6 +150,10 @@ def load_pipeline_config(
         voice_overlap_gap_seconds=float(opts_raw.get("voice_overlap_gap_seconds", 0.06)),
         voice_max_compress=float(opts_raw.get("voice_max_compress", 1.5)),
         prelude_window_seconds=float(opts_raw.get("prelude_window_seconds", 40.0)),
+        ref_min_rms_db=float(opts_raw.get("ref_min_rms_db", -33.0)),
+        # Top-level [[tts_ref_pool]] tables (like [emotion_guidance]) — a list
+        # of curated stand-in ref clips, not a scalar option.
+        tts_ref_pool=[e for e in (toml.get("tts_ref_pool") or []) if isinstance(e, dict) and e.get("path")],
         emotion_guidance=emotion_guidance,
     )
 

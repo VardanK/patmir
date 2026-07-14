@@ -301,18 +301,25 @@ class StreamManager:
         else:
             rec.sections_done = len(prior.get("sections", []))
 
+        # One warm-model cache for the whole stream (prelude + every section):
+        # each stage model is built once and reused, killing the measured
+        # 11-13% per-section rebuild tax (performance.md roadmap #2).
+        stage_cache: dict = {}
+
         # 1) Prelude — establish the cast + voices + embeddings. Window size is
         # a config knob (smaller → faster first audio, fewer characters up front).
         prelude = run_prelude(
             local_path, cfg, runs_root=self._runs_root,
             window_seconds=cfg.options.prelude_window_seconds,
+            stage_cache=stage_cache,
         )
         rec.window_end = prelude.window_end
         rec.speakers = prelude.speakers
 
         # 2) Dub the prelude window (section 0), reusing the prelude analysis.
         rec.status = "streaming"
-        opening = dub_prelude_window(cfg, prelude, runs_root=self._runs_root)
+        opening = dub_prelude_window(cfg, prelude, runs_root=self._runs_root,
+                                     stage_cache=stage_cache)
         self._emit(rec, opening)
 
         # 3) Stream the rest, playhead-driven. Seed the abandon timer so the
@@ -326,6 +333,7 @@ class StreamManager:
                 return process_section(
                     local_path, cfg, prelude.registry,
                     index=index_counter["n"], start=start, runs_root=self._runs_root,
+                    stage_cache=stage_cache,
                 )
             except Exception:  # noqa: BLE001
                 log.exception("Section at %.1fs failed.", start)

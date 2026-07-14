@@ -676,6 +676,17 @@ music_bed_gain         = 0.6     # accompaniment level under the AR voice (1.0 =
 voice_gain_db          = -3.0    # global trim on top of the per-sentence RMS match (negative = quieter)
 min_ref_seconds        = 1.5     # shortest clean turn that qualifies as a (speaker, emotion) ref clip (ElevenLabs IVC accepts ≥1 s; 1.5 leaves headroom)
 sentence_afade_seconds = 0.05    # per-sentence fade in/out on the AR voice (suppresses boundary bleed — quality issue #4)
+ref_min_rms_db         = -33.0   # loudness floor for ref-clip windows; quieter slices lose to louder eligible ones (quality issue #12)
+
+# Curated stand-in ref clips for speakers with NO usable ref of their own
+# (quality issue #12). Without this, such speakers cloned from nothing — an
+# anonymous default voice. With no pool configured, the TTS adapter instead
+# reuses another character's pinned ref from the same job. Add clean 3-10s
+# 16kHz mono WAVs here to control the stand-in voices explicitly:
+# [[tts_ref_pool]]
+# path   = "/path/to/clean-female-adult.wav"
+# gender = "female"              # optional: matched when the speaker's profile is known
+# text   = "transcript of clip"  # optional: improves fidelity for text-conditioned cloners
 
 # Maps emotion2vec's 9 classes → 5 ref-clip bins. Each key is a SER class
 # label (lowercase, English); each value is the bin name. Bins are:

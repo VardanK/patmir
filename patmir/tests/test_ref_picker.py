@@ -162,6 +162,53 @@ class PickRefsTests(unittest.TestCase):
         self.assertAlmostEqual(ref.source_start, 10.1, places=2)
         self.assertAlmostEqual(ref.source_end, 14.9, places=2)
 
+    def _write_audio_with_quiet_band(self, quiet: tuple[float, float]) -> Path:
+        """30 s sine at -23 dBFS with one band attenuated to ~-63 dBFS."""
+        audio = self.audio.copy()
+        sr = 16_000
+        audio[int(quiet[0] * sr):int(quiet[1] * sr)] *= 0.01
+        path = self.tmp_path / "quiet_band.wav"
+        sf.write(str(path), audio, sr, subtype="PCM_16")
+        return path
+
+    def test_quiet_window_loses_to_louder_shorter_one(self):
+        # The longest window (10-15s) sits in the quiet band → the loud 3 s
+        # window at 20-23s wins despite being shorter.
+        audio_path = self._write_audio_with_quiet_band((9.0, 16.0))
+        turns = [
+            SpeakerTurn(start=10.0, end=15.0, speaker_id="A"),
+            SpeakerTurn(start=20.0, end=23.0, speaker_id="A"),
+        ]
+        preds = [
+            EmotionPrediction(start=10.0, end=15.0, emotion="happy", confidence=0.9),
+            EmotionPrediction(start=20.0, end=23.0, emotion="happy", confidence=0.9),
+        ]
+        refs = pick_refs(
+            turns=turns, overlaps=[], predictions=preds,
+            speech_vocals=audio_path, refs_dir=self.refs_dir,
+            min_ref_seconds=1.5, min_rms_db=-33.0,
+        )
+        self.assertAlmostEqual(refs[("A", "happy")].source_start, 20.1, places=2)
+
+    def test_all_quiet_still_keeps_longest(self):
+        # Every window below the floor → gate relaxes, longest wins (a quiet
+        # ref beats no ref).
+        audio_path = self._write_audio_with_quiet_band((0.0, 30.0))
+        turns = [
+            SpeakerTurn(start=10.0, end=15.0, speaker_id="A"),
+            SpeakerTurn(start=20.0, end=23.0, speaker_id="A"),
+        ]
+        preds = [
+            EmotionPrediction(start=10.0, end=15.0, emotion="happy", confidence=0.9),
+            EmotionPrediction(start=20.0, end=23.0, emotion="happy", confidence=0.9),
+        ]
+        refs = pick_refs(
+            turns=turns, overlaps=[], predictions=preds,
+            speech_vocals=audio_path, refs_dir=self.refs_dir,
+            min_ref_seconds=1.5, min_rms_db=-33.0,
+        )
+        self.assertAlmostEqual(refs[("A", "happy")].source_start, 10.1, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

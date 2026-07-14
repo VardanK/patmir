@@ -29,6 +29,9 @@ AGE_ORDER = ["child", "young", "adult", "elder"]
 # a speaker seen in several emotional states matches more robustly than this
 # single thin margin would allow. Lower than the ECAPA-literature ~0.25 because
 # separated, emotional audio compresses same-speaker similarity.
+# NOTE: this constant is ECAPA's number. `resolve`/`resolve_or_register`
+# default to `embeddings.match_threshold()`, which returns the calibrated
+# value for whichever embedding backend is active (PATMIR_EMBED_BACKEND).
 DEFAULT_MATCH_THRESHOLD = 0.12
 
 
@@ -90,7 +93,9 @@ class SpeakerRegistry:
         self.default_voice_id = default_voice_id or pool[0].id
         self._assigned: dict[str, str] = {}     # speaker_id → voice_id
         self._use_count: dict[str, int] = {v.id: 0 for v in pool}
-        self._locked_ref: dict[str, str] = {}    # speaker_id → ref clip (OmniVoice path)
+        self._locked_ref: dict[str, str] = {}    # speaker_id → ref clip (clone path)
+        self._locked_ref_text: dict[str, str] = {}  # speaker_id → ref clip transcript
+        self._profiles: dict[str, SpeakerProfile] = {}  # speaker_id → gender/age
         self._embeddings: dict[str, list] = {}   # speaker_id → list of ECAPA embeddings
         self._id_counter = 0                        # for minting global ids for new speakers
 
@@ -108,6 +113,7 @@ class SpeakerRegistry:
             return self._assigned[speaker_id]
 
         profile = profile or SpeakerProfile()
+        self._profiles[speaker_id] = profile
         chosen = self._best_match(profile)
         self._assigned[speaker_id] = chosen.id
         self._use_count[chosen.id] += 1
@@ -143,13 +149,25 @@ class SpeakerRegistry:
 
     # ── OmniVoice clone path ────────────────────────────────────────────────
 
-    def lock_ref(self, speaker_id: str, ref_audio: str) -> str:
+    def lock_ref(self, speaker_id: str, ref_audio: str, ref_text: str = "") -> str:
         """Lock a speaker's clone reference on first sufficient clip so the
         cloned voice doesn't shift mid-video. Returns the locked ref."""
-        return self._locked_ref.setdefault(speaker_id, ref_audio)
+        locked = self._locked_ref.setdefault(speaker_id, ref_audio)
+        if locked == ref_audio:
+            self._locked_ref_text.setdefault(speaker_id, ref_text)
+        return locked
 
     def locked_ref(self, speaker_id: str) -> str | None:
         return self._locked_ref.get(speaker_id)
+
+    def locked_refs(self) -> dict[str, dict[str, str]]:
+        """All locked clone refs, JSON-shaped for `ctx.extra["locked_refs"]` —
+        the TTS adapter prefers these over the per-section refs so a character
+        clones from the SAME clip in every section."""
+        return {
+            spk: {"ref_audio": path, "ref_text": self._locked_ref_text.get(spk, "")}
+            for spk, path in self._locked_ref.items()
+        }
 
     # ── cross-section identity (ECAPA embeddings) ──────────────────────────
 
@@ -160,15 +178,18 @@ class SpeakerRegistry:
         if embedding is not None:
             self._embeddings.setdefault(speaker_id, []).append(embedding)
 
-    def resolve(self, embedding, threshold: float = DEFAULT_MATCH_THRESHOLD) -> str | None:
+    def resolve(self, embedding, threshold: float | None = None) -> str | None:
         """Return the known speaker_id whose stored embeddings best match
         `embedding` (max cosine ≥ threshold), or None if none qualify → caller
         registers a new character. Scores each speaker by the BEST of their
         stored embeddings so an emotional clip can still match a calm one.
+        `threshold=None` uses the active embedding backend's calibrated value.
         """
         if embedding is None or not self._embeddings:
             return None
-        from patmir.pipeline.streaming.embeddings import cosine
+        from patmir.pipeline.streaming.embeddings import cosine, match_threshold
+        if threshold is None:
+            threshold = match_threshold()
 
         best_id, best_score = None, -1.0
         for spk, embs in self._embeddings.items():
@@ -193,7 +214,8 @@ class SpeakerRegistry:
         *,
         profile: SpeakerProfile,
         ref_audio: str | None = None,
-        threshold: float = DEFAULT_MATCH_THRESHOLD,
+        ref_text: str = "",
+        threshold: float | None = None,
     ) -> tuple[str, bool]:
         """Map a section-local speaker (given its embedding + profile) to a
         global character. Returns (global_speaker_id, is_new). If no known
@@ -210,13 +232,18 @@ class SpeakerRegistry:
         self.assign_voice(gid, profile)
         self.set_embedding(gid, embedding)
         if ref_audio is not None:
-            self.lock_ref(gid, ref_audio)
+            self.lock_ref(gid, ref_audio, ref_text)
         return gid, True
 
     # ── introspection ─────────────────────────────────────────────────────
 
     def assignments(self) -> dict[str, str]:
         return dict(self._assigned)
+
+    def profiles(self) -> dict[str, dict[str, str]]:
+        """Per-speaker gender/age, JSON-shaped for `ctx.extra["speaker_profiles"]`
+        (the TTS adapter's stand-in pool matches on gender)."""
+        return {spk: {"gender": p.gender, "age": p.age} for spk, p in self._profiles.items()}
 
     def known_speakers(self) -> list[str]:
         return list(self._assigned.keys())

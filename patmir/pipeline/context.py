@@ -86,6 +86,21 @@ class PipelineOptions:
     # pure shifting (which packs lines back-to-back and truncates the tail).
     # 1.0 disables extra compression (pure ripple). 1.5 ≈ up to 50% faster.
     voice_max_compress: float = 1.5
+    # Curated fallback ref-clip pool for clone TTS ([[tts_ref_pool]] tables in
+    # patmir.toml → {path, gender?, text?}). A speaker with no usable ref used
+    # to synthesize with NO reference — an anonymous default voice that also
+    # varies run to run. With a pool configured, such speakers get a stable
+    # stand-in clip from here (gender-matched when the speaker's profile is
+    # known); with no pool configured the adapter falls back to reusing
+    # another character's pinned ref from the same job before ever going
+    # ref-less. Quality issue #12.
+    tts_ref_pool: list[dict] = field(default_factory=list)
+    # Minimum mean level (dBFS RMS) for a sliced turn to qualify as a ref clip.
+    # Quiet slices are usually far-field / bleed-heavy and clone badly. Windows
+    # below the floor lose to any louder eligible window; if ALL of a cell's
+    # windows fail the floor, the longest still wins (never drop a speaker's
+    # only ref). Quality issue #12.
+    ref_min_rms_db: float = -33.0
     # Watch-along only: seconds of the opening analyzed in the prelude to
     # establish the cast before playback starts. Smaller = faster time-to-first
     # -audio, but fewer characters are seen up front (later ones register on the

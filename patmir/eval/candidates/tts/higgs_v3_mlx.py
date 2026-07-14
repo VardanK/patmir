@@ -322,6 +322,12 @@ class HiggsV3MLX:
     def summarize(self) -> dict[str, Any]:
         return dict(self._summary)
 
+    def reset_summary(self) -> None:
+        """Zero the per-job counters. Called by the TTS adapter at the start of
+        each job so a warm-cached instance (watch-along stage_cache) reports
+        per-section numbers instead of accumulating across sections."""
+        self._summary.update({"sentences": 0, "overflows": 0})
+
 
 def _wav_bytes(audio: np.ndarray, sr: int) -> bytes:
     audio = np.asarray(audio, dtype=np.float32).squeeze()

@@ -46,10 +46,12 @@ def streaming_config(config_path: Path) -> PipelineConfig:
         faster than the `htdemucs_ft` 4-model bag (which was ~34s/section, the
         throughput wall). Slightly more bleed, fine for watch-along.
 
-    asr + diarize are NOT overridden here — they inherit the now-local
-    [pipeline] defaults (nemotron_mlx + sortformer_mlx). All overrides shrink
-    per-section time so the stream keeps ahead of playback. See ADRs
-    2026-06-13-near-realtime-d3-spike and 2026-06-15-local-asr-diarize-via-mlx-audio."""
+    asr + diarize are NOT overridden here — they inherit the [pipeline]
+    defaults (whisper_large_v3_mlx_fp16 + sortformer_mlx as of 2026-06-19; a
+    faster streaming-ASR override is roadmap item #3 in performance.md). All
+    overrides shrink per-section time so the stream keeps ahead of playback.
+    See ADRs 2026-06-13-near-realtime-d3-spike and
+    2026-06-15-local-asr-diarize-via-mlx-audio."""
     return load_pipeline_config(config_path, overrides={
         "separate": "htdemucs_mlx_fast",
         "tts": "higgs_v3_mlx_q8_fast",
@@ -82,10 +84,14 @@ def stream_sections(
     duration = source_duration(source)
     t = prelude.window_end
     index = 1
+    # One warm-model cache for the whole stream: stages are built on the first
+    # section and reused after (kills the 11–13% per-section rebuild tax).
+    stage_cache: dict = {}
     while t < duration - 0.5:
         result = process_section(
             source, cfg, prelude.registry,
             index=index, start=t, target_seconds=section_seconds, runs_root=runs_root,
+            stage_cache=stage_cache,
         )
         yield result
         # Advance to this section's VAD-snapped end; guard against no-forward-

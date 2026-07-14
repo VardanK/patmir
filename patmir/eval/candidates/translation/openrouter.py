@@ -58,6 +58,11 @@ _BASE_URL = "https://openrouter.ai/api/v1"
 
 class OpenRouterTranslator:
     id = "openrouter"
+    # Network-bound + TTFT-dominated (~1s/round-trip) → the translate adapter
+    # fires sentences concurrently. httpx.Client is thread-safe. 6 stays well
+    # under OpenRouter rate limits while cutting the serial 40-63s stage to
+    # seconds (performance.md roadmap #1).
+    translate_concurrency = 6
 
     def __init__(
         self,
