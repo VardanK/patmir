@@ -1,0 +1,369 @@
+{
+  "results": [
+    {
+      "clip": "samples/Fallout-S02E01-5min.mkv",
+      "mode": "watch-along",
+      "label": "fallout-watch",
+      "repeat_index": 0,
+      "job_id": "20260620-212304-prelude",
+      "source_s": 300.02,
+      "total_wall_s": 618.13,
+      "agg_rtf": 2.06,
+      "stages": [
+        {
+          "name": "ingest",
+          "state": "done",
+          "wall_s": 2.25,
+          "build_s": null,
+          "rtf": 0.007,
+          "pct": 0.4
+        },
+        {
+          "name": "separate",
+          "state": "done",
+          "wall_s": 54.99,
+          "build_s": null,
+          "rtf": 0.183,
+          "pct": 10.4
+        },
+        {
+          "name": "diarize",
+          "state": "done",
+          "wall_s": 13.21,
+          "build_s": null,
+          "rtf": 0.044,
+          "pct": 2.5
+        },
+        {
+          "name": "emotion",
+          "state": "done",
+          "wall_s": 25.07,
+          "build_s": null,
+          "rtf": 0.084,
+          "pct": 4.7
+        },
+        {
+          "name": "asr",
+          "state": "done",
+          "wall_s": 119.95,
+          "build_s": null,
+          "rtf": 0.4,
+          "pct": 22.7
+        },
+        {
+          "name": "translate",
+          "state": "done",
+          "wall_s": 30.66,
+          "build_s": null,
+          "rtf": 0.102,
+          "pct": 5.8
+        },
+        {
+          "name": "tts",
+          "state": "done",
+          "wall_s": 277.69,
+          "build_s": null,
+          "rtf": 0.926,
+          "pct": 52.5
+        },
+        {
+          "name": "mux",
+          "state": "done",
+          "wall_s": 5.42,
+          "build_s": null,
+          "rtf": 0.018,
+          "pct": 1.0
+        },
+        {
+          "name": "output",
+          "state": "done",
+          "wall_s": 0.0,
+          "build_s": null,
+          "rtf": 0.0,
+          "pct": 0.0
+        }
+      ],
+      "sentence_count": null,
+      "tts": null,
+      "translate": null,
+      "models": {
+        "ingest": "ffmpeg",
+        "separate": "htdemucs_mlx_fast",
+        "diarize": "sortformer_mlx",
+        "emotion": "emotion2vec_plus_base",
+        "asr": "whisper_large_v3_mlx_fp16",
+        "translate": "openrouter_gemini_flash_batch",
+        "tts": "higgs_v3_mlx_q8_fast",
+        "mux": "ffmpeg_pad_stretch",
+        "output": "mkv_default"
+      },
+      "sections": [
+        {
+          "index": 0,
+          "start": 0.0,
+          "end": 39.98,
+          "section_s": 39.98,
+          "wall_s": 57.31,
+          "analysis_wall_s": 19.52,
+          "dub_wall_s": 56.01,
+          "build_s": 9.42,
+          "rtf": 1.434,
+          "stage_wall_s": {
+            "ingest": 0.15,
+            "separate": 3.09,
+            "diarize": 3.91,
+            "emotion": 3.73,
+            "asr": 8.63,
+            "translate": 4.23,
+            "tts": 50.7,
+            "mux": 1.08,
+            "output": 0.0
+          },
+          "new_speakers": [
+            "SPEAKER_00",
+            "SPEAKER_01",
+            "SPEAKER_03"
+          ]
+        },
+        {
+          "index": 1,
+          "start": 39.98,
+          "end": 66.18,
+          "section_s": 26.2,
+          "wall_s": 56.94,
+          "analysis_wall_s": 23.37,
+          "dub_wall_s": 24.8,
+          "build_s": 5.69,
+          "rtf": 2.173,
+          "stage_wall_s": {
+            "ingest": 0.19,
+            "separate": 5.67,
+            "diarize": 1.0,
+            "emotion": 1.82,
+            "asr": 14.68,
+            "translate": 2.26,
+            "tts": 21.86,
+            "mux": 0.68,
+            "output": 0.0
+          },
+          "new_speakers": []
+        },
+        {
+          "index": 2,
+          "start": 66.18,
+          "end": 94.78,
+          "section_s": 28.6,
+          "wall_s": 41.48,
+          "analysis_wall_s": 17.21,
+          "dub_wall_s": 18.7,
+          "build_s": 5.53,
+          "rtf": 1.45,
+          "stage_wall_s": {
+            "ingest": 0.19,
+            "separate": 5.23,
+            "diarize": 0.97,
+            "emotion": 2.06,
+            "asr": 8.76,
+            "translate": 1.63,
+            "tts": 16.81,
+            "mux": 0.27,
+            "output": 0.0
+          },
+          "new_speakers": []
+        },
+        {
+          "index": 3,
+          "start": 94.78,
+          "end": 121.98,
+          "section_s": 27.2,
+          "wall_s": 49.42,
+          "analysis_wall_s": 16.35,
+          "dub_wall_s": 29.32,
+          "build_s": 4.68,
+          "rtf": 1.817,
+          "stage_wall_s": {
+            "ingest": 0.21,
+            "separate": 5.26,
+            "diarize": 0.95,
+            "emotion": 2.15,
+            "asr": 7.78,
+            "translate": 3.05,
+            "tts": 25.68,
+            "mux": 0.59,
+            "output": 0.0
+          },
+          "new_speakers": []
+        },
+        {
+          "index": 4,
+          "start": 121.98,
+          "end": 151.68,
+          "section_s": 29.7,
+          "wall_s": 51.69,
+          "analysis_wall_s": 17.99,
+          "dub_wall_s": 26.68,
+          "build_s": 5.66,
+          "rtf": 1.74,
+          "stage_wall_s": {
+            "ingest": 0.22,
+            "separate": 5.6,
+            "diarize": 0.96,
+            "emotion": 1.98,
+            "asr": 9.23,
+            "translate": 2.05,
+            "tts": 24.26,
+            "mux": 0.37,
+            "output": 0.0
+          },
+          "new_speakers": []
+        },
+        {
+          "index": 5,
+          "start": 151.68,
+          "end": 178.28,
+          "section_s": 26.6,
+          "wall_s": 61.7,
+          "analysis_wall_s": 22.43,
+          "dub_wall_s": 26.35,
+          "build_s": 5.83,
+          "rtf": 2.32,
+          "stage_wall_s": {
+            "ingest": 0.21,
+            "separate": 6.5,
+            "diarize": 1.03,
+            "emotion": 2.78,
+            "asr": 11.9,
+            "translate": 3.14,
+            "tts": 22.9,
+            "mux": 0.3,
+            "output": 0.0
+          },
+          "new_speakers": []
+        },
+        {
+          "index": 6,
+          "start": 178.28,
+          "end": 208.18,
+          "section_s": 29.9,
+          "wall_s": 69.67,
+          "analysis_wall_s": 24.17,
+          "dub_wall_s": 39.55,
+          "build_s": 5.79,
+          "rtf": 2.33,
+          "stage_wall_s": {
+            "ingest": 0.21,
+            "separate": 4.99,
+            "diarize": 0.96,
+            "emotion": 2.2,
+            "asr": 15.82,
+            "translate": 3.32,
+            "tts": 35.49,
+            "mux": 0.74,
+            "output": 0.0
+          },
+          "new_speakers": []
+        },
+        {
+          "index": 7,
+          "start": 208.18,
+          "end": 236.68,
+          "section_s": 28.5,
+          "wall_s": 49.26,
+          "analysis_wall_s": 21.85,
+          "dub_wall_s": 16.38,
+          "build_s": 6.53,
+          "rtf": 1.728,
+          "stage_wall_s": {
+            "ingest": 0.23,
+            "separate": 6.03,
+            "diarize": 1.07,
+            "emotion": 2.36,
+            "asr": 12.17,
+            "translate": 2.41,
+            "tts": 13.74,
+            "mux": 0.23,
+            "output": 0.0
+          },
+          "new_speakers": []
+        },
+        {
+          "index": 8,
+          "start": 236.68,
+          "end": 262.68,
+          "section_s": 26.0,
+          "wall_s": 64.85,
+          "analysis_wall_s": 20.37,
+          "dub_wall_s": 31.69,
+          "build_s": 5.55,
+          "rtf": 2.494,
+          "stage_wall_s": {
+            "ingest": 0.22,
+            "separate": 5.61,
+            "diarize": 0.96,
+            "emotion": 2.33,
+            "asr": 11.25,
+            "translate": 3.0,
+            "tts": 28.2,
+            "mux": 0.49,
+            "output": 0.0
+          },
+          "new_speakers": []
+        },
+        {
+          "index": 9,
+          "start": 262.68,
+          "end": 290.68,
+          "section_s": 28.0,
+          "wall_s": 61.1,
+          "analysis_wall_s": 22.41,
+          "dub_wall_s": 26.83,
+          "build_s": 6.07,
+          "rtf": 2.182,
+          "stage_wall_s": {
+            "ingest": 0.21,
+            "separate": 5.7,
+            "diarize": 0.98,
+            "emotion": 2.16,
+            "asr": 13.36,
+            "translate": 2.85,
+            "tts": 23.44,
+            "mux": 0.55,
+            "output": 0.0
+          },
+          "new_speakers": []
+        },
+        {
+          "index": 10,
+          "start": 290.68,
+          "end": 300.03,
+          "section_s": 9.35,
+          "wall_s": 31.41,
+          "analysis_wall_s": 9.82,
+          "dub_wall_s": 17.45,
+          "build_s": 5.67,
+          "rtf": 3.359,
+          "stage_wall_s": {
+            "ingest": 0.21,
+            "separate": 1.31,
+            "diarize": 0.42,
+            "emotion": 1.5,
+            "asr": 6.37,
+            "translate": 2.72,
+            "tts": 14.61,
+            "mux": 0.12,
+            "output": 0.0
+          },
+          "new_speakers": []
+        }
+      ],
+      "notes": {
+        "prelude_wall_s": 23.3,
+        "sections_wall_s": 594.83,
+        "dubbed_audio_s": 300.03,
+        "n_sections": 11,
+        "total_build_s": 66.42,
+        "build_pct_of_wall": 10.7
+      }
+    }
+  ]
+}

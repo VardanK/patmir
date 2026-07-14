@@ -15,6 +15,7 @@ Human-facing navigation. The agent loads the always-loaded tier automatically vi
 - **[language-support.md](language-support.md)** — EA constraint; which models produce `hy_AM` vs `hyw` vs nothing
 - **[runs.md](runs.md)** — what every file in `runs/<job>/` is; debugging guide
 - **[glossary.md](glossary.md)** — terms (SER, VAD, DiT, ref clip, flow matching, etc.)
+- **[performance.md](performance.md)** — per-stage RTF baselines (batch + watch-along) + perf roadmap; how `patmir bench` measures
 
 ### Decisions (ADRs)
 

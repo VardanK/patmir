@@ -24,7 +24,7 @@ When you (the agent) do any of the following, update the corresponding doc **in 
 | Change a data contract (stage.py shape) | `data-contracts.md`                                                            |
 | Add a new pipeline stage                | `pipeline.md` + new `stages/<name>/` subdir                                    |
 
-The on-demand tier (`stages/*/`, `decisions/*.md`, `data-contracts.md`, `language-support.md`, `runs.md`, `glossary.md`) is **not** auto-loaded. Read those files when the task is in that area. `decisions.md` is the canonical list of "why we chose X" — if the user asks "why are we using X?" or "should we try Y?", check `decisions.md` first and only re-investigate if there's a revisit trigger or new evidence.
+The on-demand tier (`stages/*/`, `decisions/*.md`, `data-contracts.md`, `language-support.md`, `runs.md`, `glossary.md`, `performance.md`) is **not** auto-loaded. Read those files when the task is in that area. `decisions.md` is the canonical list of "why we chose X" — if the user asks "why are we using X?" or "should we try Y?", check `decisions.md` first and only re-investigate if there's a revisit trigger or new evidence.
 
 ## Repo orientation
 

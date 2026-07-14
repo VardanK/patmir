@@ -20,6 +20,11 @@ class StageStatus:
     state: str = "pending"  # pending | running | done | failed
     started_at: float | None = None
     finished_at: float | None = None
+    # Wall-clock seconds spent building this stage's candidate (model load /
+    # quantization). Included in [started_at, finished_at]; broken out so the
+    # benchmark can separate model-load cost from compute. Dominant in the
+    # watch-along path, which rebuilds every stage twice per section.
+    build_s: float | None = None
     artifacts: dict[str, str] = field(default_factory=dict)
     error: str | None = None
 

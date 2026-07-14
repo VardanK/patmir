@@ -1,0 +1,206 @@
+<title>Patmir Pipeline Benchmark — 2026-06-20</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212b; --line:#2a2f3a;
+    --tx:#e6e9ef; --mut:#9aa3b2; --tts:#ff6b6b; --asr:#ffa94d; --build:#b197fc;
+    --good:#51cf66; --bad:#ff8787; --accent:#4dabf7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1000px;margin:0 auto;padding:32px 20px 80px}
+  h1{font-size:26px;margin:0 0 4px;letter-spacing:-.02em}
+  h2{font-size:20px;margin:44px 0 12px;letter-spacing:-.01em;border-bottom:1px solid var(--line);padding-bottom:8px}
+  h3{font-size:16px;margin:26px 0 8px;color:var(--tx)}
+  .sub{color:var(--mut);font-size:13.5px;margin:0 0 22px}
+  p{color:#c7cdd9}
+  code{background:#0c0e12;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:12.5px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .scroll{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin:10px 0}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:520px}
+  th,td{padding:8px 11px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  thead th{background:var(--panel2);color:var(--mut);font-weight:600;position:sticky;top:0}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover td{background:#1a1e27}
+  .tot td{font-weight:700;border-top:2px solid var(--line);background:#14171e}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:16px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .card .k{font-size:12px;color:var(--mut);margin-bottom:4px}
+  .card .v{font-size:24px;font-weight:700;letter-spacing:-.02em}
+  .card .n{font-size:12px;color:var(--mut);margin-top:3px}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600}
+  .p-good{background:rgba(81,207,102,.16);color:var(--good)}
+  .p-bad{background:rgba(255,135,135,.16);color:var(--bad)}
+  .p-warn{background:rgba(255,169,77,.16);color:var(--asr)}
+  .bar{height:10px;border-radius:3px;display:inline-block;vertical-align:middle}
+  .tts{color:var(--tts)} .asr{color:var(--asr)} .bld{color:var(--build)}
+  .legend{font-size:12.5px;color:var(--mut);margin:6px 0 0}
+  .legend span{display:inline-block;margin-right:14px}
+  .sw{width:10px;height:10px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:middle}
+  .note{background:var(--panel);border-left:3px solid var(--accent);border-radius:0 8px 8px 0;
+    padding:11px 15px;margin:14px 0;font-size:13.5px;color:#cfd5e1}
+  .note.warn{border-left-color:var(--asr)}
+  .note.tts{border-left-color:var(--tts)}
+  ol.rm{padding-left:0;list-style:none;counter-reset:rm}
+  ol.rm>li{counter-increment:rm;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:14px 16px 14px 52px;margin:11px 0;position:relative}
+  ol.rm>li::before{content:counter(rm);position:absolute;left:14px;top:13px;width:26px;height:26px;
+    background:var(--accent);color:#06243d;border-radius:8px;display:grid;place-items:center;font-weight:800;font-size:14px}
+  .rm .t{font-weight:700;font-size:15px}
+  .rm .meta{font-size:12.5px;color:var(--mut);margin:5px 0}
+  .rm .win{color:var(--good);font-weight:600}
+  .foot{color:var(--mut);font-size:12.5px;margin-top:40px;border-top:1px solid var(--line);padding-top:14px}
+  .stagebar{display:flex;height:22px;border-radius:6px;overflow:hidden;margin:4px 0 2px;border:1px solid var(--line)}
+  .stagebar i{display:block;height:100%}
+  .small{font-size:12px;color:var(--mut)}
+</style>
+
+<div class="wrap">
+<h1>Patmir Pipeline Benchmark</h1>
+<p class="sub">2026-06-20 · 32 GB Apple Silicon (MLX/MPS) · models warm + <code>HF_HUB_OFFLINE=1</code> · harness: <code>patmir bench</code><br>
+RTF = wall&nbsp;/&nbsp;source. <b>&gt;1.0 = slower than realtime.</b></p>
+
+<div class="cards">
+  <div class="card"><div class="k">Batch · sparse (masha)</div><div class="v p-good" style="background:none">0.89×</div><div class="n">faster than realtime</div></div>
+  <div class="card"><div class="k">Batch · dense (Fallout)</div><div class="v" style="color:var(--asr)">1.4–1.7×</div><div class="n">slower — speech-dense</div></div>
+  <div class="card"><div class="k">Watch-along (both)</div><div class="v" style="color:var(--bad)">~2.0×</div><div class="n">needs pre-buffer</div></div>
+  <div class="card"><div class="k">Rebuild tax (D3)</div><div class="v bld">11–13%</div><div class="n">pure overhead</div></div>
+</div>
+
+<h2>Headline — full matrix</h2>
+<div class="scroll"><table>
+<thead><tr><th>run</th><th>source</th><th>wall</th><th>RTF</th><th>TTS</th><th>ASR</th><th>rebuild</th><th>sents/sec</th></tr></thead>
+<tbody>
+<tr><td>masha · batch <span class="small">(warm)</span></td><td>300s</td><td>267s</td><td><span class="pill p-good">0.89</span></td><td class="tts">37%</td><td class="asr">29%</td><td>—</td><td>37</td></tr>
+<tr><td>masha · batch <span class="small">(COLD 1st run)</span></td><td>300s</td><td>522s</td><td><span class="pill p-bad">1.74</span></td><td class="tts">69%*</td><td class="asr">11%</td><td>—</td><td>40</td></tr>
+<tr><td>Fallout · batch</td><td>300s</td><td>408–499s</td><td><span class="pill p-warn">1.36–1.66</span></td><td class="tts">42–50%</td><td class="asr">16–29%</td><td>—</td><td>48–60</td></tr>
+<tr><td>masha · watch-along</td><td>300s</td><td>611–726s</td><td><span class="pill p-bad">1.94–2.31</span></td><td class="tts">36–38%</td><td class="asr">34–37%</td><td class="bld">11–13%</td><td>13 sec</td></tr>
+<tr><td>Fallout · watch-along</td><td>300s</td><td>618s</td><td><span class="pill p-bad">2.06</span></td><td class="tts">52%</td><td class="asr">23%</td><td class="bld">11%</td><td>11 sec</td></tr>
+<tr><td>English · batch <span class="small">(7s)</span></td><td>7.2s</td><td>28–39s</td><td><span class="pill p-bad">3.9–5.4</span></td><td class="tts">50–58%</td><td class="asr">11–12%</td><td>—</td><td>2</td></tr>
+</tbody></table></div>
+<p class="small">*The cold-run 69% / RTF 1.74 is a <b>one-time warmup artifact</b> — see finding #2. Warm steady-state is the real baseline.</p>
+
+<h2>Where time goes</h2>
+<p class="legend">
+<span><i class="sw" style="background:var(--tts)"></i>TTS</span>
+<span><i class="sw" style="background:var(--asr)"></i>ASR</span>
+<span><i class="sw" style="background:#4dabf7"></i>separate</span>
+<span><i class="sw" style="background:#63e6be"></i>translate</span>
+<span><i class="sw" style="background:#9aa3b2"></i>other (ingest/diarize/emotion/mux/output)</span>
+</p>
+
+<h3>masha · batch (warm, RTF 0.89) — sparse cartoon dialogue, 23% speech</h3>
+<div class="stagebar">
+<i class="tts" style="width:37.4%;background:var(--tts)" title="tts 37%"></i>
+<i style="width:29.4%;background:var(--asr)" title="asr 29%"></i>
+<i style="width:10.3%;background:#4dabf7" title="separate 10%"></i>
+<i style="width:15.0%;background:#63e6be" title="translate 15%"></i>
+<i style="width:7.9%;background:#9aa3b2" title="other"></i>
+</div>
+
+<h3>Fallout · batch (RTF 1.66) — dense dialogue, 55% speech</h3>
+<div class="stagebar">
+<i style="width:41.7%;background:var(--tts)" title="tts 42%"></i>
+<i style="width:29.2%;background:var(--asr)" title="asr 29%"></i>
+<i style="width:10.8%;background:#4dabf7" title="separate 11%"></i>
+<i style="width:12.7%;background:#63e6be" title="translate 13%"></i>
+<i style="width:5.6%;background:#9aa3b2" title="other"></i>
+</div>
+
+<h3>Fallout · watch-along (RTF 2.06) — TTS-dominated when dense</h3>
+<div class="stagebar">
+<i style="width:52.5%;background:var(--tts)" title="tts 53%"></i>
+<i style="width:22.7%;background:var(--asr)" title="asr 23%"></i>
+<i style="width:10.4%;background:#4dabf7" title="separate 10%"></i>
+<i style="width:5.8%;background:#63e6be" title="translate 6%"></i>
+<i style="width:8.6%;background:#9aa3b2" title="other + rebuild"></i>
+</div>
+<p class="small">Across all runs, <b>TTS + ASR = 55–75% of the wall.</b> Both scale with how much speech the clip contains.</p>
+
+<h2>Per-stage detail</h2>
+
+<h3>Batch — masha rep1 (warm) vs Fallout rep1</h3>
+<div class="scroll"><table>
+<thead><tr><th>stage</th><th>masha wall</th><th>masha %</th><th>masha rtf</th><th>Fallout wall</th><th>Fallout %</th><th>Fallout rtf</th></tr></thead>
+<tbody>
+<tr><td>ingest</td><td>0.34</td><td>0.1%</td><td>0.001</td><td>0.33</td><td>0.1%</td><td>0.001</td></tr>
+<tr><td>separate</td><td>27.5</td><td>10.3%</td><td>0.092</td><td>53.7</td><td>10.8%</td><td>0.179</td></tr>
+<tr><td>diarize</td><td>7.9</td><td>3.0%</td><td>0.026</td><td>11.8</td><td>2.4%</td><td>0.039</td></tr>
+<tr><td>emotion</td><td>4.6</td><td>1.7%</td><td>0.015</td><td>4.9</td><td>1.0%</td><td>0.016</td></tr>
+<tr><td class="asr">asr</td><td class="asr">78.5</td><td class="asr">29.4%</td><td class="asr">0.262</td><td class="asr">145.8</td><td class="asr">29.2%</td><td class="asr">0.486</td></tr>
+<tr><td>translate</td><td>40.2</td><td>15.0%</td><td>0.134</td><td>63.5</td><td>12.7%</td><td>0.212</td></tr>
+<tr><td class="tts">tts</td><td class="tts">99.9</td><td class="tts">37.4%</td><td class="tts">0.333</td><td class="tts">207.8</td><td class="tts">41.7%</td><td class="tts">0.693</td></tr>
+<tr><td>mux</td><td>3.1</td><td>1.2%</td><td>0.010</td><td>5.9</td><td>1.2%</td><td>0.020</td></tr>
+<tr><td>output</td><td>4.9</td><td>1.9%</td><td>0.016</td><td>5.0</td><td>1.0%</td><td>0.017</td></tr>
+<tr class="tot"><td>TOTAL</td><td>267.0</td><td>RTF 0.89</td><td></td><td>498.9</td><td>RTF 1.66</td><td></td></tr>
+</tbody></table></div>
+
+<h3>Watch-along — aggregated stage wall across all sections</h3>
+<div class="scroll"><table>
+<thead><tr><th>stage</th><th>masha wall</th><th>masha %</th><th>Fallout wall</th><th>Fallout %</th></tr></thead>
+<tbody>
+<tr><td class="asr">asr</td><td class="asr">175.7</td><td class="asr">34.2%</td><td class="asr">120.0</td><td class="asr">22.7%</td></tr>
+<tr><td class="tts">tts</td><td class="tts">195.1</td><td class="tts">38.0%</td><td class="tts">277.7</td><td class="tts">52.5%</td></tr>
+<tr><td>separate</td><td>67.5</td><td>13.1%</td><td>55.0</td><td>10.4%</td></tr>
+<tr><td>emotion</td><td>26.6</td><td>5.2%</td><td>25.1</td><td>4.7%</td></tr>
+<tr><td>translate</td><td>26.0</td><td>5.1%</td><td>30.7</td><td>5.8%</td></tr>
+<tr><td>diarize</td><td>16.0</td><td>3.1%</td><td>13.2</td><td>2.5%</td></tr>
+<tr><td>ingest/mux</td><td>6.7</td><td>1.3%</td><td>7.7</td><td>1.4%</td></tr>
+<tr class="tot"><td>model rebuild</td><td class="bld">80.2 (13.1%)</td><td></td><td class="bld">66.4 (10.7%)</td><td></td></tr>
+<tr class="tot"><td>TOTAL (+prelude)</td><td>610.8 — RTF 1.94</td><td></td><td>618.1 — RTF 2.06</td><td></td></tr>
+</tbody></table></div>
+<p class="small">Watch-along uses the fast streaming config: <code>htdemucs_mlx_fast</code> · <code>higgs_v3_mlx_q8_fast</code> · <code>openrouter_gemini_flash_batch</code>. Each of the 11–13 sections runs <code>run_job</code> <b>twice</b> (analysis → dub), rebuilding every model both times — that's the rebuild row.</p>
+
+<h3>TTS per-sentence (the dominant stage)</h3>
+<div class="scroll"><table>
+<thead><tr><th>run</th><th>sents</th><th>mean</th><th>median</th><th>p90</th><th>max</th><th>tts_rtf</th><th>overflows</th></tr></thead>
+<tbody>
+<tr><td>masha batch</td><td>37</td><td>2.54s</td><td>2.39s</td><td>3.35s</td><td>4.28s</td><td>1.37</td><td><span class="pill p-good">0/37</span></td></tr>
+<tr><td>Fallout batch</td><td>60</td><td>3.38s</td><td>3.00s</td><td>6.01s</td><td>8.37s</td><td>1.22</td><td><span class="pill p-good">0/60</span></td></tr>
+<tr><td>English batch</td><td>2</td><td>5.76s</td><td>—</td><td>—</td><td>6.57s</td><td>1.19</td><td><span class="pill p-good">0/2</span></td></tr>
+</tbody></table></div>
+<p class="small">Higgs v3 q8 synthesizes at <code>tts_rtf ≈ 1.2–1.4</code> (slower than realtime <i>per spoken second</i>), but the TTS <i>stage</i> is only ~0.33–0.93 RTF of the video because speech is a fraction of runtime. Overflow/reseed guardrail is healthy (0 across all warm runs).</p>
+
+<h2>Findings</h2>
+<div class="note tts"><b>1 · TTS + ASR are the two universal bottlenecks.</b> Together 55–75% of every run, in every mode. Both scale with the amount of speech in the clip — they dominate regardless of batch vs watch-along.</div>
+<div class="note"><b>2 · Batch clears realtime only on sparse content.</b> masha (23% speech) = 0.89×; Fallout (55% speech) = 1.4–1.7×. Speech density is the driver, not a fixed pipeline cost.</div>
+<div class="note warn"><b>3 · The "1.74×" was a cold-start artifact.</b> The first-ever Higgs run per process pays ~240s of model-fetch + MLX Metal-kernel JIT compilation, landing inside the TTS stage wall but <i>not</i> in per-sentence time. Two warm repeats agree at 0.89/0.92 with identical per-sentence rate. <b>Warm is the baseline.</b></div>
+<div class="note"><b>4 · Watch-along is ~2× realtime and carries an 11–13% model-rebuild tax.</b> <code>process_section</code> calls <code>run_job</code> twice per section with fresh model builds — measured 66–80s of pure overhead per 5-min clip. Fully reclaimable with a warm-model loop.</div>
+<div class="note warn"><b>5 · Watch-along re-runs full ASR per section on padded slices.</b> The 8s pad overlaps the next section, so that audio is analyzed twice (masha dubbed-audio 314.7s &gt; 300s source). ASR is the #1 D3 cost on sparse content (34%).</div>
+<div class="note"><b>6 · Translate is serial but small (5–15%).</b> ~1.05s/round-trip × N sentences. The concurrent batch candidate already exists (watch-along uses it) — a near-free batch-mode win.</div>
+
+<h2>Roadmap <span class="small" style="font-weight:400">— ranked by measured ROI · not yet implemented</span></h2>
+<ol class="rm">
+<li><div class="t">Batch translate → batched/concurrent</div>
+  <div class="meta">effort: <b>near-zero</b> · confidence: high · risk: low</div>
+  Serial translate is 12–15% of batch wall; the concurrent <code>openrouter_gemini_flash_batch</code> already exists. <span class="win">→ batch RTF −0.10 to −0.18</span></li>
+<li><div class="t">Watch-along warm-model loop</div>
+  <div class="meta">effort: medium · confidence: high · risk: medium (32 GB ceiling)</div>
+  Build stage models once, process sections in place — reclaims the 11–13% rebuild tax. <span class="win">→ watch-along RTF −0.2 to −0.3</span></li>
+<li><div class="t">Nemotron ASR in watch-along (content-gated)</div>
+  <div class="meta">effort: medium · confidence: high speed / <span class="p-warn pill">quality risk</span></div>
+  ASR is 23–34% of D3, Whisper per-section. Nemotron is ~6× faster — but garbles fast cartoon (needs an ear-test gate). <span class="win">→ D3 RTF −0.4 to −0.5</span> (biggest single D3 lever)</li>
+<li><div class="t">TTS per-speaker prefix-KV caching</div>
+  <div class="meta">effort: high · confidence: medium · highest ceiling</div>
+  TTS is 37–52% of every run. Reuse ref+system prefix KV across a speaker's sentences instead of rebuilding per sentence. <span class="win">→ −0.1 to −0.2 batch, more in dense D3</span></li>
+<li><div class="t">Watch-along: stop re-analyzing the pad overlap</div>
+  <div class="meta">effort: low · confidence: medium · folds into #2</div>
+  Each section re-separates/re-ASRs the 8s pad the next section also covers. <span class="win">→ RTF −0.05 to −0.15</span></li>
+</ol>
+
+<h2>Reproduce</h2>
+<div class="scroll"><table><tbody>
+<tr><td><code>patmir bench samples/masha-2-5min.mkv --mode batch --repeat 2</code></td></tr>
+<tr><td><code>patmir bench samples/masha-2-5min.mkv --mode watch-along --repeat 2</code></td></tr>
+<tr><td><code>patmir bench samples/Fallout-S02E01-5min.mkv --mode batch --repeat 2</code></td></tr>
+<tr><td><code>patmir bench samples/Fallout-S02E01-5min.mkv --mode watch-along --repeat 1</code></td></tr>
+</tbody></table></div>
+<p class="small">Set <code>HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1</code> once models are cached (removes transient HF failures + network variance). Watch-along repeat-2 peaks ~8 GB scratch in <code>runs/</code>.</p>
+
+<div class="foot">
+Source: <code>docs/architecture/performance.md</code> · raw JSON in <code>agent-os/specs/2026-06-20-1656-pipeline-benchmark-perf/results/</code> ·
+harness <code>patmir/bench.py</code>. Measure + plan spec — no optimizations implemented.
+</div>
+</div>

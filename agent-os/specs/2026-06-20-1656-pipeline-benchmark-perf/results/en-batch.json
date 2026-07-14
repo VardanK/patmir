@@ -1,0 +1,242 @@
+{
+  "results": [
+    {
+      "clip": "samples/clip-en-test.mkv",
+      "mode": "batch",
+      "label": "en-batch",
+      "repeat_index": 0,
+      "job_id": "20260620-175925-clip-en-test",
+      "source_s": 7.18,
+      "total_wall_s": 38.74,
+      "agg_rtf": 5.394,
+      "stages": [
+        {
+          "name": "ingest",
+          "state": "done",
+          "wall_s": 0.1,
+          "build_s": 0.0,
+          "rtf": 0.014,
+          "pct": 0.3
+        },
+        {
+          "name": "separate",
+          "state": "done",
+          "wall_s": 1.0,
+          "build_s": 0.11,
+          "rtf": 0.139,
+          "pct": 2.6
+        },
+        {
+          "name": "diarize",
+          "state": "done",
+          "wall_s": 4.7,
+          "build_s": 4.48,
+          "rtf": 0.655,
+          "pct": 12.1
+        },
+        {
+          "name": "emotion",
+          "state": "done",
+          "wall_s": 3.43,
+          "build_s": 3.09,
+          "rtf": 0.478,
+          "pct": 8.9
+        },
+        {
+          "name": "asr",
+          "state": "done",
+          "wall_s": 4.78,
+          "build_s": 0.01,
+          "rtf": 0.666,
+          "pct": 12.3
+        },
+        {
+          "name": "translate",
+          "state": "done",
+          "wall_s": 4.93,
+          "build_s": 0.01,
+          "rtf": 0.687,
+          "pct": 12.7
+        },
+        {
+          "name": "tts",
+          "state": "done",
+          "wall_s": 19.23,
+          "build_s": 6.02,
+          "rtf": 2.677,
+          "pct": 49.6
+        },
+        {
+          "name": "mux",
+          "state": "done",
+          "wall_s": 0.28,
+          "build_s": 0.0,
+          "rtf": 0.04,
+          "pct": 0.7
+        },
+        {
+          "name": "output",
+          "state": "done",
+          "wall_s": 0.28,
+          "build_s": 0.0,
+          "rtf": 0.039,
+          "pct": 0.7
+        }
+      ],
+      "sentence_count": 2,
+      "tts": {
+        "count": 2,
+        "total_s": 13.21,
+        "mean_s": 6.606,
+        "median_s": 6.606,
+        "p90_s": 8.438,
+        "max_s": 8.438,
+        "audio_s": 10.6,
+        "tts_rtf": 1.246,
+        "engine": "higgs_v3_q8",
+        "sentences": 2,
+        "overflows": 0
+      },
+      "translate": {
+        "count": 2,
+        "total_s": 4.92,
+        "mean_ms": 2460.8,
+        "median_ms": 2460.8,
+        "p90_ms": 3432.3,
+        "max_ms": 3432.3
+      },
+      "models": {
+        "ingest": "ffmpeg",
+        "separate": "htdemucs_mlx_vocals",
+        "diarize": "sortformer_mlx",
+        "emotion": "emotion2vec_plus_base",
+        "asr": "whisper_large_v3_mlx_fp16",
+        "translate": "openrouter_gemini_flash",
+        "tts": "higgs_v3_mlx_q8",
+        "mux": "ffmpeg_pad_stretch",
+        "output": "mkv_default"
+      },
+      "sections": null,
+      "notes": {}
+    },
+    {
+      "clip": "samples/clip-en-test.mkv",
+      "mode": "batch",
+      "label": "en-batch",
+      "repeat_index": 1,
+      "job_id": "20260620-180006-clip-en-test",
+      "source_s": 7.18,
+      "total_wall_s": 28.08,
+      "agg_rtf": 3.909,
+      "stages": [
+        {
+          "name": "ingest",
+          "state": "done",
+          "wall_s": 0.1,
+          "build_s": 0.0,
+          "rtf": 0.013,
+          "pct": 0.3
+        },
+        {
+          "name": "separate",
+          "state": "done",
+          "wall_s": 0.85,
+          "build_s": 0.08,
+          "rtf": 0.119,
+          "pct": 3.0
+        },
+        {
+          "name": "diarize",
+          "state": "done",
+          "wall_s": 2.21,
+          "build_s": 2.09,
+          "rtf": 0.307,
+          "pct": 7.9
+        },
+        {
+          "name": "emotion",
+          "state": "done",
+          "wall_s": 2.36,
+          "build_s": 2.23,
+          "rtf": 0.329,
+          "pct": 8.4
+        },
+        {
+          "name": "asr",
+          "state": "done",
+          "wall_s": 3.21,
+          "build_s": 0.0,
+          "rtf": 0.447,
+          "pct": 11.4
+        },
+        {
+          "name": "translate",
+          "state": "done",
+          "wall_s": 2.42,
+          "build_s": 0.0,
+          "rtf": 0.337,
+          "pct": 8.6
+        },
+        {
+          "name": "tts",
+          "state": "done",
+          "wall_s": 16.4,
+          "build_s": 4.89,
+          "rtf": 2.284,
+          "pct": 58.4
+        },
+        {
+          "name": "mux",
+          "state": "done",
+          "wall_s": 0.25,
+          "build_s": 0.0,
+          "rtf": 0.035,
+          "pct": 0.9
+        },
+        {
+          "name": "output",
+          "state": "done",
+          "wall_s": 0.28,
+          "build_s": 0.0,
+          "rtf": 0.039,
+          "pct": 1.0
+        }
+      ],
+      "sentence_count": 2,
+      "tts": {
+        "count": 2,
+        "total_s": 11.51,
+        "mean_s": 5.756,
+        "median_s": 5.756,
+        "p90_s": 6.568,
+        "max_s": 6.568,
+        "audio_s": 9.64,
+        "tts_rtf": 1.194,
+        "engine": "higgs_v3_q8",
+        "sentences": 2,
+        "overflows": 0
+      },
+      "translate": {
+        "count": 2,
+        "total_s": 2.41,
+        "mean_ms": 1207.2,
+        "median_ms": 1207.2,
+        "p90_ms": 1311.8,
+        "max_ms": 1311.8
+      },
+      "models": {
+        "ingest": "ffmpeg",
+        "separate": "htdemucs_mlx_vocals",
+        "diarize": "sortformer_mlx",
+        "emotion": "emotion2vec_plus_base",
+        "asr": "whisper_large_v3_mlx_fp16",
+        "translate": "openrouter_gemini_flash",
+        "tts": "higgs_v3_mlx_q8",
+        "mux": "ffmpeg_pad_stretch",
+        "output": "mkv_default"
+      },
+      "sections": null,
+      "notes": {}
+    }
+  ]
+}

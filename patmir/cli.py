@@ -58,6 +58,21 @@ def main(argv: list[str] | None = None) -> int:
     p_ui.add_argument("--runs-root", type=Path, default=RUNS_ROOT)
     p_ui.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
 
+    p_bench = sub.add_parser(
+        "bench",
+        help="Benchmark the pipeline: per-stage wall + RTF for a clip.",
+    )
+    p_bench.add_argument("clip", type=Path)
+    p_bench.add_argument("--mode", choices=["batch", "watch-along"], default="batch")
+    p_bench.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    p_bench.add_argument("--repeat", type=int, default=1,
+                         help="Run N times; first run is cold, rest are warm.")
+    p_bench.add_argument("--max-sections", type=int, default=None,
+                         help="watch-along only: cap the number of sections processed.")
+    p_bench.add_argument("--report", type=Path, default=None,
+                         help="Write machine-readable bench.json to this path.")
+    p_bench.add_argument("--label", type=str, default=None)
+
     p_submit = sub.add_parser(
         "submit",
         help="POST a file or URL to the local Patmir server. Server must be running (patmir ui).",
@@ -79,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_runs_show(args.job_id)
     if args.cmd == "ui":
         return cmd_ui(args.port, args.runs_root, args.config)
+    if args.cmd == "bench":
+        return cmd_bench(args)
     if args.cmd == "submit":
         return cmd_submit(args)
     parser.print_help()
@@ -178,6 +195,37 @@ def cmd_ui(port: int, runs_root: Path, config: Path) -> int:
     print(f"  token:   {token}  (paste into the Chrome extension options page)",
           file=sys.stderr)
     serve(port=port, runs_root=runs_root, cfg=cfg, token=token, config_path=config)
+    return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    if not args.clip.exists():
+        print(f"error: {args.clip} not found", file=sys.stderr)
+        return 2
+    from patmir import bench as benchmod
+
+    RUNS_ROOT.mkdir(exist_ok=True)
+    print(f"patmir bench {args.clip} (mode={args.mode}, repeat={args.repeat})",
+          file=sys.stderr)
+    if args.mode == "batch":
+        cfg = load_pipeline_config(args.config)
+        results = benchmod.bench_batch(
+            args.clip, cfg, runs_root=RUNS_ROOT,
+            repeat=args.repeat, label=args.label,
+        )
+    else:
+        results = benchmod.bench_watch_along(
+            args.clip, args.config, runs_root=RUNS_ROOT,
+            repeat=args.repeat, max_sections=args.max_sections, label=args.label,
+        )
+
+    print(benchmod.format_report(results))
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(
+            json.dumps(benchmod.to_json(results), indent=2, ensure_ascii=False)
+        )
+        print(f"\nwrote {args.report}", file=sys.stderr)
     return 0
 
 
