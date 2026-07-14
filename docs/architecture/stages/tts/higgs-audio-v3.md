@@ -86,6 +86,30 @@ codec_id = "bosonai/higgs-audio-v2-tokenizer"
 quant = "q8"; temperature = 0.8; top_p = 0.95; seed = 0; max_retries = 2; codec_device = "mps"
 ```
 
+## mlx-audio native runtime A/B (2026-07-14 — the ADR's revisit trigger fired)
+
+mlx-audio merged a native `higgs_audio_v3` runtime (PR #770, 2026-06-05,
+closing #766): fully-MLX codec (no torch bridge), inline control tokens,
+zero-shot cloning via `ref_audio`/`ref_text`. Measured against our hybrid port
+on 8 EA sentences with the same masha ref clip (`runs/20260714-higgs-ab/`):
+
+| engine | internal RTF | note |
+| --- | --- | --- |
+| ours-q8 (hybrid port) | 1.052 | baseline |
+| native-q8 (bf16 load + LM-only `nn.quantize` 8-bit/g64) | 1.018 | parity |
+| **native-q4** (same, 4-bit) | **0.744** | **−29%, no collapse** — comparable audio lengths (slightly longer/slower-paced) |
+
+- Our port's q4 collapsed (ADR 2026-06-20); **mlx-audio's runtime at q4 does
+  not** — likely the LM-only quant predicate (codec/codebooks excluded; naive
+  full-model quantize breaks the codec's VQ math — reproduced).
+- The community `Reza2kn/Higgs-Audio-v3-TTS-4bit-MLX` repo does **not** load in
+  mlx-audio's runtime (different weight layout, `backbone.*` naming) — quantize
+  in-memory from `bosonai/higgs-audio-v3-tts-4b` instead.
+- **Pending author ear-test** of `runs/20260714-higgs-ab/{ours-q8,native-q8,native-q4}/*.wav`
+  before any swap. If native-q4 passes, watch-along TTS RTF drops ~30% and
+  memory ~2 GB; adoption = new candidate wrapping `mlx_audio.tts` load +
+  in-memory q4 + our overflow guardrails.
+
 ## Open items / notes
 
 - **Per-speaker prefix-KV caching** — each sentence re-prefills the cloned ref's

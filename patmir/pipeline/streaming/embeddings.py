@@ -32,10 +32,13 @@ _MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 _SAVEDIR = Path.home() / ".patmir" / "models" / "ecapa"
 
 # Per-backend cosine thresholds for SpeakerRegistry.resolve. ECAPA's 0.12 was
-# calibrated 2026-06-13 on Demucs-separated movie speech. ReDimNet's was
-# calibrated 2026-07-14 the same way (see the calibration note in
-# decisions/2026-07-14-watchalong-voice-consistency-and-warm-loop.md).
-_THRESHOLDS = {"ecapa": 0.12, "redimnet": 0.30}
+# calibrated 2026-06-13 on Demucs-separated movie speech. ReDimNet's 0.02 is
+# the midpoint from a 2026-07-14 calibration on masha bench ref clips —
+# where BOTH backends' same/different distributions overlapped (per-clip
+# matching on short separated emotional cartoon clips is marginal, period;
+# see ADR 2026-07-14-watchalong-voice-consistency-and-warm-loop). ECAPA stays
+# the default; redimnet is experimental pending a larger labeled pair set.
+_THRESHOLDS = {"ecapa": 0.12, "redimnet": 0.02}
 
 
 def backend() -> str:

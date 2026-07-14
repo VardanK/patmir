@@ -84,6 +84,29 @@ voices — had *code-level* causes, not model-quality causes:
   remapped transcript ids (`spk0__sad`), per-section cloning summary resets.
 - `patmir bench --mode watch-along` before/after in performance.md.
 
+## P2 measurements (same review, 2026-07-14)
+
+- **ASR (watch-along speed lever):** `Qwen3-ASR-1.7B-8bit` (mlx-audio) = RTF
+  **0.05** vs Whisper large-v3's 0.40 (≈8×) at near-Whisper quality on masha
+  slices — degraded only on the singing section; needs `language="ru"`
+  explicitly + a forced-align pass for word timing. `Voxtral Mini 4B Realtime
+  4bit` = quality ≈ Whisper but RTF 0.64 (slower than Whisper; rejected for
+  the section architecture; also requires 16 kHz mono input). Details:
+  `stages/asr/qwen3-asr-mlx.md`, `stages/asr/voxtral-mini-realtime.md`.
+- **TTS runtime:** mlx-audio native Higgs runtime measured — native-q8 ≈
+  parity with our port; **native-q4 = RTF 0.744 (−29%) without our port's q4
+  collapse**. Ear-test material at `runs/20260714-higgs-ab/`. Details:
+  `stages/tts/higgs-audio-v3.md`.
+- **Speaker embeddings:** ReDimNet-b2 (ptn + ft_lm) calibrated against ECAPA
+  on the bench ref clips — **both backends' same/different-speaker cosine
+  distributions overlap** on short Demucs-separated emotional cartoon clips
+  (ECAPA: min-same +0.088 < max-diff +0.143; ReDimNet: −0.075 < +0.112).
+  Per-clip matching is marginal regardless of model → the locked-ref +
+  multi-embedding + RMS-gate fixes are the load-bearing mitigations. ECAPA
+  stays default; `PATMIR_EMBED_BACKEND=redimnet` is an experimental flag
+  (threshold 0.02). A proper cast-list pass needs a larger labeled pair set —
+  follow-up spec.
+
 ## Revisit
 
 - If resident-set memory grows past ~20 GB (bigger models), make the

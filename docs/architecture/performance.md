@@ -238,7 +238,9 @@ Ranked by measured ROI (expected RTF win × confidence ÷ effort). **No fixes ar
 implemented in this spec** — each becomes its own follow-up. Re-measure each with
 `patmir bench` against the baselines above.
 
-### 1. Batch translate → batched/concurrent  ·  quick win, near-zero effort
+### 1. Batch translate → batched/concurrent  ·  ✅ LANDED 2026-07-14
+(per-sentence loop now concurrent via `translate_concurrency=6` on the
+OpenRouter candidate — byte-identical output, no ear-test needed)
 - **Hypothesis:** batch translate is serial (40–63s, 12–15% of batch wall, mean
   ~1.05s/round-trip). The concurrent `openrouter_gemini_flash_batch` candidate
   *already exists* and is used by watch-along.
@@ -249,7 +251,9 @@ implemented in this spec** — each becomes its own follow-up. Re-measure each w
   confirm batch-mode quality parity. Cloud rate limits.
 - **Becomes:** a small config/A-B spec.
 
-### 2. Watch-along warm-model loop  ·  high ROI for D3
+### 2. Watch-along warm-model loop  ·  ✅ LANDED 2026-07-14
+(`run_job(stage_cache=)`; rebuild tax 13.1% → 3.4%; masha agg RTF 1.94–2.31 →
+1.47 cold — see re-measure above)
 - **Hypothesis:** `process_section` calls `run_job` twice and rebuilds every stage
   model each call → measured **11–13% of watch-along wall** (66–80s / 5 min).
 - **Expected win:** reclaim most of the rebuild tax; watch-along RTF −0.2 to −0.3.
@@ -261,7 +265,12 @@ implemented in this spec** — each becomes its own follow-up. Re-measure each w
   multiple stage models stay resident.
 - **Becomes:** its own spec (runner refactor).
 
-### 3. ASR speed in watch-along (Nemotron, content-gated)  ·  biggest D3 stage
+### 3. ASR speed in watch-along  ·  biggest remaining D3 lever — candidate changed 2026-07-14
+**Update 2026-07-14:** `Qwen3-ASR-1.7B-8bit` (mlx-audio) supersedes Nemotron as
+the speed candidate: RTF **0.05** vs Whisper 0.40, near-Whisper quality on
+masha (only the singing section degraded; none of Nemotron's garbling).
+Voxtral Mini Realtime rejected (RTF 0.64 > Whisper). Adoption needs word-level
+timing via `qwen3_forced_aligner` + an ear-test. See `stages/asr/qwen3-asr-mlx.md`.
 - **Hypothesis:** watch-along does **not** override asr → runs Whisper large-v3
   per section (**23–34% of D3 wall**); `nemotron_mlx` is ~6× faster.
 - **Expected win:** masha D3 ASR 175s → ~30s; watch-along RTF −0.4 to −0.5 — the
@@ -274,7 +283,12 @@ implemented in this spec** — each becomes its own follow-up. Re-measure each w
   class before defaulting.
 - **Becomes:** a spec with an ear-test gate (possibly per-content ASR selection).
 
-### 4. TTS per-speaker prefix-KV caching  ·  highest ceiling, highest effort
+### 4. TTS per-speaker prefix-KV caching / native runtime  ·  measured 2026-07-14
+**Update 2026-07-14:** mlx-audio's native Higgs v3 runtime measured (the ADR
+revisit trigger): native-q8 ≈ parity with our port (RTF 1.018 vs 1.052);
+**native-q4 = 0.744 (−29%) without our port's q4 collapse**. If the ear-test
+passes (`runs/20260714-higgs-ab/`), adopting native-q4 beats hand-rolling
+prefix-KV caching. See `stages/tts/higgs-audio-v3.md`.
 - **Hypothesis:** TTS is **37–52% of every run** — the largest single stage.
   Each sentence builds a *fresh* KV cache and re-embeds the speaker ref
   (`higgs_v3_mlx.py` `_generate_once` ~L256, `_encode_ref` ~L299). Reusing the
@@ -287,7 +301,9 @@ implemented in this spec** — each becomes its own follow-up. Re-measure each w
   follow-up (ADR 2026-06-20).
 - **Becomes:** its own spec (TTS-internal optimization).
 
-### 5. Watch-along: stop re-analyzing the pad overlap  ·  modest, low effort
+### 5. Watch-along: stop re-analyzing the pad overlap  ·  ✅ LANDED 2026-07-14
+(sections now VAD-snap into the pad up to `slice_len − END_GUARD_SECONDS`;
+12 sections vs 13 on masha)
 - **Hypothesis:** each section re-separates/re-ASRs an 8s pad that the next
   section also analyzes (dubbed audio 314.7s > 300s on masha ≈ overlap waste).
 - **Expected win:** ~5–10% of D3 analysis (separate + asr); RTF −0.05 to −0.15.
