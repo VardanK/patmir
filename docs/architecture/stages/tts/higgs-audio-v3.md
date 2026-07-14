@@ -105,10 +105,12 @@ on 8 EA sentences with the same masha ref clip (`runs/20260714-higgs-ab/`):
 - The community `Reza2kn/Higgs-Audio-v3-TTS-4bit-MLX` repo does **not** load in
   mlx-audio's runtime (different weight layout, `backbone.*` naming) — quantize
   in-memory from `bosonai/higgs-audio-v3-tts-4b` instead.
-- **Pending author ear-test** of `runs/20260714-higgs-ab/{ours-q8,native-q8,native-q4}/*.wav`
-  before any swap. If native-q4 passes, watch-along TTS RTF drops ~30% and
-  memory ~2 GB; adoption = new candidate wrapping `mlx_audio.tts` load +
-  in-memory q4 + our overflow guardrails.
+- **Author ear-test 2026-07-14: native-q4 REJECTED** (worst of the three —
+  faster but audibly degraded; "no collapse" ≠ good quality). **ours-q8 ranked
+  best** and is the engine already active (`higgs_v3_mlx_q8`) → **no swap**.
+  native-q8 was only parity, so the native runtime brings no benefit at equal
+  quality. Our hybrid port stays; the remaining TTS speed lever is per-speaker
+  prefix-KV caching (roadmap #4).
 
 ## Open items / notes
 

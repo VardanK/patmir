@@ -18,7 +18,7 @@ class ASRStage(Protocol):
 
 - **[whisper-mlx-large-v3](whisper-mlx-large-v3.md)** — **active** (since 2026-06-19; the only local engine clean on fast cartoon RU).
 - **[nemotron-mlx](nemotron-mlx.md)** — registered fast alternate (garbles fast cartoon dialogue; fine for slower/clearer speech).
-- **[qwen3-asr-mlx](qwen3-asr-mlx.md)** — 2026-07-14 eval: ~8× faster than Whisper (RTF 0.05) at near-Whisper quality on masha except singing sections; the leading watch-along speed candidate, adoption pending forced-alignment integration + ear-test.
+- **[qwen3-asr-mlx](qwen3-asr-mlx.md)** — 2026-07-14 eval: ~8× faster than Whisper (RTF 0.05) but **author-rejected on quality** (transcripts read as nonsense to a native speaker). Whisper stays.
 - **[voxtral-mini-realtime](voxtral-mini-realtime.md)** — evaluated 2026-07-14, not adopted (quality ≈ Whisper but RTF 0.64 — slower than Whisper in our batch-over-slices architecture).
 - **[faster-whisper](faster-whisper.md)** — registered as a deferred fallback (CTranslate2 int8).
 - **[qwen3-asr-mlx](qwen3-asr-mlx.md)** — experimental; alt-architecture ASR.

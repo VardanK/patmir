@@ -86,17 +86,18 @@ voices — had *code-level* causes, not model-quality causes:
 
 ## P2 measurements (same review, 2026-07-14)
 
-- **ASR (watch-along speed lever):** `Qwen3-ASR-1.7B-8bit` (mlx-audio) = RTF
-  **0.05** vs Whisper large-v3's 0.40 (≈8×) at near-Whisper quality on masha
-  slices — degraded only on the singing section; needs `language="ru"`
-  explicitly + a forced-align pass for word timing. `Voxtral Mini 4B Realtime
-  4bit` = quality ≈ Whisper but RTF 0.64 (slower than Whisper; rejected for
-  the section architecture; also requires 16 kHz mono input). Details:
+- **ASR (watch-along speed lever): both candidates rejected.**
+  `Qwen3-ASR-1.7B-8bit` = RTF **0.05** vs Whisper's 0.40 (≈8×) but
+  **author-rejected on quality 2026-07-14** (transcripts read as nonsense to a
+  native speaker). `Voxtral Mini 4B Realtime 4bit` = quality ≈ Whisper but RTF
+  0.64 (slower than Whisper for section slices; 16 kHz-mono-only input).
+  **Whisper large-v3 stays for both modes.** Details:
   `stages/asr/qwen3-asr-mlx.md`, `stages/asr/voxtral-mini-realtime.md`.
-- **TTS runtime:** mlx-audio native Higgs runtime measured — native-q8 ≈
-  parity with our port; **native-q4 = RTF 0.744 (−29%) without our port's q4
-  collapse**. Ear-test material at `runs/20260714-higgs-ab/`. Details:
-  `stages/tts/higgs-audio-v3.md`.
+- **TTS runtime: no swap.** mlx-audio native Higgs runtime measured — native-q8
+  ≈ parity with our port; native-q4 = RTF 0.744 (−29%) without collapse, but
+  the **author ear-test 2026-07-14 rejected native-q4 (worst of three) and
+  ranked ours-q8 (the active engine) best**. Prefix-KV caching on our port is
+  again the TTS speed lever. Details: `stages/tts/higgs-audio-v3.md`.
 - **Speaker embeddings:** ReDimNet-b2 (ptn + ft_lm) calibrated against ECAPA
   on the bench ref clips — **both backends' same/different-speaker cosine
   distributions overlap** on short Demucs-separated emotional cartoon clips

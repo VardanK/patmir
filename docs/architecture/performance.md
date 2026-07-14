@@ -265,12 +265,13 @@ OpenRouter candidate — byte-identical output, no ear-test needed)
   multiple stage models stay resident.
 - **Becomes:** its own spec (runner refactor).
 
-### 3. ASR speed in watch-along  ·  biggest remaining D3 lever — candidate changed 2026-07-14
-**Update 2026-07-14:** `Qwen3-ASR-1.7B-8bit` (mlx-audio) supersedes Nemotron as
-the speed candidate: RTF **0.05** vs Whisper 0.40, near-Whisper quality on
-masha (only the singing section degraded; none of Nemotron's garbling).
-Voxtral Mini Realtime rejected (RTF 0.64 > Whisper). Adoption needs word-level
-timing via `qwen3_forced_aligner` + an ear-test. See `stages/asr/qwen3-asr-mlx.md`.
+### 3. ASR speed in watch-along  ·  no viable candidate as of 2026-07-14
+**Update 2026-07-14:** all three fast candidates are out — Nemotron (garbles
+fast cartoon RU, 2026-06-19), `Qwen3-ASR-1.7B-8bit` (RTF 0.05 but
+**author-rejected on quality**: transcripts read as nonsense to a native
+speaker), Voxtral Mini Realtime (quality ok, RTF 0.64 — slower than Whisper).
+**Whisper large-v3 stays**; ASR speed reopens only with a new checkpoint + a
+masha ear-test. See `stages/asr/qwen3-asr-mlx.md`, `stages/asr/voxtral-mini-realtime.md`.
 - **Hypothesis:** watch-along does **not** override asr → runs Whisper large-v3
   per section (**23–34% of D3 wall**); `nemotron_mlx` is ~6× faster.
 - **Expected win:** masha D3 ASR 175s → ~30s; watch-along RTF −0.4 to −0.5 — the
@@ -283,12 +284,13 @@ timing via `qwen3_forced_aligner` + an ear-test. See `stages/asr/qwen3-asr-mlx.m
   class before defaulting.
 - **Becomes:** a spec with an ear-test gate (possibly per-content ASR selection).
 
-### 4. TTS per-speaker prefix-KV caching / native runtime  ·  measured 2026-07-14
+### 4. TTS per-speaker prefix-KV caching  ·  back to highest ceiling, highest effort
 **Update 2026-07-14:** mlx-audio's native Higgs v3 runtime measured (the ADR
 revisit trigger): native-q8 ≈ parity with our port (RTF 1.018 vs 1.052);
-**native-q4 = 0.744 (−29%) without our port's q4 collapse**. If the ear-test
-passes (`runs/20260714-higgs-ab/`), adopting native-q4 beats hand-rolling
-prefix-KV caching. See `stages/tts/higgs-audio-v3.md`.
+native-q4 = 0.744 (−29%) without collapse — but the **author ear-test rejected
+native-q4 (worst of three) and ranked ours-q8 best**, so no runtime swap.
+Prefix-KV caching on our port is again the only real TTS speed lever.
+See `stages/tts/higgs-audio-v3.md`.
 - **Hypothesis:** TTS is **37–52% of every run** — the largest single stage.
   Each sentence builds a *fresh* KV cache and re-embeds the speaker ref
   (`higgs_v3_mlx.py` `_generate_once` ~L256, `_encode_ref` ~L299). Reusing the
