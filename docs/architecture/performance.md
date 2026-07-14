@@ -265,13 +265,17 @@ OpenRouter candidate — byte-identical output, no ear-test needed)
   multiple stage models stay resident.
 - **Becomes:** its own spec (runner refactor).
 
-### 3. ASR speed in watch-along  ·  no viable candidate as of 2026-07-14
-**Update 2026-07-14:** all three fast candidates are out — Nemotron (garbles
-fast cartoon RU, 2026-06-19), `Qwen3-ASR-1.7B-8bit` (RTF 0.05 but
-**author-rejected on quality**: transcripts read as nonsense to a native
-speaker), Voxtral Mini Realtime (quality ok, RTF 0.64 — slower than Whisper).
-**Whisper large-v3 stays**; ASR speed reopens only with a new checkpoint + a
-masha ear-test. See `stages/asr/qwen3-asr-mlx.md`, `stages/asr/voxtral-mini-realtime.md`.
+### 3. ASR speed in watch-along  ·  flipped to Qwen3 2026-07-14; speed edge ~3% in-pipeline
+**Update 2026-07-15:** author revised 2026-07-14 — "both Whisper and Qwen
+garble sometimes → pick the fastest" → `[pipeline].asr =
+qwen3_asr_1_7b_mlx_8bit`. In-pipeline Reacher A/B (watch-along, warm loop):
+qwen3 asr 118.7s / agg **2.10** vs whisper 136.3s / agg **2.16** — the
+standalone 8× is eaten by the ForcedAligner pass (Whisper's word timestamps
+are native). Qwen3 also chunks 3.5× coarser (29 vs 104 sentences / 5 min).
+Recovery ideas if Qwen3 stays: split chunks at aligner word gaps; drop the
+aligner in watch-along (sentence timing may suffice) → restores most of the
+8×. Ear-test pending: `runs/20260715-reacher-asr-ab/`. Voxtral + Nemotron
+remain rejected. See `stages/asr/qwen3-asr-mlx.md`.
 - **Hypothesis:** watch-along does **not** override asr → runs Whisper large-v3
   per section (**23–34% of D3 wall**); `nemotron_mlx` is ~6× faster.
 - **Expected win:** masha D3 ASR 175s → ~30s; watch-along RTF −0.4 to −0.5 — the
@@ -325,10 +329,15 @@ See `stages/tts/higgs-audio-v3.md`.
 
 ## Reproducing
 
+**Default clip is Reacher (2026-07-14, author decision):** masha is a
+cartoonish edge case (fast squeaky voices, singing, SFX) — bench and ear-test
+on `samples/Reacher-S02E01-5min.mkv` (live-action RU dub, representative
+content) first; keep masha as the cartoon stress test.
+
 ```
-patmir bench samples/masha-2-5min.mkv        --mode batch       --repeat 2
-patmir bench samples/masha-2-5min.mkv        --mode watch-along --repeat 2
-patmir bench samples/Fallout-S02E01-5min.mkv --mode batch       --repeat 2
+patmir bench samples/Reacher-S02E01-5min.mkv --mode batch       --repeat 2
+patmir bench samples/Reacher-S02E01-5min.mkv --mode watch-along --repeat 2
+patmir bench samples/masha-2-5min.mkv        --mode watch-along --repeat 1   # cartoon stress test
 patmir bench samples/Fallout-S02E01-5min.mkv --mode watch-along --repeat 1
 ```
 
