@@ -80,7 +80,6 @@ class HiggsV3MLX:
         import mlx.nn as nn
         from mlx_lm.models import qwen3
         from huggingface_hub import hf_hub_download, snapshot_download
-        from transformers import AutoTokenizer
         import json
 
         self._mx = mx
@@ -105,7 +104,10 @@ class HiggsV3MLX:
             tie_word_embeddings=True,
         )
         model = qwen3.Qwen3Model(args)
-        snap = snapshot_download(repo_id, allow_patterns=["*.safetensors", "config.json"])
+        snap = snapshot_download(
+            repo_id,
+            allow_patterns=["*.safetensors", "config.json", "tokenizer*.json", "chat_template.jinja"],
+        )
         all_w = mx.load(os.path.join(snap, "model.safetensors"))
         qw, w_audio = self._remap(all_w)
         model.load_weights(list(qw.items()), strict=True)
@@ -116,7 +118,17 @@ class HiggsV3MLX:
         self.model = model
         self.w_audio = w_audio.astype(mx.bfloat16)
 
-        self.tok = AutoTokenizer.from_pretrained(repo_id)
+        # Load the CONCRETE tokenizer class from the local snapshot, never
+        # AutoTokenizer on the repo id: AutoTokenizer resolves the repo's
+        # custom *config* class first, which (a) prompts interactively for
+        # trust_remote_code when the repo revision changes — derailing headless
+        # runs — and (b) with funasr/modelscope imported (emotion stage),
+        # modelscope's hf_util patcher hijacks the dynamic-module fetch and
+        # tries to re-download the whole repo from ModelScope (the slow-mirror
+        # trap, ADR 2026-05-26-prefer-fast-model-mirrors). The tokenizer itself
+        # is a plain Qwen2Tokenizer (tokenizer_config.json, no auto_map).
+        from transformers import Qwen2TokenizerFast
+        self.tok = Qwen2TokenizerFast.from_pretrained(snap)
         self._codec = None
         self._ref_cache: dict[str, Any] = {}
         self._summary: dict[str, Any] = {"engine": f"higgs_v3_{quant}", "sentences": 0, "overflows": 0}
