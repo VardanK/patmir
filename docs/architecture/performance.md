@@ -288,13 +288,24 @@ remain rejected. See `stages/asr/qwen3-asr-mlx.md`.
   class before defaulting.
 - **Becomes:** a spec with an ear-test gate (possibly per-content ASR selection).
 
-### 4. TTS per-speaker prefix-KV caching  ·  back to highest ceiling, highest effort
+### 4. TTS per-speaker prefix-KV caching  ·  measured ceiling: −14% of TTS time
 **Update 2026-07-14:** mlx-audio's native Higgs v3 runtime measured (the ADR
 revisit trigger): native-q8 ≈ parity with our port (RTF 1.018 vs 1.052);
 native-q4 = 0.744 (−29%) without collapse — but the **author ear-test rejected
 native-q4 (worst of three) and ranked ours-q8 best**, so no runtime swap.
-Prefix-KV caching on our port is again the only real TTS speed lever.
-See `stages/tts/higgs-audio-v3.md`.
+
+**Update 2026-07-15 — prefill/decode split measured** (8 sentences, real
+Reacher ref, q8 warm; `runs/20260715-reacher-asr-ab/higgs_prefill_split.json`):
+decode loop **73.1%**, prefill 21.5%, torch codec decode 5.0%. Direct
+cached-prefix experiment (prefix KV built once, suffix-only prefill per
+sentence): **saving = 14.3% of TTS time** (per-sentence prefill 0.55–0.65s →
+0.13–0.34s; the 120-token speaker prefix dominates the ~150-token prompt).
+So KV caching ≈ TTS RTF 0.99 → ~0.85 on Reacher, agg ~2.10 → ~1.95 — worth
+doing (moderate effort, quality-neutral by construction) but NOT the realtime
+unlock: **decode is the wall (73%)** and it's memory-bandwidth-bound with
+quantization already at the ear-approved limit (q8). Realtime on dense
+content = pre-buffer, or a decode-level idea (speculative/multi-token
+decoding — research-grade).
 - **Hypothesis:** TTS is **37–52% of every run** — the largest single stage.
   Each sentence builds a *fresh* KV cache and re-embeds the speaker ref
   (`higgs_v3_mlx.py` `_generate_once` ~L256, `_encode_ref` ~L299). Reusing the

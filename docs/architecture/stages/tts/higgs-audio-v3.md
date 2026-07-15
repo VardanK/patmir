@@ -115,8 +115,10 @@ on 8 EA sentences with the same masha ref clip (`runs/20260714-higgs-ab/`):
 ## Open items / notes
 
 - **Per-speaker prefix-KV caching** — each sentence re-prefills the cloned ref's
-  tokens; caching that KV per speaker would cut short-line overhead and likely
-  bring watch-along under realtime. Not done.
+  tokens; caching that KV per speaker cuts prefill. **Measured 2026-07-15:**
+  saving = **14.3% of TTS time** (direct cached-prefix experiment; decode is
+  73% and is the real wall). Does NOT bring watch-along under realtime on its
+  own. Data: `runs/20260715-reacher-asr-ab/higgs_prefill_split.json`. Not done.
 - Optional Higgs **"scene description" system prompt** (`<|scene_desc_start|>…`)
   — our `generate_speech`-style path doesn't expose it; possible quality lever.
 - License **research/non-commercial** (fine for this personal tool). MLX →
