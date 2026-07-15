@@ -991,7 +991,11 @@ forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
 aligner_dtype   = "bfloat16"
 
 # Higher-precision bf16 variant of Qwen3-ASR-1.7B. ~3.4 GB resident (vs
-# 2.3 GB at 8-bit). Reduces CJK hallucinations on cartoon sound effects
+# 2.3 GB at 8-bit). MEASURED 2026-07-15 (Reacher + masha slices, same runtime
+# + aligner): transcripts character-identical to 8-bit, 2-4x slower (RTF
+# 0.32-0.56 vs 0.10-0.15) -> no reason to use; errors are model-level, not
+# quantization. runs/20260715-reacher-asr-ab/qwen_prec_{8bit,bf16}.json.
+# Original hope was it reduces CJK hallucinations on cartoon sound effects
 # at the cost of more memory.
 [[stages.asr.candidates]]
 id              = "qwen3_asr_1_7b_mlx_bf16"

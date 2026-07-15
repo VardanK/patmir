@@ -13,6 +13,7 @@
   - Transcript quality on Reacher (live-action RU dub) reads clean — proper names intact, no masha-style mangling.
   - Ear-test material: `runs/20260715-reacher-asr-ab/{reacher-dub-qwen3.wav,reacher-dub-whisper.wav,transcripts.md}`.
   - **Flipped active 2026-07-14** (`[pipeline].asr = qwen3_asr_1_7b_mlx_8bit`) per author decision "both garble sometimes → pick the fastest"; note the speed premise weakened to ~3% in-pipeline. Whisper stays registered — one-line revert.
+- **2026-07-15 precision A/B (8bit vs bf16, same slices, same runtime+aligner):** transcripts **character-for-character identical** on Reacher (3 slices) and masha (singing section) — same phrasing, same minor errors ("парашюток", "все планах чертам"). bf16 is 2–4× slower (RTF 0.32–0.56 vs 0.10–0.15) and +1.1 GB. **8-bit is strictly better; quality errors are model-level (1.7B), not quantization.** Data: `runs/20260715-reacher-asr-ab/qwen_prec_{8bit,bf16}.json`. If quality must improve, the lever is a bigger checkpoint (no Qwen3-ASR >1.7B exists on mlx-community as of 2026-07-15), not precision.
 - **Notes:**
   - If Qwen3 is kept: candidate follow-ups = split run-on chunks at aligner word gaps (recover sentence granularity), and consider skipping the aligner in watch-along (sentence-level timing may suffice for mux ducks) which would restore most of the 8×.
   - Not part of the Phase 2 verification path.
