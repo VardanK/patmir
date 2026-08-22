@@ -1,11 +1,14 @@
 # Pipeline performance — baseline + roadmap
 
-Last updated: 2026-06-20 (spec `2026-06-20-1656-pipeline-benchmark-perf`)
+Last updated: 2026-08-23 (Reacher re-baseline on the current active set)
 
-> **Status: baseline measured.** Full matrix complete (masha + Fallout ×
-> batch + watch-along, + English batch). All numbers below are measured via
-> `patmir bench` on 32 GB Apple Silicon, models warm + `HF_HUB_OFFLINE=1`.
-> This spec measures + plans only; the roadmap items are not yet implemented.
+> **Status: re-baselined.** The **Reacher** rows are the live numbers — measured
+> on the current active set (`qwen3_asr_1_7b_mlx_8bit` + `higgs_v3_mlx_q8`) on
+> 32 GB Apple Silicon (M1 Pro), models warm + `HF_HUB_OFFLINE=1`. The masha and
+> Fallout rows are **historical**: they were measured on
+> `whisper_large_v3_mlx_fp16`, so their ASR/TTS split no longer reflects reality.
+> Stored reports:
+> `agent-os/specs/2026-06-20-1656-pipeline-benchmark-perf/results/reacher-{batch,watch}.json`.
 
 ## How these numbers are produced
 
@@ -33,6 +36,45 @@ Hardware: 32 GB Apple Silicon, MLX/MPS. Active models per
 > reads agg RTF **1.74** while two warm repeats read **0.89 / 0.92** with an
 > *identical* per-sentence rate (`tts_rtf ~1.37`). **Warm steady-state is the
 > real baseline; batch already clears realtime.** Numbers below are warm.
+
+### Reacher-S02E01-5min.mkv — English, dialogue-dense live action (canonical clip, 2026-08-23)
+
+`source 301.1s · wall 352.2s · agg RTF 1.17 (warm) · 25 sentences`
+(cold first run: wall 390.7s · RTF 1.298)
+
+First Reacher baseline. Measured on the current active set — `qwen3_asr_1_7b_mlx_8bit` +
+`higgs_v3_mlx_q8` — so it supersedes the masha/Fallout rows below, which were measured on
+`whisper_large_v3_mlx_fp16`.
+
+| stage     | wall (s) | build (s) | rtf   | % of wall |
+| --------- | -------: | --------: | ----: | --------: |
+| ingest    |     0.30 |      0.00 | 0.001 |      0.1% |
+| separate  |    37.70 |      0.10 | 0.125 |     10.7% |
+| diarize   |     7.50 |      0.20 | 0.025 |      2.1% |
+| emotion   |     7.70 |      2.00 | 0.026 |      2.2% |
+| asr       |    38.01 |      0.80 | 0.126 |     10.8% |
+| translate |     6.80 |      0.00 | 0.022 |      1.9% |
+| **tts**   |   244.45 |      3.02 | 0.812 |  **69.4%**|
+| mux       |     3.80 |      0.00 | 0.013 |      1.1% |
+| output    |     5.90 |      0.00 | 0.020 |      1.7% |
+
+- **TTS is no longer one bottleneck among several — it is the bottleneck, at 69.4%.**
+  The share nearly doubled (37–42% on the Whisper-era clips) because the Qwen3 ASR flip
+  removed ASR as a competitor, not because TTS got slower.
+- **ASR collapsed to 10.8%** (38.0s) from Whisper's 29% — the single clearest win of the
+  2026-07-14 flip, and larger in-pipeline than the ~3% the A/B predicted.
+- **`tts_rtf` = 1.136** — synth is slower than realtime *per spoken second* (241.4s of
+  compute for 212.4s of audio). Reacher is ~70% speech, so the stage lands at 0.81 RTF of
+  the video. This is the hard floor: no software change on this machine makes batch clear
+  realtime while `tts_rtf > 1`.
+- **Per-sentence TTS variance is extreme:** median 6.35s but p90 21.4s and max 30.4s
+  (mean 9.65s). Qwen3 chunks ~3.5× coarser than Whisper — 25 sentences per 5 minutes vs
+  ~104 — so each sentence carries ~8.7s of audio and the long ones dominate. Total decode
+  cost is roughly linear in output tokens, so splitting chunks would not cut total TTS
+  time much, but it would flatten the tail — and a 30s sentence is a direct watch-along
+  buffer risk. **0 overflows / 25.**
+- **translate concurrency confirmed working:** 25 calls totalling 37.0s of serial latency
+  complete in 6.8s of stage wall (5.4×). Roadmap #1 is delivering; translate is now 1.9%.
 
 ### masha-2-5min.mkv — Russian, fast cartoon dialogue (canonical clip)
 
@@ -112,6 +154,35 @@ Each section runs `run_job` **twice** (analysis ingest→asr, then dub
 translate→mux) — **since 2026-07-14 with a shared warm-model `stage_cache`**
 (models built once per stream; see the re-measure below). The pre-2026-07-14
 baselines below rebuilt every stage model on both calls.
+
+### Reacher-S02E01-5min.mkv — 2026-08-23 (current active set)
+
+`source 301.1s · dubbed audio 301.0s · wall 514.6s · agg RTF 1.71 · 10 sections`
+
+| stage     | wall (s) | rtf   | % of wall |
+| --------- | -------: | ----: | --------: |
+| ingest    |     1.80 | 0.006 |      0.4% |
+| separate  |    54.90 | 0.183 |     11.6% |
+| diarize   |    19.00 | 0.063 |      4.0% |
+| emotion   |    16.00 | 0.053 |      3.4% |
+| asr       |    82.15 | 0.273 |     17.4% |
+| translate |    25.30 | 0.084 |      5.3% |
+| **tts**   |   269.49 | 0.895 |  **57.0%**|
+| mux       |     4.00 | 0.013 |      0.8% |
+
+- **Rebuild tax is down to 2.1%** (10.8s of 514.6s), from the 11–13% measured pre-07-14.
+  Roadmap #2 (warm-model loop) is confirmed landed and effective.
+- **Dubbed audio 301.0s == source 301.1s**, so the pad is no longer analyzed twice.
+  Roadmap #5 confirmed landed (masha previously read 314.7s dubbed over 300s source).
+- **Section pipelining is now the largest remaining software win.** The analysis half
+  (ingest+separate+diarize+emotion+asr) is 0.578 RTF; the dub half (translate+tts+mux) is
+  0.992 RTF. They run strictly sequentially today, so the two sum to 1.71. Overlapping them
+  caps the result at `max(0.578, 0.992)` ≈ **0.99 RTF — a 42% cut** if they parallelize
+  cleanly. They contend for one GPU, so the real gain is smaller, but the cloud-translate
+  wait (25.3s) and the CPU-only ECAPA/remap work overlap for free.
+- **ASR is 17.4% here vs 10.8% in batch** because each section re-runs ASR on its own
+  padded slice. The ForcedAligner (a second 0.6B encode+forward per chunk) is the
+  droppable part — worth ~5–6% of wall, not the ~29% it would have been under Whisper.
 
 ### masha-2-5min.mkv — re-measure 2026-07-14 (warm-model loop + pad-dubbing + P0 fixes)
 
@@ -201,6 +272,8 @@ Full matrix (all warm except the noted cold first-run):
 
 | run | RTF | TTS | ASR | rebuild | note |
 | --- | --: | --: | --: | ------: | ---- |
+| **Reacher batch** (dense, ~70% speech, qwen3+higgs) | **1.17** | **69%** | **11%** | – | current active set |
+| **Reacher watch-along** (qwen3+higgs) | **1.71** | 57% | 17% | 2.1% | current active set |
 | masha batch (sparse, 23% speech)   | **0.89** | 37% | 29% | – | clears realtime |
 | Fallout batch (dense, 55% speech)  | **1.36–1.66** | 42% | 29% | – | dense → >realtime |
 | masha watch-along (2026-07-14, warm loop) | **1.47 (cold)** | 32% | 29% | 3.4% | roadmap #2/#5 landed |
@@ -209,6 +282,13 @@ Full matrix (all warm except the noted cold first-run):
 | en batch (7s)                      | 3.9–5.4 | – | – | – | fixed-cost floor only |
 
 **Findings:**
+
+0. **Superseded by the 2026-08-23 Reacher baseline (findings 1/4/5 below are historical).**
+   On the current active set, **TTS alone is 69% of batch wall and ASR is 11%** — they are
+   no longer co-bottlenecks. The Qwen3 flip removed ASR as a competitor, which means
+   essentially all remaining batch headroom is in TTS, and TTS is memory-bandwidth-bound
+   (`tts_rtf` 1.136 at the ear-approved q8, and q4 was ear-rejected). The rebuild tax
+   (finding 4) is down to 2.1% and the pad double-analysis (finding 5) is gone.
 
 1. **TTS and ASR are the two universal bottlenecks** — together 55–75% of *every*
    run. Both scale with the amount of speech, so they dominate regardless of mode.
@@ -228,7 +308,7 @@ Full matrix (all warm except the noted cold first-run):
 7. **Cold-start is real for one-shot batch:** first-ever Higgs use costs ~240s of
    model-fetch + MLX Metal-kernel JIT compilation (one-time per process).
 
-**Realtime gaps to close:** batch-dense ≈ 0.4–0.7 RTF; watch-along ≈ 1.0 RTF.
+**Realtime gaps to close (2026-08-23, Reacher):** batch **0.17 RTF**; watch-along **0.71 RTF**. Section pipelining is the largest remaining software lever (watch-along ceiling ≈ 0.99). Neither gap closes on this machine while `tts_rtf > 1` — the Higgs q8 decode runs at ~154 GB/s effective, 77% of the M1 Pro's 200 GB/s peak, so it is bandwidth-saturated rather than inefficient.
 
 ---
 
@@ -265,7 +345,11 @@ OpenRouter candidate — byte-identical output, no ear-test needed)
   multiple stage models stay resident.
 - **Becomes:** its own spec (runner refactor).
 
-### 3. ASR speed in watch-along  ·  flipped to Qwen3 2026-07-14; speed edge ~3% in-pipeline
+### 3. ASR speed  ·  ✅ LANDED 2026-07-14 — far bigger than the A/B predicted
+
+**2026-08-23 update:** the Reacher baseline shows ASR at **10.8% of batch wall (38.0s)**, down from Whisper's 29%. The standalone A/B predicted only ~3% in-pipeline; the real win was much larger. Cost: chunking is ~3.5× coarser (25 sentences per 5 min vs ~104), which pushes TTS per-sentence p90 to 21.4s and max to 30.4s. Splitting chunks at word gaps would flatten that tail — a watch-along buffer concern, not a total-throughput one.
+
+#### Original entry
 **Update 2026-07-15:** author revised 2026-07-14 — "both Whisper and Qwen
 garble sometimes → pick the fastest" → `[pipeline].asr =
 qwen3_asr_1_7b_mlx_8bit`. In-pipeline Reacher A/B (watch-along, warm loop):
@@ -288,7 +372,11 @@ remain rejected. See `stages/asr/qwen3-asr-mlx.md`.
   class before defaulting.
 - **Becomes:** a spec with an ear-test gate (possibly per-content ASR selection).
 
-### 4. TTS per-speaker prefix-KV caching  ·  measured ceiling: −14% of TTS time
+### 4. TTS per-speaker prefix-KV caching  ·  ❌ DROPPED 2026-08-23
+
+Measured ceiling was −14% of TTS time on the MLX port. Dropped because the CUDA move deletes `eval/candidates/tts/higgs_v3_mlx.py` for the upstream PyTorch implementation, which supplies bf16, flash-attention and batched decode across sentences — strictly more than the prefix-KV win, with no hand-maintained runtime to carry. Do not tune code that is being removed. Original measurement retained below.
+
+#### Original entry  ·  measured ceiling: −14% of TTS time
 **Update 2026-07-14:** mlx-audio's native Higgs v3 runtime measured (the ADR
 revisit trigger): native-q8 ≈ parity with our port (RTF 1.018 vs 1.052);
 native-q4 = 0.744 (−29%) without collapse — but the **author ear-test rejected
