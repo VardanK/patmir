@@ -27,6 +27,7 @@ from starlette.requests import Request
 from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.manifest import Manifest
+from patmir.pipeline.runner import prewarm_stage_cache
 from patmir.pipeline.stage import STAGE_ORDER
 from patmir.ui import auth, cache as cache_mod
 from patmir.ui.jobs import JobManager, JobSpec
@@ -55,8 +56,14 @@ def _create_app(
     storage = replace(storage, runs_root=runs_root, cache_root=cache_root)
 
     require_token = auth.TokenAuth(token)
-    manager = JobManager(cfg, storage=storage)
-    streamer = StreamManager(config_path, jobs=manager, storage=storage)
+    # One warm-model cache for the whole process, shared by batch jobs and
+    # streams. Keyed (stage, candidate_id) so the streaming overrides cannot
+    # collide with the batch config. Without this every submission rebuilt every
+    # stage inside the same long-lived server process.
+    stage_cache: dict = {}
+    manager = JobManager(cfg, storage=storage, stage_cache=stage_cache)
+    streamer = StreamManager(config_path, jobs=manager, storage=storage,
+                             stage_cache=stage_cache)
 
     app.add_middleware(
         CORSMiddleware,
@@ -70,6 +77,16 @@ def _create_app(
     @app.on_event("startup")
     async def _startup() -> None:
         await manager.start()
+        # Build the models now rather than making the first submission wait for
+        # them (plus, on MLX, the one-time ~240s Metal-kernel JIT). Off the event
+        # loop so the server starts serving immediately.
+        if cfg.options.prewarm_stages:
+            built = await asyncio.to_thread(prewarm_stage_cache, cfg, stage_cache)
+            if built:
+                print(f"[prewarm] {len(built)} stages in "
+                      f"{sum(built.values()):.1f}s: "
+                      + ", ".join(f"{k} {v:.1f}s" for k, v in built.items()),
+                      flush=True)
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:

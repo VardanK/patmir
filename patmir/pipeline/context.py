@@ -106,6 +106,12 @@ class PipelineOptions:
     # -audio, but fewer characters are seen up front (later ones register on the
     # fly mid-stream). 40s balances first-audio latency against cast coverage.
     prelude_window_seconds: float = 40.0
+    # Build every active stage once when the local server starts, instead of
+    # letting the first real submission pay model load (plus, on MLX, the
+    # one-time ~240s Metal-kernel JIT). Costs the full resident set up front —
+    # ~10 GB with the current models — so set False on a memory-constrained box
+    # or when the server is started just to browse finished runs.
+    prewarm_stages: bool = True
     # OmniVoice guidance_scale per emotion bin. The TTS adapter looks this
     # up per sentence and passes it to the inner candidate as a per-call
     # override of the constructor default.

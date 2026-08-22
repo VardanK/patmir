@@ -106,8 +106,15 @@ class StreamManager:
         *,
         jobs: JobManager,
         storage: StoragePaths,
+        stage_cache: dict | None = None,
     ) -> None:
         self._config_path = config_path
+        # Warm-model cache shared with JobManager and owned by the app. It used
+        # to be a local in `_run_blocking`, so every model was rebuilt when a
+        # new stream started; hoisting it here keeps them resident. Keys are
+        # (stage, candidate_id), so sharing with the batch config is safe even
+        # where the streaming overrides select a different candidate.
+        self._stage_cache = stage_cache
         self._jobs = jobs            # delegate: source resolution + URL download
         self._storage = storage
         self._runs_root = storage.runs_root
@@ -302,10 +309,12 @@ class StreamManager:
         else:
             rec.sections_done = len(prior.get("sections", []))
 
-        # One warm-model cache for the whole stream (prelude + every section):
-        # each stage model is built once and reused, killing the measured
-        # 11-13% per-section rebuild tax (performance.md roadmap #2).
-        stage_cache: dict = {}
+        # Warm-model cache: each stage model is built once and reused, killing
+        # the measured 11-13% per-section rebuild tax (performance.md roadmap
+        # #2). Shared app-wide when the server provided one, so it also survives
+        # across streams and is shared with batch jobs; falls back to a
+        # stream-local dict when constructed without one.
+        stage_cache: dict = self._stage_cache if self._stage_cache is not None else {}
 
         # 1) Prelude — establish the cast + voices + embeddings. Window size is
         # a config knob (smaller → faster first audio, fewer characters up front).

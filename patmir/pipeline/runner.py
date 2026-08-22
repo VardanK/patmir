@@ -39,6 +39,56 @@ def _make_job_dir(source: Path, runs_root: Path) -> tuple[Path, str]:
     raise RuntimeError(f"Could not create a unique job dir under {runs_root} for {base_id}.")
 
 
+def stage_cache_key(cfg: PipelineConfig, name: str) -> tuple[str, str]:
+    """Warm-model cache key: `(stage, candidate_id)`.
+
+    Keying on the stage name alone is not safe once one cache is shared between
+    configs. `streaming_config()` overrides some stages (e.g. `separate` →
+    `htdemucs_mlx_fast`), so batch and watch-along can select different
+    candidates for the same stage — under a name-only key one mode would
+    silently receive the other's model.
+    """
+    entry = cfg.entries.get(name) or {}
+    return (name, str(entry.get("id", name)))
+
+
+def prewarm_stage_cache(
+    cfg: PipelineConfig,
+    stage_cache: dict[Any, Any],
+    *,
+    stages: list[str] | None = None,
+) -> dict[str, float]:
+    """Build every active stage into `stage_cache` up front.
+
+    Called from the server's startup hook so the first real submission doesn't
+    pay model load — plus, on MLX, the one-time ~240s Metal-kernel JIT that
+    otherwise lands inside the first job's TTS stage.
+
+    Best-effort per stage: a stage that fails to build (missing API key, absent
+    model) is skipped with its error recorded rather than taking the server down
+    — the normal JIT build path will surface the same failure on first use.
+
+    Returns `{stage: build_seconds}` for the stages it built (a stage already in
+    the cache is skipped and omitted).
+    """
+    built: dict[str, float] = {}
+    for name in (stages if stages is not None else list(STAGE_ORDER)):
+        if name not in cfg.entries:
+            continue
+        key = stage_cache_key(cfg, name)
+        if key in stage_cache:
+            continue
+        t0 = time.time()
+        try:
+            stage_cache[key] = cfg.build_stage(name)
+        except Exception as exc:  # noqa: BLE001 — startup must not die here
+            print(f"[prewarm] {name} skipped: {type(exc).__name__}: {exc}", flush=True)
+            continue
+        built[name] = time.time() - t0
+    _free_accelerator_cache()
+    return built
+
+
 def run_job(
     source: Path,
     cfg: PipelineConfig,
@@ -71,8 +121,11 @@ def run_job(
     (performance.md roadmap #2). Batch runs leave it None and keep the default
     one-model-resident-at-a-time behavior; with a cache, ALL stage models stay
     resident (~9 GB with the current active set — fine on 32 GB, watch this if
-    models grow). `_free_accelerator_cache` still runs between stages either
-    way (it drops scratch allocations, not the cached weights)."""
+    models grow). Entries are keyed on `(stage, candidate_id)`, not stage name
+    alone, so a cache shared between configs that select different candidates
+    for the same stage (batch vs the watch-along overrides) can never hand back
+    the wrong model. `_free_accelerator_cache` runs only when a stage was
+    actually built — on a hit there is no build scratch to reclaim."""
     runs_root = runs_root or cfg.storage.runs_root
 
     if resume_job_dir is not None:
@@ -128,15 +181,17 @@ def run_job(
         # attribute it — it's the per-section rebuild cost in watch-along.
         # With a caller-owned `stage_cache` the instance is kept warm instead
         # (build_s = 0 on hits), trading memory for the rebuild tax.
-        if stage_cache is not None and name in stage_cache:
-            stage_obj = stage_cache[name]
+        key = stage_cache_key(cfg, name)
+        cache_hit = stage_cache is not None and key in stage_cache
+        if cache_hit:
+            stage_obj = stage_cache[key]
             st.build_s = 0.0
         else:
             _build_t0 = time.time()
             stage_obj = cfg.build_stage(name)
             st.build_s = time.time() - _build_t0
             if stage_cache is not None:
-                stage_cache[name] = stage_obj
+                stage_cache[key] = stage_obj
         try:
             output = _run_stage(name, stage_obj, state, ctx)
             state[name] = output
@@ -158,7 +213,12 @@ def run_job(
             raise
         finally:
             stage_obj = None  # noqa — drop reference
-            _free_accelerator_cache()
+            # Only reclaim scratch when we actually built something. On a cache
+            # hit there is no build scratch to drop, and running it anyway threw
+            # away the allocator pool the next stage immediately re-requested —
+            # 9 times per section in watch-along.
+            if not cache_hit:
+                _free_accelerator_cache()
 
         if stop_after and name == stop_after:
             break

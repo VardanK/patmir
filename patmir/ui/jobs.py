@@ -107,8 +107,13 @@ class JobManager:
         cfg: PipelineConfig,
         *,
         storage: StoragePaths,
+        stage_cache: dict | None = None,
     ) -> None:
         self._cfg = cfg
+        # Warm-model cache shared with StreamManager and owned by the app, so
+        # models survive across submissions instead of being rebuilt per job.
+        # None keeps the old build-per-job behavior (used by the tests).
+        self._stage_cache = stage_cache
         self._storage = storage
         self._runs_root = storage.runs_root
         self._cache_root = storage.cache_root
@@ -339,6 +344,7 @@ class JobManager:
             runs_root=self._runs_root,
             source_lang=rec.source_lang,
             on_job_dir_created=_on_job_dir,
+            stage_cache=self._stage_cache,
         )
         rec.run_job_id = manifest.job_id
         # Keep download state in stage_states post-success.
