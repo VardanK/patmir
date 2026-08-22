@@ -9,6 +9,10 @@ Human-facing navigation. The agent loads the always-loaded tier automatically vi
 - **[decisions.md](decisions.md)** — index of every locked decision
 - **[quality-issues.md](quality-issues.md)** — live tracker of observed problems
 
+## Setup
+
+- **[../setup/windows-wsl2-cuda.md](../setup/windows-wsl2-cuda.md)** — running the pipeline on the NVIDIA workstation via WSL2 + CUDA
+
 ## On-demand tier (read when working in that area)
 
 - **[data-contracts.md](data-contracts.md)** — every dataclass from `stage.py`, fields + meanings
