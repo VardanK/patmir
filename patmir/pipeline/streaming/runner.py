@@ -29,15 +29,6 @@ from patmir.pipeline.streaming.section import (
 def streaming_config(config_path: Path) -> PipelineConfig:
     """Build the watch-along pipeline config. Overrides vs the active pipeline:
 
-      - tts → `higgs_v3_mlx_q8_fast`: Higgs Audio v3 (4B) MLX-q8 + voice cloning,
-        with `max_retries=1` to bound per-section latency. Switched off
-        `omnivoice_mlx_bf16_fast` 2026-06-20 for engine consistency with batch
-        (ADR 2026-06-20-higgs-v3-tts-mlx-q8). NOTE: Higgs q8 agg RTF ~1.10 (>
-        OmniVoice-16's 0.91) does NOT clear realtime per-section on its own —
-        watch-along leans on the pre-buffer / section pipelining; per-speaker
-        prefix-KV caching is the follow-up to get it comfortably under realtime.
-        Flip back to `omnivoice_mlx_bf16_fast` here to revert. (OmniVoice replaced
-        `elevenlabs_pool` 2026-06-15; ElevenLabs credits exhausted.)
       - translate → `openrouter_gemini_flash_batch`: translates the section's
         sentences in one batched call instead of one round-trip each — cuts the
         opening's translate time and keeps character voice coherent per scene.
@@ -46,15 +37,26 @@ def streaming_config(config_path: Path) -> PipelineConfig:
         faster than the `htdemucs_ft` 4-model bag (which was ~34s/section, the
         throughput wall). Slightly more bleed, fine for watch-along.
 
-    asr + diarize are NOT overridden here — they inherit the [pipeline]
-    defaults (whisper_large_v3_mlx_fp16 + sortformer_mlx as of 2026-06-19; a
-    faster streaming-ASR override is roadmap item #3 in performance.md). All
-    overrides shrink per-section time so the stream keeps ahead of playback.
-    See ADRs 2026-06-13-near-realtime-d3-spike and
+    tts, asr and diarize are NOT overridden — they inherit the [pipeline]
+    defaults (`higgs_v3_mlx_q8` + `qwen3_asr_1_7b_mlx_8bit` + `sortformer_mlx`).
+
+    **tts override dropped 2026-08-23.** It used to point at
+    `higgs_v3_mlx_q8_fast`, whose *only* difference from `higgs_v3_mlx_q8` was
+    `max_retries=1` vs 2 — same repo, quant, temperature, top_p and seed. So it
+    was never a faster model: a sentence that generates cleanly costs exactly
+    the same under both, and the cap only bounded the worst case when the
+    non-termination guardrail reseeds (measured 0 overflows / 25 on Reacher,
+    0/37 masha, 0/60 Fallout). Sharing one candidate id with batch lets a single
+    4B instance serve both modes from the warm-model cache instead of two —
+    which matters on a 24 GB discrete GPU, where two would not fit. If
+    overflows ever show up in watch-along, tune `max_retries` on the shared
+    candidate rather than reintroducing a second one.
+
+    All remaining overrides shrink per-section time so the stream keeps ahead of
+    playback. See ADRs 2026-06-13-near-realtime-d3-spike and
     2026-06-15-local-asr-diarize-via-mlx-audio."""
     return load_pipeline_config(config_path, overrides={
         "separate": "htdemucs_mlx_fast",
-        "tts": "higgs_v3_mlx_q8_fast",
         "translate": "openrouter_gemini_flash_batch",
     })
 

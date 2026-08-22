@@ -1,8 +1,10 @@
 # Higgs Audio v3 TTS (4B) — `higgs_v3_mlx_q8`
 
-**Status:** ACTIVE — batch (`higgs_v3_mlx_q8`) **and** watch-along
-(`higgs_v3_mlx_q8_fast`, `max_retries=1`), locked 2026-06-20. ADR:
+**Status:** ACTIVE — `higgs_v3_mlx_q8` for **both** batch and watch-along, locked
+2026-06-20, unified 2026-08-23. ADR:
 `decisions/2026-06-20-higgs-v3-tts-mlx-q8.md`.
+
+**Unified 2026-08-23:** watch-along dropped its `higgs_v3_mlx_q8_fast` override and now shares `higgs_v3_mlx_q8` with batch. The two differed *only* in `max_retries` (1 vs 2) — identical repo, quant, temperature, top_p and seed — so `_fast` was never a faster model: a cleanly-generating sentence cost the same under both, and the cap only bounded the reseed path of the non-termination guardrail (measured 0 overflows / 25 Reacher, 0/37 masha, 0/60 Fallout). One candidate id means one 4B instance serves both modes from the warm-model cache instead of two, which is required on a 24 GB discrete GPU. Tune `max_retries` on the shared candidate if overflows appear.
 
 Model: `bosonai/higgs-audio-v3-tts-4b` (4B chat-native TTS, June 2026), loaded
 via the transformers `trust_remote_code` port
@@ -45,9 +47,11 @@ Decode per-step: torch-bf16 **69 ms** → MLX-bf16 **48** → **MLX-q8 28**. Qua
 is the only lever (decode is bandwidth-bound; torch micro-opt + `torch.compile`
 measured 0% — they don't reduce bytes/token). Aggregate RTF (wall/audio, same
 sentences + clean ref): **Higgs q8 1.10** vs OmniVoice-32 **1.69** (batch win),
-vs OmniVoice-16 **0.91**. Long-line q8 RTF 0.92. Watch-along uses
-`higgs_v3_mlx_q8_fast` (same q8, `max_retries=1`) despite the RTF gap — it leans
-on the pre-buffer; prefix-KV caching is the follow-up to clear realtime there.
+vs OmniVoice-16 **0.91**. Long-line q8 RTF 0.92. Watch-along runs the same
+`higgs_v3_mlx_q8` (see the unification note above) and leans on the pre-buffer.
+Prefix-KV caching was the intended follow-up but was **dropped 2026-08-23** — the
+CUDA move deletes this MLX port for the upstream PyTorch implementation, which
+brings bf16, flash-attention and batched decode instead.
 
 - **q4 rejected** — collapses (runaway / no EOC); matches "Higgs is quant-sensitive".
 - **bf16** = cross-platform fallback (~1.9 RTF, 2.5× slower).

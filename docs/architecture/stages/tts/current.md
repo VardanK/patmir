@@ -1,10 +1,10 @@
 # Active tts config
 
-**Batch (default):** `higgs_v3_mlx_q8` — Higgs Audio v3 (4B) via our MLX-q8 port +
-PyTorch codec. **Watch-along:** `higgs_v3_mlx_q8_fast` (same q8, `max_retries=1`;
-`streaming/runner.py` override) — switched off `omnivoice_mlx_bf16_fast` 2026-06-20
-for engine consistency (RTF ~1.10 leans on the pre-buffer; OmniVoice-16 stays as
-the registered watch-along fallback). Full Higgs write-up → `higgs-audio-v3.md`;
+**Batch and watch-along (both):** `higgs_v3_mlx_q8` — Higgs Audio v3 (4B) via our
+MLX-q8 port + PyTorch codec. Switched off `omnivoice_mlx_bf16_fast` 2026-06-20 for
+engine consistency (OmniVoice-16 stays as the registered watch-along fallback).
+
+**Unified 2026-08-23:** watch-along dropped its `higgs_v3_mlx_q8_fast` override and now shares `higgs_v3_mlx_q8` with batch. The two differed *only* in `max_retries` (1 vs 2) — identical repo, quant, temperature, top_p and seed — so `_fast` was never a faster model: a cleanly-generating sentence cost the same under both, and the cap only bounded the reseed path of the non-termination guardrail (measured 0 overflows / 25 Reacher, 0/37 masha, 0/60 Fallout). One candidate id means one 4B instance serves both modes from the warm-model cache instead of two, which is required on a 24 GB discrete GPU. Tune `max_retries` on the shared candidate if overflows appear. Full Higgs write-up → `higgs-audio-v3.md`;
 ADR → `decisions/2026-06-20-higgs-v3-tts-mlx-q8.md`.
 
 ```toml
