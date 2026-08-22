@@ -162,6 +162,32 @@ Phase 2.x will add `emotion: Emotion | None = None`.
 | `video`      | `Path`         | `out.mkv`                |
 | `subtitles`  | `Path \| None` | `out.hy.srt`             |
 
+## Config contracts
+
+### `StoragePaths` (`patmir/paths.py`)
+
+Resolved filesystem roots, built from the `[storage]` table and carried on
+`PipelineConfig.storage`. Every field is absolute; relative values in the TOML resolve
+against the config file's directory, and `~` is expanded. Unknown keys under `[storage]`
+raise. ADR: `decisions/2026-08-01-configurable-storage-roots.md`.
+
+| Field / property | Type           | Default                | Meaning                                                       |
+| ---------------- | -------------- | ---------------------- | ------------------------------------------------------------- |
+| `runs_root`      | `Path`         | `<config_dir>/runs`    | Working dir — one subdir per job, all intermediates            |
+| `cache_root`     | `Path`         | `~/.patmir/cache`      | Finished dubs keyed by (source, config); what the extension plays |
+| `downloads_root` | `Path`         | `~/.patmir/downloads`  | yt-dlp downloads for URL submissions                          |
+| `state_root`     | `Path`         | `~/.patmir`            | Local server's bearer token + job index                       |
+| `library_root`   | `Path \| None` | `None`                 | When set, finished deliverables are copied to `library_root/<job_id>/`; `None` = don't publish |
+| `jobs_index`     | `Path` (prop)  | `state_root/jobs.json` | Derived                                                       |
+| `secret_path`    | `Path` (prop)  | `state_root/secret`    | Derived                                                       |
+
+`PipelineConfig` gained a `storage: StoragePaths` field alongside `entries` and `options`.
+It is **excluded from the cache key** — `ui.cache.config_hash` hashes only `entries` — so
+relocating a root never orphans an existing dub.
+
+`Manifest` gained `published_dir: str | None` — the destination the deliverables were
+copied to, or `None` when publishing was skipped or failed.
+
 ## Stage protocols
 
 `@runtime_checkable Protocol` — see `patmir/pipeline/stage.py:159+`.

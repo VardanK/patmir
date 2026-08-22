@@ -36,6 +36,9 @@ class Manifest:
     source_lang: str | None = None
     created_at: float = field(default_factory=time.time)
     stages: dict[str, StageStatus] = field(default_factory=dict)
+    # Where the finished deliverables were copied, when [storage].library_root
+    # is configured (see patmir.pipeline.publish). None = not published.
+    published_dir: str | None = None
 
     def __post_init__(self) -> None:
         # Always ensure every stage in STAGE_ORDER has an entry. This keeps
@@ -53,6 +56,7 @@ class Manifest:
             "source_path": self.source_path,
             "source_lang": self.source_lang,
             "created_at": self.created_at,
+            "published_dir": self.published_dir,
             "stages": {k: asdict(v) for k, v in self.stages.items()},
         }
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -67,4 +71,5 @@ class Manifest:
             source_lang=data.get("source_lang"),
             created_at=data.get("created_at", time.time()),
             stages=stages,
+            published_dir=data.get("published_dir"),
         )

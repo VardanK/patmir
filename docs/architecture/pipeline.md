@@ -15,9 +15,35 @@ Order is defined in `stage.py:STAGE_ORDER`. Resume-from-stage is supported via `
 Two entry points feed the same pipeline:
 
 - **Local file path** (CLI: `patmir dub <video>`, or `patmir submit <video>` to the local server) — the `ffmpeg` ingest candidate reads PCM from the file directly.
-- **URL** (Chrome extension or `patmir submit --url <URL>`) — the local FastAPI server (`patmir ui`) pre-downloads with yt-dlp to `~/.patmir/downloads/<cache_key>/source.<ext>` and then runs the same `ffmpeg` ingest candidate on the downloaded file. A dedicated `yt_dlp` ingest candidate is on the roadmap (slice 3 of the D1 spec) so the URL doesn't have to be fully downloaded before the pipeline starts.
+- **URL** (Chrome extension or `patmir submit --url <URL>`) — the local FastAPI server (`patmir ui`) pre-downloads with yt-dlp to `<downloads_root>/<cache_key>/source.<ext>` and then runs the same `ffmpeg` ingest candidate on the downloaded file. A dedicated `yt_dlp` ingest candidate is on the roadmap (slice 3 of the D1 spec) so the URL doesn't have to be fully downloaded before the pipeline starts.
 
-Successful runs are materialized into a global cache at `~/.patmir/cache/<key>/dub.wav` keyed by source + pipeline-config hash; subsequent submissions of the same URL/file under the same config return instantly. See `decisions/2026-05-27-low-friction-translation-d1.md`.
+Successful runs are materialized into a global cache at `<cache_root>/<key>/dub.wav` keyed by source + pipeline-config hash; subsequent submissions of the same URL/file under the same config return instantly. See `decisions/2026-05-27-low-friction-translation-d1.md`.
+
+## Storage roots
+
+Every path above is a **default**, not a constant. All roots come from the `[storage]` table in `patmir.toml`, resolved by `patmir/paths.py` into a `StoragePaths` carried on `PipelineConfig.storage`. Relative paths resolve against the config file's directory (not the CWD). ADR: `decisions/2026-08-01-configurable-storage-roots.md`.
+
+| Root | Default | Holds |
+| --- | --- | --- |
+| `runs_root` | `<config_dir>/runs` | working dir, one subdir per job, all intermediates |
+| `cache_root` | `~/.patmir/cache` | finished dubs keyed by (source, config); what the extension plays |
+| `downloads_root` | `~/.patmir/downloads` | yt-dlp downloads for URL submissions |
+| `state_root` | `~/.patmir` | local server's bearer token + job index |
+| `library_root` | unset | when set, each finished run's deliverables are copied here |
+
+Storage does **not** contribute to the cache key, so relocating a root never orphans an existing dub. Keep `runs_root` and `state_root` on local disk — `runs/` is the live working dir (appended-and-seek-tailed progress log, non-atomic per-stage manifest rewrites, in-place ffmpeg/soundfile writes); `library_root` and `cache_root` are whole-file copies and are fine on a network share.
+
+## Publish (post-`output` runner step)
+
+When `[storage].library_root` is set, the runner copies the finished deliverables out of the job dir after the `output` stage returns:
+
+```
+library_root/<job_id>/out.mkv      final container (Armenian default audio)
+library_root/<job_id>/out.hy.srt   Armenian subtitles
+library_root/<job_id>/dub.wav      Armenian audio alone
+```
+
+Copy, not move — the job dir has to survive for `--resume-from` (which reads absolute paths out of the sidecar JSONs) and for `cache.materialize`. Each file is written as `.partial` and renamed inside the destination dir, so an interrupted transfer never leaves a truncated container behind. A publish failure is reported to the progress log and swallowed: the dub is already complete in the job dir. The destination lands in `manifest.published_dir`, surfaced by `patmir runs show`. See `patmir/pipeline/publish.py`.
 
 ## Data flow (ASCII)
 
@@ -140,7 +166,7 @@ StreamScheduler.run()              playhead-driven loop:
    │  └ process_section(start) → analyze→ECAPA identity-resolve against the
    │      registry→remap+trim transcript→translate→tts→mux → section chunk
    ▼
-append_section() → cache           each chunk written to ~/.patmir/cache/<key>/
+append_section() → cache           each chunk written to <cache_root>/<key>/
                                     section_NNN.wav + sections.json as it lands
 ```
 

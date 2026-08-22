@@ -17,16 +17,45 @@ import json
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from patmir.env import load_dotenv
+from patmir.paths import StoragePaths
 from patmir.pipeline.config import load_pipeline_config
 from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.runner import run_job
 from patmir.pipeline.stage import STAGE_ORDER
 
 DEFAULT_CONFIG = Path("patmir.toml")
-RUNS_ROOT = Path("runs")
+
+
+def _storage_for(config: Path) -> StoragePaths:
+    """Resolve just the storage roots, without requiring a full pipeline config.
+
+    `runs ls`, `runs show`, and `submit` don't build any stage — they only need
+    the roots. Before `[storage]` existed they ran with no `patmir.toml` at all,
+    so a missing config falls back to the defaults rather than failing. A config
+    that exists but is malformed still raises.
+    """
+    import tomllib
+
+    from patmir.paths import defaults, load_storage
+
+    if not config.is_file():
+        return defaults(config)
+    with config.open("rb") as f:
+        return load_storage(tomllib.load(f), config)
+
+
+def _require_config(config: Path) -> bool:
+    """Print a clean error (instead of a traceback) when the config is missing."""
+    if config.is_file():
+        return True
+    print(f"error: config not found: {config}", file=sys.stderr)
+    print("  pass --config <path> or run from the directory holding patmir.toml",
+          file=sys.stderr)
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -49,13 +78,17 @@ def main(argv: list[str] | None = None) -> int:
 
     p_runs = sub.add_parser("runs", help="Inspect prior runs.")
     p_runs_sub = p_runs.add_subparsers(dest="runs_cmd", required=True)
-    p_runs_sub.add_parser("ls", help="List runs under ./runs.")
+    # Both need --config to learn [storage].runs_root.
+    p_runs_ls = p_runs_sub.add_parser("ls", help="List runs under the configured runs root.")
+    p_runs_ls.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     p_show = p_runs_sub.add_parser("show", help="Show a run's manifest.")
     p_show.add_argument("job_id")
+    p_show.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
 
     p_ui = sub.add_parser("ui", help="Launch the local FastAPI progress UI.")
     p_ui.add_argument("--port", type=int, default=8765)
-    p_ui.add_argument("--runs-root", type=Path, default=RUNS_ROOT)
+    p_ui.add_argument("--runs-root", type=Path, default=None,
+                      help="Override [storage].runs_root for this server.")
     p_ui.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
 
     p_bench = sub.add_parser(
@@ -83,15 +116,17 @@ def main(argv: list[str] | None = None) -> int:
                           help="Video URL (e.g. YouTube). Cannot be combined with a file path.")
     p_submit.add_argument("--source-lang", type=str, default=None)
     p_submit.add_argument("--server", type=str, default="http://127.0.0.1:8765")
+    p_submit.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                          help="Read the bearer token from this config's [storage].state_root.")
 
     args = parser.parse_args(argv)
     if args.cmd == "dub":
         return cmd_dub(args)
     if args.cmd == "runs":
         if args.runs_cmd == "ls":
-            return cmd_runs_ls()
+            return cmd_runs_ls(args.config)
         if args.runs_cmd == "show":
-            return cmd_runs_show(args.job_id)
+            return cmd_runs_show(args.job_id, args.config)
     if args.cmd == "ui":
         return cmd_ui(args.port, args.runs_root, args.config)
     if args.cmd == "bench":
@@ -106,15 +141,18 @@ def cmd_dub(args: argparse.Namespace) -> int:
     if not args.video.exists():
         print(f"error: {args.video} not found", file=sys.stderr)
         return 2
+    if not _require_config(args.config):
+        return 2
     cfg = load_pipeline_config(args.config, skip_before=args.resume_from)
+    runs_root = cfg.storage.runs_root
 
     job_dir = args.resume_job
     progress_stop = threading.Event()
     progress_thread: threading.Thread | None = None
 
     if job_dir is None:
-        # Pre-create runs/ so the run_job mkdir doesn't fail.
-        RUNS_ROOT.mkdir(exist_ok=True)
+        # Pre-create the runs root so the run_job mkdir doesn't fail.
+        runs_root.mkdir(parents=True, exist_ok=True)
         # The runner makes the per-job dir; we tail progress.jsonl by polling
         # the runs/ root for the freshest dir after a moment.
         # Simpler: have the runner accept a callback to give us the job_dir as
@@ -124,6 +162,9 @@ def cmd_dub(args: argparse.Namespace) -> int:
 
     print(f"patmir dub {args.video}", file=sys.stderr)
     print(f"  config: {args.config}", file=sys.stderr)
+    print(f"  runs:   {runs_root}", file=sys.stderr)
+    if cfg.storage.library_root:
+        print(f"  library: {cfg.storage.library_root}", file=sys.stderr)
     if args.resume_from:
         print(f"  resume-from: {args.resume_from}", file=sys.stderr)
 
@@ -131,7 +172,7 @@ def cmd_dub(args: argparse.Namespace) -> int:
         manifest = run_job(
             args.video,
             cfg,
-            runs_root=RUNS_ROOT,
+            runs_root=runs_root,
             resume_job_dir=job_dir,
             resume_from=args.resume_from,
             source_lang=args.source_lang,
@@ -145,16 +186,17 @@ def cmd_dub(args: argparse.Namespace) -> int:
         if progress_thread:
             progress_thread.join(timeout=0.5)
 
-    _print_summary(manifest)
+    _print_summary(manifest, runs_root)
     return 0
 
 
-def cmd_runs_ls() -> int:
-    if not RUNS_ROOT.exists():
+def cmd_runs_ls(config: Path) -> int:
+    runs_root = _storage_for(config).runs_root
+    if not runs_root.exists():
         print("(no runs)")
         return 0
     rows = []
-    for child in sorted(RUNS_ROOT.iterdir(), reverse=True):
+    for child in sorted(runs_root.iterdir(), reverse=True):
         if not child.is_dir():
             continue
         manifest_path = child / "manifest.json"
@@ -170,8 +212,8 @@ def cmd_runs_ls() -> int:
     return 0
 
 
-def cmd_runs_show(job_id: str) -> int:
-    path = RUNS_ROOT / job_id / "manifest.json"
+def cmd_runs_show(job_id: str, config: Path) -> int:
+    path = _storage_for(config).runs_root / job_id / "manifest.json"
     if not path.exists():
         print(f"no manifest at {path}", file=sys.stderr)
         return 2
@@ -179,7 +221,9 @@ def cmd_runs_show(job_id: str) -> int:
     return 0
 
 
-def cmd_ui(port: int, runs_root: Path, config: Path) -> int:
+def cmd_ui(port: int, runs_root: Path | None, config: Path) -> int:
+    if not _require_config(config):
+        return 2
     try:
         from patmir.ui.app import serve
         from patmir.ui import auth as ui_auth
@@ -188,13 +232,19 @@ def cmd_ui(port: int, runs_root: Path, config: Path) -> int:
         print("  pip install -e '.[ui]'", file=sys.stderr)
         return 2
     cfg = load_pipeline_config(config)
-    token = ui_auth.ensure_token()
+    storage = cfg.storage
+    if runs_root is not None:
+        storage = replace(storage, runs_root=runs_root.expanduser().absolute())
+    token = ui_auth.ensure_token(storage.secret_path)
     print(f"patmir ui — bind 127.0.0.1:{port}", file=sys.stderr)
     print(f"  config:  {config}", file=sys.stderr)
-    print(f"  runs:    {runs_root}", file=sys.stderr)
+    print(f"  runs:    {storage.runs_root}", file=sys.stderr)
+    print(f"  cache:   {storage.cache_root}", file=sys.stderr)
+    if storage.library_root:
+        print(f"  library: {storage.library_root}", file=sys.stderr)
     print(f"  token:   {token}  (paste into the Chrome extension options page)",
           file=sys.stderr)
-    serve(port=port, runs_root=runs_root, cfg=cfg, token=token, config_path=config)
+    serve(port=port, storage=storage, cfg=cfg, token=token, config_path=config)
     return 0
 
 
@@ -202,20 +252,23 @@ def cmd_bench(args: argparse.Namespace) -> int:
     if not args.clip.exists():
         print(f"error: {args.clip} not found", file=sys.stderr)
         return 2
+    if not _require_config(args.config):
+        return 2
     from patmir import bench as benchmod
 
-    RUNS_ROOT.mkdir(exist_ok=True)
+    cfg = load_pipeline_config(args.config)
+    runs_root = cfg.storage.runs_root
+    runs_root.mkdir(parents=True, exist_ok=True)
     print(f"patmir bench {args.clip} (mode={args.mode}, repeat={args.repeat})",
           file=sys.stderr)
     if args.mode == "batch":
-        cfg = load_pipeline_config(args.config)
         results = benchmod.bench_batch(
-            args.clip, cfg, runs_root=RUNS_ROOT,
+            args.clip, cfg, runs_root=runs_root,
             repeat=args.repeat, label=args.label,
         )
     else:
         results = benchmod.bench_watch_along(
-            args.clip, args.config, runs_root=RUNS_ROOT,
+            args.clip, args.config, runs_root=runs_root,
             repeat=args.repeat, max_sections=args.max_sections, label=args.label,
         )
 
@@ -242,7 +295,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print(f"UI extra not installed: {exc}", file=sys.stderr)
         return 2
 
-    token = ui_auth.ensure_token()
+    token = ui_auth.ensure_token(_storage_for(args.config).secret_path)
     body: dict[str, str] = {}
     if args.video:
         path = args.video.expanduser().resolve()
@@ -275,7 +328,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_summary(m: Manifest) -> None:
+def _print_summary(m: Manifest, runs_root: Path) -> None:
     print()
     print(f"job: {m.job_id}")
     print(f"source: {m.source_path}  lang={m.source_lang}")
@@ -289,12 +342,14 @@ def _print_summary(m: Manifest) -> None:
         print(f"  {_state_glyph(st.state)} {name:<10} {dur}")
         for k, v in st.artifacts.items():
             print(f"        {k}: {v}")
-    _print_diarize_summary(m)
+    if m.published_dir:
+        print(f"published: {m.published_dir}")
+    _print_diarize_summary(m, runs_root)
 
 
-def _print_diarize_summary(m: Manifest) -> None:
+def _print_diarize_summary(m: Manifest, runs_root: Path) -> None:
     """Surface speaker count + per-(speaker, emotion) ref-clip coverage."""
-    job_dir = RUNS_ROOT / m.job_id
+    job_dir = runs_root / m.job_id
     turns_path = job_dir / "diarize" / "turns.json"
     refs_path = job_dir / "diarize" / "refs.json"
     if not turns_path.exists():

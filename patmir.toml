@@ -650,6 +650,34 @@ api_key_env     = "OPENROUTER_API_KEY"
 response_format = "mp3"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Storage roots.
+# ──────────────────────────────────────────────────────────────────────────────
+# Every key is optional; commented-out values are the defaults. Relative paths
+# resolve against THIS FILE's directory, not the invoking shell's CWD. `~` is
+# expanded. See patmir/paths.py.
+#
+# runs_root      working dir — one subdir per job, all intermediates.
+# cache_root     finished dubs keyed by (source, pipeline config); what the
+#                Chrome extension plays from.
+# downloads_root yt-dlp downloads for URL submissions.
+# state_root     local server's bearer token + job index.
+# library_root   NEW, unset by default. When set, each finished run's
+#                deliverables (out.mkv, out.hy.srt, dub.wav) are copied to
+#                library_root/<job_id>/. Unset = don't publish.
+#
+# Only library_root and cache_root are good candidates for network storage.
+# runs_root is the live working dir (appended progress log, per-stage manifest
+# rewrites, in-place ffmpeg writes) and state_root holds the server's token —
+# keep both on local disk.
+
+[storage]
+# runs_root      = "runs"
+# cache_root     = "~/.patmir/cache"
+# downloads_root = "~/.patmir/downloads"
+# state_root     = "~/.patmir"
+# library_root   = "/Volumes/media/patmir/library"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Phase 1 pipeline.
 # ──────────────────────────────────────────────────────────────────────────────
 # `[pipeline]` is the single source of truth for which candidate runs each

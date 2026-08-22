@@ -17,7 +17,11 @@ from pathlib import Path
 
 from fastapi import HTTPException, Request, status
 
-DEFAULT_SECRET_PATH = Path.home() / ".patmir" / "secret"
+from patmir import paths
+
+# Fallback for callers with no loaded config. Real callers pass the path from
+# `PipelineConfig.storage.secret_path` so `[storage].state_root` is honored.
+DEFAULT_SECRET_PATH = paths.defaults(None).secret_path
 
 
 def ensure_token(secret_path: Path = DEFAULT_SECRET_PATH) -> str:

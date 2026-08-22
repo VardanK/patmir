@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from patmir import paths as paths_mod
+from patmir.paths import StoragePaths, load_storage
 from patmir.pipeline.context import PipelineOptions
 
 _STAGE_NAMESPACE: dict[str, tuple[str, str]] = {
@@ -41,14 +43,22 @@ _STAGE_NAMESPACE: dict[str, tuple[str, str]] = {
 
 @dataclass
 class PipelineConfig:
-    """Resolved candidate entries per stage + global options.
+    """Resolved candidate entries per stage + global options + storage roots.
 
     Stage instances are built lazily by the runner via `build_stage(name)`;
     `entries` carries the raw config dicts so each build is cheap to repeat
     (and easy to free between stages on memory-constrained backends).
+
+    `storage` carries the resolved filesystem roots (see `patmir.paths`). It is
+    deliberately NOT part of the cache key — `ui.cache.config_hash` hashes only
+    `entries`, so relocating the cache or the library never orphans an existing
+    dub.
     """
     entries: dict[str, dict[str, Any]]
     options: PipelineOptions
+    storage: StoragePaths = field(
+        default_factory=lambda: paths_mod.defaults(None)
+    )
 
     def build_stage(self, name: str) -> Any:
         entry = self.entries.get(name)
@@ -166,4 +176,8 @@ def load_pipeline_config(
             continue
         entries[stage] = _find_candidate(toml, _STAGE_NAMESPACE[stage], cid)
 
-    return PipelineConfig(entries=entries, options=options)
+    return PipelineConfig(
+        entries=entries,
+        options=options,
+        storage=load_storage(toml, config_path),
+    )

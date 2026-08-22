@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.streaming.prelude import run_prelude
 from patmir.pipeline.streaming.runner import source_duration
@@ -104,13 +105,13 @@ class StreamManager:
         config_path: Path,
         *,
         jobs: JobManager,
-        runs_root: Path,
-        cache_root: Path,
+        storage: StoragePaths,
     ) -> None:
         self._config_path = config_path
         self._jobs = jobs            # delegate: source resolution + URL download
-        self._runs_root = runs_root
-        self._cache_root = cache_root
+        self._storage = storage
+        self._runs_root = storage.runs_root
+        self._cache_root = storage.cache_root
         self._cfg: PipelineConfig | None = None  # streaming config, lazy
         self._records: OrderedDict[str, StreamRecord] = OrderedDict()
         self._by_cache_key: dict[str, str] = {}

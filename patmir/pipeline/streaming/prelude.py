@@ -108,7 +108,7 @@ def run_prelude(
         _slice_audio(source, window_seconds, slice_wav)
         manifest = run_job(slice_wav, cfg, runs_root=runs_root, stop_after="asr",
                            stage_cache=stage_cache)
-        job_dir = (runs_root or Path.cwd() / "runs") / manifest.job_id
+        job_dir = (runs_root or cfg.storage.runs_root) / manifest.job_id
 
     window_end = _snap_window_end(job_dir, window_seconds)
 

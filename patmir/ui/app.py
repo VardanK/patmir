@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -23,6 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
+from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.stage import STAGE_ORDER
@@ -38,22 +40,23 @@ _CACHE_KEY_RE = r"^[0-9a-f]{16}$"
 
 
 def _create_app(
-    runs_root: Path,
-    cache_root: Path,
+    storage: StoragePaths,
     cfg: PipelineConfig,
     token: str,
     config_path: Path = Path("patmir.toml"),
 ) -> FastAPI:
     app = FastAPI(title="Patmir")
-    runs_root = runs_root.resolve()
-    cache_root = cache_root.resolve()
+    # Resolve the roots once here so the per-request containment checks below
+    # (`_safe_job_dir`, `_safe_cache_dir`) compare like with like — a symlinked
+    # root resolves to its target on both sides.
+    runs_root = storage.runs_root.resolve()
+    cache_root = storage.cache_root.resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
+    storage = replace(storage, runs_root=runs_root, cache_root=cache_root)
 
     require_token = auth.TokenAuth(token)
-    manager = JobManager(cfg, runs_root=runs_root, cache_root=cache_root)
-    streamer = StreamManager(
-        config_path, jobs=manager, runs_root=runs_root, cache_root=cache_root
-    )
+    manager = JobManager(cfg, storage=storage)
+    streamer = StreamManager(config_path, jobs=manager, storage=storage)
 
     app.add_middleware(
         CORSMiddleware,
@@ -315,8 +318,7 @@ def _is_valid_key(key: str) -> bool:
 def serve(
     *,
     port: int = 8765,
-    runs_root: Path | None = None,
-    cache_root: Path | None = None,
+    storage: StoragePaths | None = None,
     cfg: PipelineConfig | None = None,
     token: str | None = None,
     config_path: Path = Path("patmir.toml"),
@@ -326,12 +328,13 @@ def serve(
     if cfg is None:
         from patmir.pipeline.config import load_pipeline_config
         cfg = load_pipeline_config(config_path)
+    if storage is None:
+        storage = cfg.storage
     if token is None:
-        token = auth.ensure_token()
+        token = auth.ensure_token(storage.secret_path)
 
     app = _create_app(
-        runs_root=runs_root or Path("runs"),
-        cache_root=cache_root or cache_mod.DEFAULT_CACHE_ROOT,
+        storage=storage,
         cfg=cfg,
         token=token,
         config_path=config_path,

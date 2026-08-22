@@ -1,6 +1,8 @@
 # `runs/<job>/` artifact map
 
-Every job creates a fresh directory under `runs/`, named `<YYYYMMDD-HHMMSS>-<source-stem>/`. Below is what each file is and how to use it for debugging.
+Every job creates a fresh directory under the runs root, named `<YYYYMMDD-HHMMSS>-<source-stem>/` (suffixed `-2`, `-3` on a same-second collision). Below is what each file is and how to use it for debugging.
+
+The runs root defaults to `runs/` next to `patmir.toml` and is set by `[storage].runs_root` — see the "Storage roots" section of `pipeline.md` and ADR `decisions/2026-08-01-configurable-storage-roots.md`. Paths below are written `runs/<job>/` for brevity.
 
 ## Top-level files
 
@@ -25,6 +27,21 @@ Every job creates a fresh directory under `runs/`, named `<YYYYMMDD-HHMMSS>-<sou
 | `dub.meta.json`       | mux      | Duration, sample rate, options used (stretch_cap, music_bed_gain, voice_gain_db).        |
 | `out.mkv`             | output   | Final MKV — Armenian default audio, original retained as secondary, Armenian SRT as default subtitle track. |
 | `out.hy.srt`          | output   | Standalone subtitle file (also muxed into `out.mkv`).                                    |
+
+## Published deliverables (`[storage].library_root`)
+
+When `library_root` is configured, the runner copies three files out of the job dir after the `output` stage:
+
+```
+library_root/<job_id>/
+├── out.mkv       # final container (Armenian default audio)
+├── out.hy.srt    # Armenian subtitles
+└── dub.wav       # Armenian audio alone
+```
+
+Copy, not move — everything above stays in the job dir, so `--resume-from` and the server's cache materialize still work. Files are written as `<name>.partial` and renamed inside the destination dir, so a `.partial` left behind means an interrupted transfer (safe to delete; rerun to republish). A publish failure does not fail the run: check `progress.jsonl` for a `publish failed: …` row and `manifest.json`'s `published_dir` (null when publishing was skipped or failed).
+
+**Quality/batch mode only.** Watch-along sections stop at `mux` and never run the `output` stage, so they publish nothing — their audio lives in `cache_root/<key>/section_NNN.wav` instead.
 
 ## Subdirectories
 

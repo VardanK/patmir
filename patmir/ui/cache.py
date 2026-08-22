@@ -22,11 +22,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from patmir import paths
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.stage import STAGE_ORDER
 
 CACHE_VERSION = 1
-DEFAULT_CACHE_ROOT = Path.home() / ".patmir" / "cache"
+# Fallback for callers with no loaded config. The server takes its cache root
+# from `PipelineConfig.storage.cache_root` so `[storage]` is honored.
+DEFAULT_CACHE_ROOT = paths.defaults(None).cache_root
 _BY_URL_FILE = "by-url.json"
 
 

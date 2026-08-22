@@ -160,7 +160,7 @@ def dub_prelude_window(
     then resume translate→tts→mux with the registry voices. This is section 0;
     the streaming runner picks up at `window_end`.
     """
-    runs_root = runs_root or Path.cwd() / "runs"
+    runs_root = runs_root or cfg.storage.runs_root
     job_dir = prelude.job_dir
     end_rel = prelude.window_end
 
@@ -203,7 +203,7 @@ def process_section(
     runs_root: Path | None = None,
     stage_cache: dict | None = None,
 ) -> SectionResult:
-    runs_root = runs_root or Path.cwd() / "runs"
+    runs_root = runs_root or cfg.storage.runs_root
     slice_len = target_seconds + pad_seconds
 
     with tempfile.TemporaryDirectory(prefix=f"patmir-sec{index}-") as tmp:

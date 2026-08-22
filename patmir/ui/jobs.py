@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.runner import run_job
 from patmir.pipeline.stage import STAGE_ORDER
@@ -30,8 +31,6 @@ from patmir.ui import cache as cache_mod
 log = logging.getLogger(__name__)
 
 JobStatus = Literal["queued", "running", "done", "failed"]
-DOWNLOADS_DIR = Path.home() / ".patmir" / "downloads"
-JOBS_INDEX_PATH = Path.home() / ".patmir" / "jobs.json"
 _INDEX_MAX_ENTRIES = 200
 
 
@@ -107,14 +106,13 @@ class JobManager:
         self,
         cfg: PipelineConfig,
         *,
-        runs_root: Path,
-        cache_root: Path,
-        downloads_dir: Path = DOWNLOADS_DIR,
+        storage: StoragePaths,
     ) -> None:
         self._cfg = cfg
-        self._runs_root = runs_root
-        self._cache_root = cache_root
-        self._downloads_dir = downloads_dir
+        self._storage = storage
+        self._runs_root = storage.runs_root
+        self._cache_root = storage.cache_root
+        self._downloads_dir = storage.downloads_root
         self._records: OrderedDict[str, JobRecord] = OrderedDict()
         self._by_cache_key: dict[str, str] = {}  # cache_key → job_id (active or last)
         self._queue: asyncio.Queue[str] = asyncio.Queue()
@@ -284,9 +282,10 @@ class JobManager:
 
     def _persist_index(self) -> None:
         try:
-            JOBS_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+            index_path = self._storage.jobs_index
+            index_path.parent.mkdir(parents=True, exist_ok=True)
             payload = [asdict(r) for r in self._records.values()]
-            JOBS_INDEX_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+            index_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
         except OSError:
             log.warning("Failed to persist jobs index.", exc_info=True)
 

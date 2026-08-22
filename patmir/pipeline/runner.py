@@ -20,11 +20,23 @@ from patmir.pipeline.stage import STAGE_ORDER
 
 
 def _make_job_dir(source: Path, runs_root: Path) -> tuple[Path, str]:
+    """Create a fresh `runs_root/<timestamp>-<stem>` dir.
+
+    Job ids are second-granularity and the watch-along loop calls `run_job`
+    once per section, so two runs can land in the same second — suffix on
+    collision instead of failing the pipeline.
+    """
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    job_id = f"{ts}-{source.stem}"
-    job_dir = runs_root / job_id
-    job_dir.mkdir(parents=True, exist_ok=False)
-    return job_dir, job_id
+    base_id = f"{ts}-{source.stem}"
+    for attempt in range(1, 100):
+        job_id = base_id if attempt == 1 else f"{base_id}-{attempt}"
+        job_dir = runs_root / job_id
+        try:
+            job_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        return job_dir, job_id
+    raise RuntimeError(f"Could not create a unique job dir under {runs_root} for {base_id}.")
 
 
 def run_job(
@@ -61,7 +73,7 @@ def run_job(
     resident (~9 GB with the current active set — fine on 32 GB, watch this if
     models grow). `_free_accelerator_cache` still runs between stages either
     way (it drops scratch allocations, not the cached weights)."""
-    runs_root = runs_root or Path.cwd() / "runs"
+    runs_root = runs_root or cfg.storage.runs_root
 
     if resume_job_dir is not None:
         job_dir = resume_job_dir
@@ -134,6 +146,8 @@ def run_job(
             ctx.progress(name, 1.0, "done")
             if name == "asr" and output is not None:
                 manifest.source_lang = ctx.source_lang
+            if name == "output" and cfg.storage.library_root is not None:
+                manifest.published_dir = _publish(job_dir, job_id, cfg, ctx)
             manifest.to_path(manifest_path)
         except Exception as exc:
             st.state = "failed"
@@ -150,6 +164,26 @@ def run_job(
             break
 
     return manifest
+
+
+def _publish(job_dir: Path, job_id: str, cfg: PipelineConfig, ctx: JobContext) -> str | None:
+    """Copy the deliverables to `[storage].library_root/<job_id>/`.
+
+    Never fails the run: the dub is already complete in the job dir at this
+    point, so a publish error (share not mounted, out of space) is reported and
+    swallowed rather than throwing away a finished pipeline.
+    """
+    from patmir.pipeline.publish import publish_job
+
+    library_root = cfg.storage.library_root
+    assert library_root is not None
+    try:
+        dest = publish_job(job_dir, job_id, library_root)
+    except (OSError, FileNotFoundError) as exc:
+        ctx.progress("output", 1.0, f"publish failed: {exc}")
+        return None
+    ctx.progress("output", 1.0, f"published to {dest}")
+    return str(dest)
 
 
 def _free_accelerator_cache() -> None:
