@@ -44,6 +44,10 @@ ui = [
   "jinja2>=3.1",
 ]
 all = ["patmir[local,cloud,ui]"]
+# Test runner for the patmir/tests/ suite.
+dev = [
+  "pytest>=8",
+]
 
 [project.scripts]
 patmir = "patmir.cli:main"
