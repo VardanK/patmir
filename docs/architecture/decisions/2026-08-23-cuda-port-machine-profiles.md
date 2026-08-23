@@ -360,6 +360,41 @@ What *is* covered by tests is the runtime-independent part, which is more than i
 at what `max_batch`. First-run expectations, and what to check, are in
 `docs/setup/windows-wsl2-cuda.md` Phase 9.
 
+## First end-to-end attempt (2026-08-24)
+
+The first real `patmir dub` on the 3090 got **eight of nine stages** through: ingest, separate,
+diarize (Sortformer on NeMo, confirmed working on transformers 5.15.1 — so the NeMo-vs-5.x question
+in Decision 3 is closed and quality issue #13 stays shut), emotion, asr, translate, and the Higgs
+model plus codec both loading on the card.
+
+It died entering TTS synthesis, and not on anything this port introduced:
+
+```
+Could not load this library: .../site-packages/torchcodec/libtorchcodec_image.so
+```
+
+On torch >= 2.11 `torchaudio.load()` decodes nothing itself — it delegates to `torchcodec`, whose
+native libraries link against both torch and the system FFmpeg. Both Higgs candidates used it to read
+a speaker's reference clip. This is the *second* time this exact delegation has bitten: the separate
+stage hit it through Silero's `read_audio` helper and was worked around there with soundfile plus
+`np.interp`.
+
+That workaround was not reusable here. Linear interpolation is acceptable for a VAD frontend and not
+for the clip the codec clones a character's voice from — it aliases. So reference clips now decode
+through **ffmpeg** (`eval/candidates/tts/_audio_io.py`), which is already a hard dependency of the
+project, resamples properly, reads whatever container the clip is in, and costs one subprocess per
+speaker because the callers cache. Applied to the MLX sibling too: it carries the identical defect
+and simply has not fired on the Mac yet. A stereo ref clip is now also correctly downmixed, which the
+old path got wrong.
+
+Worth noting what this says about the `audio_head.weight | MISSING` line in the load report — it is
+still expected and still not a problem, and it appeared immediately above the real failure. The
+candidate asserts the tie at build time precisely so that noise cannot be mistaken for a fault.
+
+The underlying dlopen failure is untouched and remains an environment landmine: anything else in the
+stack that reaches for torchcodec will hit it. Most likely an FFmpeg major version torchcodec has no
+build for. Not chased, because nothing we run needs it now.
+
 ## Revisit
 
 - Upstream flags flash-attention support (a TTS speedup the candidate can then take for free).

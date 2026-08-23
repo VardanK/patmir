@@ -312,13 +312,13 @@ class HiggsV3Torch:
             return cached
 
         import torch  # lazy
-        import torchaudio  # lazy
+
+        from patmir.eval.candidates.tts._audio_io import decode_mono
 
         codec = self.model.get_audio_codec()
-        wav, sr = torchaudio.load(path)
-        wav = wav.float()
-        if sr != SR:
-            wav = torchaudio.functional.resample(wav, sr, SR)
+        # ffmpeg, not torchaudio.load: on torch >= 2.11 that delegates to
+        # torchcodec, whose native libs fail to dlopen on the WSL2 box.
+        wav = torch.from_numpy(decode_mono(path, SR))
         # The codec needs at least a second of audio.
         if wav.shape[-1] < SR:
             wav = torch.nn.functional.pad(wav, (0, SR - wav.shape[-1]))

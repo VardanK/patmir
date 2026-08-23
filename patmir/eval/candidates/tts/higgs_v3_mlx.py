@@ -190,14 +190,14 @@ class HiggsV3MLX:
         if path in self._ref_cache:
             return self._ref_cache[path]
         import torch
-        import torchaudio
+
+        from patmir.eval.candidates.tts._audio_io import decode_mono
         codec = self._get_codec()
-        wav, sr = torchaudio.load(path)
-        wav = wav.float()
+        # ffmpeg, not torchaudio.load — see _audio_io. Same defect as the torch
+        # sibling; it just has not fired on the Mac yet.
+        wav = torch.from_numpy(decode_mono(path, SR))
         while wav.ndim < 3:
             wav = wav.unsqueeze(0)
-        if sr != SR:
-            wav = torchaudio.functional.resample(wav, sr, SR)
         if wav.shape[-1] < SR:
             wav = torch.nn.functional.pad(wav, (0, SR - wav.shape[-1]))
         codes_BNT = codec.encode(wav.to(self.codec_device)).audio_codes
