@@ -72,6 +72,29 @@ def _snapshot() -> Path | None:
     return None
 
 
+def _tiny_model(snapshot: str):
+    """A 2-layer randomly-initialized HiggsMultimodalQwen3 on CPU in float32.
+
+    Small enough to build in a unit test, real enough to exercise the actual
+    decode path and the checkpoint's own tied-weights declaration.
+    """
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    cfg = AutoConfig.from_pretrained(snapshot, trust_remote_code=True)
+    tc = cfg.text_config
+    tc.hidden_size = 64
+    tc.num_hidden_layers = 2
+    tc.num_attention_heads = 2
+    tc.num_key_value_heads = 1
+    tc.head_dim = 32
+    tc.intermediate_size = 128
+    cfg.audio_encoder_config = dict(cfg.audio_encoder_config)
+    cfg.audio_encoder_config["out_dim"] = 64
+    torch.manual_seed(0)
+    return AutoModelForCausalLM.from_config(cfg, trust_remote_code=True).to(torch.float32).eval()
+
+
 def _bare(max_batch: int = 8, max_retries: int = 0) -> HiggsV3Torch:
     """A candidate with no model, for testing the orchestration around decode."""
     obj = object.__new__(HiggsV3Torch)
@@ -461,6 +484,76 @@ class BatchEquivalenceTest(unittest.TestCase):
             self.assertEqual(wf.getnchannels(), 1)
         self.assertEqual(cand._summary["sentences"], 1)
         self.assertEqual(cand._summary["batches"], 1)
+
+
+@unittest.skipIf(
+    _snapshot() is None,
+    f"Higgs checkpoint snapshot not found under {_hub_cache()}",
+)
+class TiedWeightsShimTest(unittest.TestCase):
+    """The checkpoint's remote code declares `_tied_weights_keys` as a LIST; the
+    installed transformers reads it as a `{target: source}` dict and does
+    `.keys()` on it, so loading died with `'list' object has no attribute
+    'keys'`.
+
+    Only `from_pretrained` hit it — the offending helper runs on the
+    weight-loading path — which is why every test here builds the class with
+    `from_config` and passed happily while the real load failed on the 3090.
+    """
+
+    def setUp(self):
+        from transformers import AutoConfig
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        self.snapshot = str(_snapshot())
+        ref = (AutoConfig.from_pretrained(
+            self.snapshot, trust_remote_code=True).auto_map or {}
+        ).get("AutoModelForCausalLM")
+        self.klass = get_class_from_dynamic_module(ref, self.snapshot)
+        self._saved = self.klass._tied_weights_keys
+
+    def tearDown(self):
+        self.klass._tied_weights_keys = self._saved
+
+    def test_the_shipped_list_form_is_normalized(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import normalize_tied_weights_keys
+
+        self.klass._tied_weights_keys = ["audio_head.weight"]
+        self.assertTrue(normalize_tied_weights_keys(self.snapshot))
+        self.assertEqual(
+            self.klass._tied_weights_keys,
+            {"audio_head.weight": "audio_embedding.weight"},
+        )
+
+    def test_it_is_idempotent(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import normalize_tied_weights_keys
+
+        self.klass._tied_weights_keys = ["audio_head.weight"]
+        normalize_tied_weights_keys(self.snapshot)
+        self.assertFalse(
+            normalize_tied_weights_keys(self.snapshot),
+            "already a dict — must report no change rather than re-patching",
+        )
+
+    def test_the_loading_path_helper_stops_raising(self):
+        """`_get_tied_weight_keys` is the exact function that failed."""
+        from transformers.modeling_utils import _get_tied_weight_keys
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import normalize_tied_weights_keys
+
+        self.klass._tied_weights_keys = ["audio_head.weight"]
+        model = _tiny_model(self.snapshot)
+        with self.assertRaises(AttributeError):
+            _get_tied_weight_keys(model)
+
+        normalize_tied_weights_keys(self.snapshot)
+        model = _tiny_model(self.snapshot)
+        self.assertEqual(_get_tied_weight_keys(model), ["audio_head.weight"])
+        # And the tie the whole thing exists to preserve is still real.
+        self.assertEqual(
+            model.audio_head.weight.data_ptr(),
+            model.audio_embedding.weight.data_ptr(),
+        )
 
 
 class AdapterBatchDispatchTest(unittest.TestCase):

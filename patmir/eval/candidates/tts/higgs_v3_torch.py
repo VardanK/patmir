@@ -110,6 +110,45 @@ def _chunks(items: list[int], size: int) -> list[list[int]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
+# The parameter `audio_head.weight` is tied to. Fixed by the checkpoint: its
+# `tie_weights()` assigns `audio_head.weight = audio_embedding.weight`.
+_TIED_SOURCE = "audio_embedding.weight"
+
+
+def normalize_tied_weights_keys(snapshot: str) -> bool:
+    """Convert the checkpoint's `_tied_weights_keys` list into the dict form
+    that current transformers requires. Returns True if it patched anything.
+
+    The repo's remote code declares the old list form,
+    `_tied_weights_keys = ["audio_head.weight"]`. transformers 5.9's
+    `_get_tied_weight_keys` does `tied.keys()` on that attribute, so loading the
+    checkpoint dies with `AttributeError: 'list' object has no attribute 'keys'`.
+    The newer contract is a `{target: source}` mapping.
+
+    Only `from_pretrained` is affected: the helper runs on the weight-loading
+    path, which is why building the same class with `from_config` (as the tests
+    do) works fine and hid this until the first real load on the 3090.
+
+    Patched on the class rather than worked around at the call site because the
+    attribute is read by transformers internals we do not drive. Verified to
+    leave the tie itself intact — `_check_audio_head_tied` asserts that after
+    every load, so a wrong mapping here fails loudly rather than producing noise.
+    """
+    from transformers import AutoConfig
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    config = AutoConfig.from_pretrained(snapshot, trust_remote_code=True)
+    ref = (getattr(config, "auto_map", None) or {}).get("AutoModelForCausalLM")
+    if not ref:
+        return False
+    klass = get_class_from_dynamic_module(ref, snapshot)
+    keys = getattr(klass, "_tied_weights_keys", None)
+    if isinstance(keys, list):
+        klass._tied_weights_keys = {k: _TIED_SOURCE for k in keys}
+        return True
+    return False
+
+
 class HiggsV3Torch:
     id = "higgs_v3_torch"
     # IVC-style: clones from audio alone; ref_text only improves fidelity.
@@ -178,6 +217,8 @@ class HiggsV3Torch:
             # the slow mirror (ADR 2026-05-26-prefer-fast-model-mirrors). The
             # tokenizer itself is a plain Qwen2 tokenizer with no auto_map.
             self.tok = Qwen2TokenizerFast.from_pretrained(snap)
+            # Must happen BEFORE from_pretrained — see the function's docstring.
+            normalize_tied_weights_keys(snap)
             # The model class *does* need trust_remote_code — it is the repo's
             # own `modeling_higgs_multimodal_qwen3`. Loading from the local
             # snapshot keeps that resolution off the network.
