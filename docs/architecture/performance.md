@@ -389,6 +389,8 @@ OpenRouter candidate — byte-identical output, no ear-test needed)
 
 **2026-08-23 update:** the Reacher baseline shows ASR at **10.8% of batch wall (38.0s)**, down from Whisper's 29%. The standalone A/B predicted only ~3% in-pipeline; the real win was much larger. Cost: chunking is ~3.5× coarser (25 sentences per 5 min vs ~104), which pushes TTS per-sentence p90 to 21.4s and max to 30.4s. Splitting chunks at word gaps would flatten that tail — a watch-along buffer concern, not a total-throughput one.
 
+**2026-08-23, later:** that follow-up is implemented on the **CUDA profile only**, as a side effect of rewriting the torch Qwen3-ASR candidate against transformers' native `qwen3_asr` (the `qwen-asr` package's exact `transformers==4.57.6` pin is unusable alongside Higgs). The package hid long-form segmentation inside `transcribe()`; the transformers API is single-shot, so `qwen3_asr.build_chunks()` now cuts on the separate stage's Silero VAD silences capped at `chunk_seconds=28` and runs the chunks batched through both the ASR and the aligner. That should give finer sentences than the MLX path's coarse internal chunking and so a flatter TTS tail — **UNMEASURED**, and it does not touch the Mac. Measure sentence count per 5 min and TTS p90 on the first CUDA baseline; if the tail does flatten, the same chunking is the argument for wrapping the MLX runtime the same way.
+
 #### Original entry
 **Update 2026-07-15:** author revised 2026-07-14 — "both Whisper and Qwen
 garble sometimes → pick the fastest" → `[pipeline].asr =

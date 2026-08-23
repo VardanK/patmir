@@ -66,11 +66,19 @@ cloud = [
 # anyway. Install explicitly on the workstation:
 #     uv pip install -e ".[local,ui,dev,cuda]"
 cuda = [
-  # `qwen-asr` is deliberately ABSENT. It pins transformers==4.57.6 exactly,
-  # which is mutually exclusive with the Higgs TTS checkpoint's >=5.5 — the two
-  # cannot share an environment. The `qwen3_asr_1_7b` candidate stays registered
-  # in patmir.toml for whenever that pin loosens; the cuda profile uses
-  # `faster_whisper_large_v3_fp16` instead (CTranslate2, no transformers dep).
+  # `qwen-asr` (the official Qwen package) is deliberately ABSENT and must not
+  # be installed. It pins transformers==4.57.6 EXACTLY, mutually exclusive with
+  # the Higgs TTS checkpoint's >=5.5, and it drags in exact pins on accelerate,
+  # nagisa and soynlp plus gradio/flask/sox. Installing it silently resolves
+  # transformers down and breaks the TTS stage.
+  #
+  # It is also unnecessary: transformers 5.13.0 added native `qwen3_asr`
+  # (Qwen3ASRForConditionalGeneration + Qwen3ASRForTokenClassification for the
+  # forced aligner), which is what the `qwen3_asr` candidate module drives. This
+  # floor is higher than `local`'s >=5.5 because that candidate needs it; the
+  # module also gates on it at build time so a stale env gives the fix rather
+  # than `KeyError: 'qwen3_asr'`.
+  "transformers>=5.13",
   "nemo_toolkit[asr]>=2.0",  # `sortformer_nemo` (NVIDIA's own Sortformer runtime)
 ]
 # Local FastAPI progress UI (Phase 1).

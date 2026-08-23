@@ -761,10 +761,12 @@ separate  = "htdemucs_vocals"      # torch twin of htdemucs_mlx_vocals (sig 0457
 # off pyannote in the first place (ADR 2026-06-15). `pyannote_3_1` stays
 # registered as the fallback if NeMo won't install.
 diarize   = "sortformer_nemo"
-# NOT `qwen3_asr_1_7b`: the `qwen-asr` package pins transformers==4.57.6, which
-# is mutually exclusive with the Higgs TTS checkpoint's >=5.5. TTS is 69% of
-# wall and ASR 11%, so ASR yields. CTranslate2 has no transformers dependency.
-asr       = "faster_whisper_large_v3_fp16"
+# Same model family as the Mac's active ASR, so per-stage ASR timings stay
+# comparable across the two baselines. Driven through transformers' native
+# `qwen3_asr` (5.13+) rather than the `qwen-asr` package, whose exact
+# transformers==4.57.6 pin is mutually exclusive with the Higgs TTS checkpoint.
+# `faster_whisper_large_v3_fp16` stays registered as the no-Qwen fallback.
+asr       = "qwen3_asr_1_7b"
 tts       = "higgs_v3_torch_bf16"  # same Higgs v3 model, upstream transformers runtime
 
 # Watch-along layer: applied AFTER the hardcoded overrides in
@@ -1087,24 +1089,24 @@ device        = "auto"
 compute_type  = "int8"
 vad_filter    = true
 
-# ACTIVE ASR under [pipeline.profiles.cuda]. Same Whisper large-v3 via
-# CTranslate2, but fp16 — int8 above exists because CT2 has no MPS backend and
-# falls back to CPU on the Mac, where int8 is the only tolerable option. On a
-# 3090 fp16 is both faster and closer to the reference checkpoint.
+# CUDA ASR FALLBACK (was briefly the active CUDA ASR, 2026-08-23 only). Same
+# Whisper large-v3 via CTranslate2, but fp16 — int8 above exists because CT2 has
+# no MPS backend and falls back to CPU on the Mac, where int8 is the only
+# tolerable option. On a 3090 fp16 is both faster and closer to the reference
+# checkpoint.
 #
-# Why not `qwen3_asr_1_7b` (the torch sibling of the Mac's active ASR): the
-# `qwen-asr` package pins `transformers==4.57.6` EXACTLY, and the Higgs TTS
-# checkpoint requires >=5.5 (its tokenizer_config gives `extra_special_tokens`
-# as a list, which 4.x mishandles). Those two cannot coexist in one environment,
-# and TTS is 69% of wall while ASR is 11% — so ASR is the stage that yields.
-# CTranslate2 does not depend on transformers at all, which is what makes this
-# the clean way out rather than another version negotiation.
+# This was selected for [pipeline.profiles.cuda] when the ONLY known way to run
+# Qwen3-ASR on torch was the `qwen-asr` package, whose exact
+# `transformers==4.57.6` pin is mutually exclusive with the Higgs TTS
+# checkpoint's >=5.5. CTranslate2 has no transformers dependency at all, which
+# made it the clean way out. Superseded the same day: transformers 5.13 carries
+# native `qwen3_asr`, so `qwen3_asr_1_7b` reaches the same model with no package
+# and no pin — and keeps the ASR stage identical in family across both machines.
+# Flip [pipeline.profiles.cuda].asr back here if Qwen3-ASR misbehaves on CUDA.
 #
-# NOTE this makes the ASR stage differ between machines (Mac runs
-# qwen3_asr_1_7b_mlx_8bit), so per-stage ASR timings are NOT directly comparable
-# across the two baselines. Whisper large-v3 is well characterized here: it was
-# the Mac default until 2026-07-14 — clean on fast cartoon speech, prone to
-# hallucinated repeats on singing/music windows.
+# Whisper large-v3 is well characterized here: it was the Mac default until
+# 2026-07-14 — clean on fast cartoon speech, prone to hallucinated repeats on
+# singing/music windows.
 [[stages.asr.candidates]]
 id            = "faster_whisper_large_v3_fp16"
 module        = "patmir.pipeline.stages.asr.faster_whisper"
@@ -1120,33 +1122,53 @@ vad_filter    = true
 # Two backends — pick by platform:
 #   - On Apple Silicon: use `qwen3_asr_*_mlx` (runs on the Mac GPU + unified
 #     memory via `mlx-qwen3-asr`, includes a working MLX ForcedAligner).
-#   - On NVIDIA GPU box: use `qwen3_asr_*` below (official `qwen-asr`).
+#   - On NVIDIA GPU box: use `qwen3_asr_*` below (transformers-native torch).
 #
-# The official PyTorch `qwen-asr` package pins `transformers<5` which conflicts
-# with omnivoice (needs transformers>=5). The MLX path has no such conflict.
+# DO NOT install the official `qwen-asr` package. It pins
+# `transformers==4.57.6` EXACTLY, which is mutually exclusive with the Higgs
+# TTS checkpoint's >=5.5 — installing it silently resolves transformers down
+# and breaks the TTS stage. The torch entries below drive the same models
+# through transformers' OWN `qwen3_asr` implementation (added in 5.13.0:
+# Qwen3ASRForConditionalGeneration + Qwen3ASRForTokenClassification for the
+# forced aligner), so there is no package and no pin to negotiate. The
+# pyproject floor is `transformers>=5.13`, so a downgrade now fails at install
+# time instead of at TTS build time.
+#
+# The torch entries take the `-hf` checkpoints (the transformers-native
+# conversions). The unsuffixed repos are the layout `qwen-asr` reads and will
+# NOT load through transformers.
+#
+# Long-form audio: the `qwen-asr` package segmented internally; the
+# transformers API is single-shot, so the candidate chunks on the separate
+# stage's Silero VAD intervals (capped at `chunk_seconds`) and runs the chunks
+# batched (`batch_size`) through both the ASR and the aligner.
 #
 # Install before enabling:
 #   Mac:  `uv pip install mlx-qwen3-asr`
-#   CUDA: `uv pip install qwen-asr`
+#   CUDA: nothing — `transformers>=5.13` + torch already cover it
 [[stages.asr.candidates]]
 id              = "qwen3_asr_1_7b"
 module          = "patmir.pipeline.stages.asr.qwen3_asr"
-model_id        = "Qwen/Qwen3-ASR-1.7B"
-device          = "auto"
+model_id        = "Qwen/Qwen3-ASR-1.7B-hf"
+device          = "auto"       # auto -> cuda on the GPU box
 dtype           = "bfloat16"
-forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
+forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 aligner_dtype   = "bfloat16"
 max_new_tokens  = 256
+chunk_seconds   = 28.0         # cap per ASR window; cuts land in VAD silence
+batch_size      = 8            # chunks decoded/aligned per batch
 
 [[stages.asr.candidates]]
 id              = "qwen3_asr_0_6b"
 module          = "patmir.pipeline.stages.asr.qwen3_asr"
-model_id        = "Qwen/Qwen3-ASR-0.6B"
+model_id        = "Qwen/Qwen3-ASR-0.6B-hf"
 device          = "auto"
 dtype           = "bfloat16"
-forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B"
+forced_aligner  = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 aligner_dtype   = "bfloat16"
 max_new_tokens  = 256
+chunk_seconds   = 28.0
+batch_size      = 8
 
 # Qwen3-ASR via MLX — native Apple Silicon GPU, working forced aligner.
 # Use these on Mac instead of the CUDA-targeted entries above. Loads weights

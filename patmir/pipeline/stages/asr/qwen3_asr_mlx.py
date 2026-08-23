@@ -6,7 +6,10 @@ GPU + unified memory pool. Bundles a custom MLX `ForcedAligner` that produces
 real word-level timestamps on Mac (the official CUDA-bound aligner does not).
 
 This is the right Mac path for Qwen3-ASR. CUDA workstations should use the
-sibling `qwen3_asr` module via the `qwen-asr` package instead.
+sibling `qwen3_asr` module, which drives the same models through transformers'
+native `qwen3_asr` support (5.13+). Note the aligner repo differs between the
+two: this module wants the original `Qwen/Qwen3-ForcedAligner-0.6B` layout,
+the transformers one wants the `-hf` conversion.
 
 Models loaded from `mlx-community/Qwen3-ASR-{0.6B,1.7B}-{bf16,4bit,5bit,6bit,8bit}`.
 
@@ -19,7 +22,11 @@ from typing import Any
 
 from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import AudioTrack, Sentence, Transcript, Word
-from patmir.pipeline.stages.asr._sentence import filter_words_by_vad, write_transcript
+from patmir.pipeline.stages.asr._sentence import (
+    filter_words_by_vad,
+    word_in_target_script,
+    write_transcript,
+)
 
 
 # Qwen3-ASR labels languages with full English names ("English", "Russian", …).
@@ -49,23 +56,6 @@ def _mx_dtype(name: str):
         "float16": mx.float16,
         "float32": mx.float32,
     }.get(name, mx.bfloat16)
-
-
-def _word_in_target_script(text: str, language: str) -> bool:
-    """True if `text` contains at least one character in the script the
-    target language uses. Used to drop CJK/emoji garbage that Qwen3-ASR
-    hallucinates on cartoon sound effects when running in Russian or
-    English mode."""
-    if not text:
-        return False
-    if language == "ru":
-        return any("Ѐ" <= ch <= "ӿ" for ch in text)
-    if language == "en":
-        return any("a" <= ch.lower() <= "z" for ch in text)
-    if language == "hy":
-        return any("԰" <= ch <= "֏" for ch in text)
-    # Unknown target language — be permissive, just reject pure CJK.
-    return not all("一" <= ch <= "鿿" or ch.isspace() for ch in text)
 
 
 class Qwen3ASRMLX:
@@ -184,7 +174,7 @@ class Qwen3ASRMLX:
         # would translate to nonsense if let through.
         orphan_words = [
             w for w in words
-            if id(w) not in covered_word_ids and _word_in_target_script(w.text, language)
+            if id(w) not in covered_word_ids and word_in_target_script(w.text, language)
         ]
         if orphan_words:
             orphan_words.sort(key=lambda w: w.start)

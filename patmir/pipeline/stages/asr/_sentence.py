@@ -15,6 +15,9 @@ still dropping hallucinations from pure non-speech-vocal regions.
   - multi-token sentences where every unique token is non-lexical
     (e.g. '-фью -фью цыпа цыпа' — bird chirps that Whisper transliterated)
 
+`word_in_target_script(text, lang)` rejects words with no character in the
+target language's script — the Qwen3-ASR CJK-hallucination guard.
+
 The original laughter / animal sounds survive in the music bed via htdemucs's
 non-speech-vocals stem, so dropping these sentences doesn't lose anything.
 """
@@ -156,6 +159,27 @@ def is_non_lexical(text: str) -> bool:
     if tokens and all(t in NON_LEXICAL_SINGLE_TOKENS for t in tokens):
         return True
     return False
+
+
+def word_in_target_script(text: str, language: str) -> bool:
+    """True if `text` contains at least one character in the script the
+    target language uses.
+
+    Qwen3-ASR routinely hallucinates CJK characters and emoji on non-speech
+    vocals (cartoon sound effects, screams) even when transcribing Russian or
+    English, and those would translate to nonsense if let through. Shared by
+    the MLX and transformers Qwen3-ASR candidates so the two cannot drift.
+    """
+    if not text:
+        return False
+    if language == "ru":
+        return any("\u0400" <= ch <= "\u04ff" for ch in text)
+    if language == "en":
+        return any("a" <= ch.lower() <= "z" for ch in text)
+    if language == "hy":
+        return any("\u0530" <= ch <= "\u058f" for ch in text)
+    # Unknown target language — be permissive, just reject pure CJK.
+    return not all("\u4e00" <= ch <= "\u9fff" or ch.isspace() for ch in text)
 
 
 def filter_words_by_vad(

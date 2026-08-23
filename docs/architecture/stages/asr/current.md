@@ -1,17 +1,34 @@
 # Active asr config
 
-```toml
-[pipeline]
-asr = "whisper_large_v3_mlx_fp16"
+**The active candidate differs per machine profile.** ASR is the one stage where
+the two machines run different runtimes of (now) the same model family.
 
-[[stages.asr.candidates]]
-id      = "whisper_large_v3_mlx_fp16"
-module  = "patmir.pipeline.stages.asr.whisper_mlx"
-repo_id = "mlx-community/whisper-large-v3-mlx"   # full large-v3, fp16
+```toml
+[pipeline]                        # Apple Silicon (default)
+asr = "qwen3_asr_1_7b_mlx_8bit"   # mlx-qwen3-asr, 8-bit, MLX ForcedAligner
+
+[pipeline.profiles.cuda]          # RTX 3090 / WSL2
+asr = "qwen3_asr_1_7b"            # transformers-native torch, bf16
 ```
 
-**Whisper large-v3 (MLX, fp16)** — switched back from `nemotron_mlx` on
-2026-06-19 after the first Russian-cartoon ear-test. See `whisper-mlx-large-v3.md`.
+| Profile | Candidate | Runtime | Doc |
+| --- | --- | --- | --- |
+| default (Mac) | `qwen3_asr_1_7b_mlx_8bit` | `mlx-qwen3-asr` | [qwen3-asr-mlx.md](qwen3-asr-mlx.md) |
+| `cuda` | `qwen3_asr_1_7b` | transformers >= 5.13, native `qwen3_asr` | [qwen3-asr-transformers.md](qwen3-asr-transformers.md) |
+
+**Mac:** flipped from `whisper_large_v3_mlx_fp16` on 2026-07-14 — author verdict
+"both garble sometimes, pick the fastest". The 2026-08-23 re-baseline puts ASR at
+10.8% of batch wall (38.0 s) vs Whisper's 29%. Ear-test still pending
+(`runs/20260715-reacher-asr-ab/`).
+
+**CUDA:** `qwen3_asr_1_7b` since 2026-08-23, replacing the same-day interim
+`faster_whisper_large_v3_fp16`. The interim existed only because the `qwen-asr`
+package pins `transformers==4.57.6`, which the Higgs TTS checkpoint's `>=5.5`
+forbids; transformers 5.13 carries `qwen3_asr` natively, so the package is not
+needed and the two machines are back on one model family. **Never executed.**
+
+The Whisper-era notes below are retained as history — that candidate stays
+registered as a fallback on both profiles.
 
 ### Why not Nemotron / turbo (ear-tested 2026-06-19 on masha)
 

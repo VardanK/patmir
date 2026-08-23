@@ -145,10 +145,16 @@ uv pip install -e ".[local,ui,dev,cuda]"
 pytest patmir/tests/ -q
 ```
 
-The `cuda` extra carries the deps only this machine needs — `qwen-asr` for the torch
-ASR candidate and `nemo_toolkit[asr]` for Sortformer. It is deliberately excluded from
-`all`, since neither belongs on the Apple-Silicon laptop where those candidates cannot
-be selected anyway.
+The `cuda` extra carries the deps only this machine needs — `transformers>=5.13` for the
+torch Qwen3-ASR candidate and `nemo_toolkit[asr]` for Sortformer. It is deliberately
+excluded from `all`, since NeMo has no business on the Apple-Silicon laptop where those
+candidates cannot be selected anyway.
+
+**Do not install `qwen-asr`.** It is the official Qwen package and the obvious way to run
+Qwen3-ASR on torch, and it pins `transformers==4.57.6` *exactly* — mutually exclusive
+with the Higgs TTS checkpoint's `>=5.5`. It is also unnecessary: transformers 5.13 carries
+`qwen3_asr` natively, which is what the `qwen3_asr_1_7b` candidate drives. The floor in
+the `cuda` extra makes a downgrade fail at install time rather than at TTS build time.
 
 NeMo is the heaviest dependency in the stack and the most likely to fight the Python version — it is
 why 3.12 is pinned. The `cuda` extra installs it from PyPI; verify it landed:
@@ -210,7 +216,7 @@ source ~/.bashrc
 | `emotion` | unchanged | `emotion2vec.py` resolves device `auto` to cuda |
 | `translate` | unchanged | cloud (OpenRouter), platform-independent |
 | `separate` | `htdemucs_vocals` | torch twin of `htdemucs_mlx_vocals`; same vocals-specialist sub-model (`04573f0d`), `accompaniment = mix - vocals` |
-| `asr` | `faster_whisper_large_v3_fp16` | Whisper large-v3 via CTranslate2. Not Qwen3-ASR — see the dependency note below |
+| `asr` | `qwen3_asr_1_7b` | Qwen3-ASR 1.7B bf16 — the same model family as the Mac, via transformers' native `qwen3_asr` (needs `transformers>=5.13`). Takes the **`-hf`** checkpoints. Chunks on the separate stage's VAD silences and decodes them batched. `faster_whisper_large_v3_fp16` stays registered as the no-Qwen fallback |
 | `diarize` | `sortformer_nemo` | Same Sortformer model as the Mac, on NVIDIA's own NeMo. Needs the extra install below |
 | `tts` | `higgs_v3_torch_bf16` | same Higgs v3 model, decoded **batched across sentences** (`max_batch`, default 8) |
 
@@ -305,7 +311,9 @@ to `.wslconfig` and `wsl --shutdown`.
 | Run dies after the first stage with `libmlx.so: cannot open shared object file` | Two compounding causes, both fixed in-tree — `git pull` if you hit it. `[local]` used to install the Apple-only `mlx-*` wheels here (now gated on `sys_platform == 'darwin'`), and `_free_accelerator_cache()`, which runs after **every** stage, probed MLX under `except ImportError` while dlopen actually raises `OSError`. It fired regardless of the active profile, so a correct `PATMIR_PROFILE=cuda` did not save you. Belt and braces: `uv pip uninstall mlx mlx-audio mlx-whisper mlx-lm` |
 | Extension cannot reach the server | missing `networkingMode=mirrored` |
 | Mux stage fails | `rubberband-cli` not installed |
-| `uv pip install` reports transformers 4.57.6 vs >=5.5 unsatisfiable | Expected if `qwen-asr` is installed: it pins transformers exactly, and the Higgs TTS checkpoint needs >=5.5. `uv pip uninstall qwen-asr`; the cuda profile uses `faster_whisper_large_v3_fp16` for ASR precisely to avoid this |
+| `uv pip install` reports transformers 4.57.6 vs >=5.5 unsatisfiable | Expected if `qwen-asr` is installed: it pins transformers exactly, and the Higgs TTS checkpoint needs >=5.5. `uv pip uninstall qwen-asr` and never reinstall it — the `qwen3_asr_1_7b` candidate reaches the same models through transformers' native `qwen3_asr` (5.13+), so the package is not needed for Qwen3-ASR on this box |
+| ASR dies with `KeyError: 'qwen3_asr'` | transformers older than 5.13, which is where native `qwen3_asr` landed. The candidate gates on this at build time and reports the fix, so you should see a `RuntimeError` naming the version instead; a raw `KeyError` means something bypassed the gate. `uv pip install -U "transformers>=5.13"` |
+| ASR fails loading `Qwen/Qwen3-ASR-1.7B` | Missing the `-hf` suffix. The transformers-native conversions are `Qwen/Qwen3-ASR-1.7B-hf` and `Qwen/Qwen3-ForcedAligner-0.6B-hf`; the unsuffixed repos are the layout the `qwen-asr` package reads. The Mac's MLX candidate legitimately keeps the unsuffixed aligner — that one is read by `mlx-qwen3-asr` |
 | TTS stage dies on `'list' object has no attribute 'keys'` | `transformers` got resolved down to 4.x — check with `uv pip list \| grep -i transformers`. The Higgs checkpoint needs >=5.5 (its tokenizer_config gives `extra_special_tokens` as a list, which 4.x mishandles). Installing `nemo_toolkit` was what pulled it down. `uv pip install -U "transformers>=5.5"`, then re-verify torch is still the cu128 build |
 | Higgs load report says `audio_head.weight \| MISSING \| newly initialized` | **Expected, not a problem.** The checkpoint omits that key because the model ties it to `audio_embedding.weight`; the tie is applied after the report is printed. Confirmed tied on the 3090 (shared storage, identical norms). The candidate asserts the tie at build time, so a genuinely broken tie is a hard error rather than silent noise |
 | flash-attention will not build | use a prebuilt cu128 wheel instead of compiling |

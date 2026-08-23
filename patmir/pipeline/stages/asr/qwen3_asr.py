@@ -1,47 +1,91 @@
-"""Qwen3-ASR backend.
+"""Qwen3-ASR on PyTorch, via transformers' native `qwen3_asr` support.
 
-`Qwen/Qwen3-ASR-0.6B` and `Qwen/Qwen3-ASR-1.7B` — Apache-2.0 multilingual ASR
-from Alibaba (Jan 2026). 52 supported languages including EN and RU. On
-LibriSpeech "other" (noisy) the 1.7B variant beats Whisper-large-v3 by ~15%
-relative WER; English clean is roughly a wash; the multilingual average is
-meaningfully better.
+`Qwen/Qwen3-ASR-{0.6B,1.7B}-hf` — Apache-2.0 multilingual ASR from Alibaba
+(Jan 2026), 30 supported languages including EN and RU. On LibriSpeech "other"
+(noisy) the 1.7B variant beats Whisper-large-v3 by ~15% relative WER.
 
-Word-level timestamps require the companion `Qwen3-ForcedAligner-0.6B` —
-loaded alongside the ASR model via `forced_aligner=...` at init time. Without
-the aligner, only segment-level timestamps are available.
+**This candidate deliberately does NOT use the official `qwen-asr` package.**
+That package pins `transformers==4.57.6` exactly, and the Higgs Audio v3 TTS
+checkpoint needs `transformers>=5.5` — the two cannot coexist in one
+environment. Transformers grew native `qwen3_asr` support in **5.13.0**
+(`Qwen3ASRForConditionalGeneration` + `Qwen3ASRForTokenClassification` for the
+forced aligner), so driving the models straight through transformers removes
+the conflict entirely and drops four exact pins (`transformers`, `accelerate`,
+`nagisa`, `soynlp`) plus `vllm`, `gradio`, and `flask` from the dependency set.
 
-Install: `pip install qwen-asr` (the official package from the Qwen team).
-Heavy deps; the module imports lazily so adding the candidate to patmir.toml
-doesn't pull anything in until the user flips it on.
+Requires **transformers >= 5.13**. On an older transformers the checkpoint's
+`model_type: qwen3_asr` is unknown and `from_pretrained` fails with
+`KeyError: 'qwen3_asr'`; `__init__` raises with that instruction instead.
+
+Note the `-hf` checkpoint suffix: `Qwen/Qwen3-ASR-1.7B-hf` is the
+transformers-native conversion. The unsuffixed `Qwen/Qwen3-ASR-1.7B` is the
+original layout the `qwen-asr` package reads and will NOT load here.
+
+## Long-form audio
+
+Upstream's package hid long-form segmentation inside `transcribe()`; the
+transformers API is single-shot, so segmentation lives here. The encoder does
+handle arbitrary length (windowed, ~13 audio tokens/second), but decoding a
+whole 5-minute transcript in one autoregressive pass invites repetition loops
+and needs a huge `max_new_tokens`. Instead we cut the audio into chunks at
+Silero VAD silences (`ctx.extra["vad_intervals"]`, set by the separate stage),
+capped at `chunk_seconds`, and run them **batched** — the ASR and the aligner
+both support batch inference natively.
+
+Cutting on VAD boundaries means no decode budget is spent on silence, and it
+yields finer sentence granularity than the MLX path's coarse internal chunking
+(which pushed per-sentence TTS p90 to 21 s — see `stages/asr/qwen3-asr-mlx.md`).
+
+## Word timestamps
+
+`Qwen/Qwen3-ForcedAligner-0.6B-hf` is a single forward pass (no AR decode) with
+a classification head predicting each word's length. It covers a **subset** of
+the ASR languages (`_ALIGNER_LANGS`); outside that set, or if an optional
+tokenizer dependency is missing, we degrade to chunk-level sentence timings
+rather than failing the stage.
+
+Install: `uv pip install "transformers>=5.13" torch torchaudio soundfile`
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from patmir.pipeline.context import JobContext
-from patmir.pipeline.stage import AudioTrack, Transcript, Word
-from patmir.pipeline.stages.asr._sentence import group_into_sentences, write_transcript
+from patmir.pipeline.stage import AudioTrack, Sentence, Transcript, Word
+from patmir.pipeline.stages.asr._sentence import (
+    filter_words_by_vad,
+    is_non_lexical,
+    word_in_target_script,
+    write_transcript,
+)
 
+SAMPLE_RATE = 16_000
 
-# Qwen3-ASR returns the language as the full English name (e.g. "English",
-# "Russian"). Downstream stages expect ISO 639-1 codes. Limited to the source
-# languages the rest of the pipeline supports; anything else falls back to
-# lowercased first token.
-_QWEN_LANG_TO_ISO: dict[str, str] = {
+# Minimum transformers release carrying `models/qwen3_asr` (added 5.13.0).
+MIN_TRANSFORMERS = (5, 13)
+
+# Qwen3-ASR reports the language as a full English name ("English", "Russian").
+# Downstream pipeline stages expect ISO 639-1.
+_FULL_TO_ISO: dict[str, str] = {
     "english": "en",
     "russian": "ru",
     "armenian": "hy",
 }
+
+# The forced aligner covers a subset of the ASR languages (ISO codes for the
+# set documented on the model card). Japanese additionally needs `nagisa` and
+# Korean `soynlp`; a missing one surfaces as ImportError and is caught.
+_ALIGNER_LANGS = frozenset({"zh", "en", "yue", "fr", "de", "it", "ja", "ko", "pt", "ru", "es"})
 
 
 def _to_iso(language: str | None) -> str | None:
     if not language:
         return None
     key = language.strip().lower()
-    if key in _QWEN_LANG_TO_ISO:
-        return _QWEN_LANG_TO_ISO[key]
-    # Accept already-ISO inputs like "en" / "ru" unchanged.
+    if key in _FULL_TO_ISO:
+        return _FULL_TO_ISO[key]
     if len(key) == 2 and key.isalpha():
         return key
     return key.split()[0]
@@ -56,14 +100,9 @@ def _resolve_device(requested: str) -> str:
             return "cuda"
         if torch.backends.mps.is_available():
             return "mps"
-    except ImportError:
+    except Exception:
         pass
     return "cpu"
-
-
-def _device_map_arg(device: str) -> str:
-    # qwen-asr's device_map expects "cuda:0" / "cpu" / "mps".
-    return "cuda:0" if device == "cuda" else device
 
 
 def _dtype(name: str):
@@ -72,102 +111,297 @@ def _dtype(name: str):
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
         "float32": torch.float32,
-    }.get(name, torch.float32)
+    }.get(name, torch.bfloat16)
 
 
-class Qwen3ASR:
+def _check_transformers() -> None:
+    """Fail with the fix rather than `KeyError: 'qwen3_asr'`."""
+    import transformers  # type: ignore[import-not-found]
+
+    version = getattr(transformers, "__version__", "0")
+    parts: list[int] = []
+    for piece in version.split(".")[:2]:
+        digits = "".join(c for c in piece if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 2:
+        parts.append(0)
+
+    if tuple(parts) < MIN_TRANSFORMERS:
+        want = ".".join(str(p) for p in MIN_TRANSFORMERS)
+        raise RuntimeError(
+            f"Qwen3-ASR needs transformers >= {want} for native `qwen3_asr` support; "
+            f"found {version}. Older releases fail with KeyError: 'qwen3_asr'. "
+            f"Fix: uv pip install --upgrade 'transformers>={want}'. "
+            "NOTE: do NOT install the `qwen-asr` package — it pins "
+            "transformers==4.57.6 and would break the Higgs TTS stage."
+        )
+
+
+def build_chunks(
+    duration: float,
+    vad_intervals: list[tuple[float, float]] | None,
+    max_seconds: float,
+    pad_seconds: float = 0.2,
+) -> list[tuple[float, float]]:
+    """Cut `[0, duration]` into ASR windows no longer than `max_seconds`.
+
+    With VAD intervals the cuts land in silence, so no chunk boundary splits a
+    word and no decode budget is spent on silence. Without them, fixed windows.
+    A single speech interval longer than `max_seconds` is hard-split.
+    """
+    if max_seconds <= 0:
+        raise ValueError("max_seconds must be > 0")
+
+    if not vad_intervals:
+        chunks: list[tuple[float, float]] = []
+        start = 0.0
+        while start < duration:
+            chunks.append((start, min(duration, start + max_seconds)))
+            start += max_seconds
+        return chunks
+
+    # Split over-long intervals first, so the greedy pass below only ever has
+    # to decide where to *group*, never where to cut inside speech.
+    pieces: list[tuple[float, float]] = []
+    for raw_start, raw_end in sorted(vad_intervals):
+        start, end = max(0.0, float(raw_start)), min(duration, float(raw_end))
+        if end <= start:
+            continue
+        while end - start > max_seconds:
+            pieces.append((start, start + max_seconds))
+            start += max_seconds
+        pieces.append((start, end))
+
+    grouped: list[tuple[float, float]] = []
+    for start, end in pieces:
+        if grouped and end - grouped[-1][0] <= max_seconds:
+            grouped[-1] = (grouped[-1][0], end)
+        else:
+            grouped.append((start, end))
+
+    # Pad outward for word onsets, but never past a neighbour's midpoint.
+    padded: list[tuple[float, float]] = []
+    for i, (start, end) in enumerate(grouped):
+        lo = 0.0 if i == 0 else (grouped[i - 1][1] + start) / 2.0
+        hi = duration if i == len(grouped) - 1 else (end + grouped[i + 1][0]) / 2.0
+        padded.append((max(lo, start - pad_seconds), min(hi, end + pad_seconds)))
+    return padded
+
+
+class Qwen3ASRTorch:
     id = "qwen3_asr"
 
     def __init__(
         self,
         model_id: str,
-        device: str,
+        device: str = "auto",
         dtype: str = "bfloat16",
-        forced_aligner: str | None = "Qwen/Qwen3-ForcedAligner-0.6B",
+        forced_aligner: str | None = "Qwen/Qwen3-ForcedAligner-0.6B-hf",
         aligner_dtype: str = "bfloat16",
         max_new_tokens: int = 256,
+        chunk_seconds: float = 28.0,
+        batch_size: int = 8,
+        attn_implementation: str = "sdpa",
     ) -> None:
-        from qwen_asr import Qwen3ASRModel  # lazy import (heavy)
+        _check_transformers()
+        from transformers import (  # type: ignore[import-not-found]
+            AutoProcessor,
+            Qwen3ASRForConditionalGeneration,
+            Qwen3ASRForTokenClassification,
+        )
 
         self.device = _resolve_device(device)
         self.model_id = model_id
-        self.forced_aligner = forced_aligner
-        kwargs: dict[str, Any] = dict(
+        self.max_new_tokens = max_new_tokens
+        self.chunk_seconds = chunk_seconds
+        self.batch_size = max(1, batch_size)
+
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = Qwen3ASRForConditionalGeneration.from_pretrained(
+            model_id,
             dtype=_dtype(dtype),
-            device_map=_device_map_arg(self.device),
-            max_new_tokens=max_new_tokens,
-        )
+            attn_implementation=attn_implementation,
+        ).to(self.device).eval()
+
+        self.aligner = None
+        self.aligner_processor = None
         if forced_aligner:
-            kwargs["forced_aligner"] = forced_aligner
-            kwargs["forced_aligner_kwargs"] = dict(
+            self.aligner_processor = AutoProcessor.from_pretrained(forced_aligner)
+            self.aligner = Qwen3ASRForTokenClassification.from_pretrained(
+                forced_aligner,
                 dtype=_dtype(aligner_dtype),
-                device_map=_device_map_arg(self.device),
-            )
-        self.model = Qwen3ASRModel.from_pretrained(model_id, **kwargs)
+                attn_implementation=attn_implementation,
+            ).to(self.device).eval()
+
+    # ---- audio -----------------------------------------------------------
+
+    def _load_audio(self, audio: AudioTrack) -> np.ndarray:
+        import soundfile as sf  # type: ignore[import-not-found]
+
+        samples, sr = sf.read(str(audio.path), dtype="float32", always_2d=False)
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1)
+        if sr != SAMPLE_RATE:
+            import torch  # type: ignore[import-not-found]
+            import torchaudio  # type: ignore[import-not-found]
+            samples = torchaudio.functional.resample(
+                torch.from_numpy(samples), sr, SAMPLE_RATE
+            ).numpy()
+        return np.ascontiguousarray(samples, dtype=np.float32)
+
+    # ---- ASR -------------------------------------------------------------
+
+    def _transcribe_batch(
+        self, clips: list[np.ndarray], language: str | None
+    ) -> list[dict[str, Any]]:
+        import torch  # type: ignore[import-not-found]
+
+        inputs = self.processor.apply_transcription_request(
+            audio=clips,
+            language=[language] * len(clips) if language else None,
+        ).to(self.model.device, self.model.dtype)
+
+        with torch.inference_mode():
+            output_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens)
+        generated = output_ids[:, inputs["input_ids"].shape[1]:]
+        parsed = self.processor.decode(generated, return_format="parsed")
+        return list(parsed)
+
+    def _align_batch(
+        self, clips: list[np.ndarray], transcripts: list[str], language: str
+    ) -> list[list[dict[str, Any]]]:
+        """Word timestamps per clip, relative to that clip's start.
+
+        Returns `[]` for a clip whose alignment produced nothing. Any failure
+        degrades the whole batch to empty rather than failing the stage —
+        chunk-level timings still place the line, just less precisely.
+        """
+        import torch  # type: ignore[import-not-found]
+
+        assert self.aligner is not None and self.aligner_processor is not None
+        aligner_inputs, word_lists = self.aligner_processor.prepare_forced_aligner_inputs(
+            audio=clips, transcript=transcripts, language=language,
+        )
+        aligner_inputs = aligner_inputs.to(self.aligner.device, self.aligner.dtype)
+
+        with torch.inference_mode():
+            outputs = self.aligner(**aligner_inputs)
+
+        return list(self.aligner_processor.decode_forced_alignment(
+            logits=outputs.logits,
+            input_ids=aligner_inputs["input_ids"],
+            word_lists=word_lists,
+            timestamp_token_id=self.aligner.config.timestamp_token_id,
+        ))
 
     def transcribe(self, audio: AudioTrack, ctx: JobContext) -> Transcript:
-        ctx.progress("asr", 0.05, f"qwen3-asr ({self.model_id}) on {self.device}")
-        results = self.model.transcribe(
-            audio=str(audio.path),
-            return_time_stamps=self.forced_aligner is not None,
-        )
-        ctx.progress("asr", 0.9, "decoded")
+        ctx.progress("asr", 0.02, f"qwen3-asr ({self.model_id}) on {self.device}")
+        samples = self._load_audio(audio)
 
-        if not results:
+        vad: list[tuple[float, float]] | None = ctx.extra.get("vad_intervals")
+        chunks = build_chunks(audio.duration, vad, self.chunk_seconds)
+        if not chunks:
             return Transcript(language=ctx.source_lang or "en", words=[], sentences=[])
 
-        first = results[0]
-        raw_lang = getattr(first, "language", None)
-        language = _to_iso(raw_lang) or ctx.source_lang or "en"
+        clips = [
+            samples[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)]
+            for start, end in chunks
+        ]
+        ctx.progress("asr", 0.05, f"{len(chunks)} chunks (VAD-snapped)" if vad else f"{len(chunks)} chunks")
+
+        # Language: honour an explicit source language, else auto-detect on the
+        # longest chunk (most speech = most reliable) and then FORCE it for
+        # every chunk. Per-chunk auto-detect mislabels short interjections,
+        # which is a documented source of foreign-script hallucination.
+        language = ctx.source_lang
+        if not language:
+            longest = max(range(len(clips)), key=lambda i: len(clips[i]))
+            probe = self._transcribe_batch([clips[longest]], None)
+            language = _to_iso(probe[0].get("language") if probe else None) or "en"
+            ctx.progress("asr", 0.08, f"detected {language}")
         ctx.source_lang = language
 
-        # Word timestamps are present when the forced aligner was loaded.
-        # The qwen_asr API exposes them as `time_stamps` — a list of entries
-        # with `word`/`text` + `start` + `end` keys (or tuple).
-        words: list[Word] = []
-        ts = getattr(first, "time_stamps", None) or getattr(first, "word_timestamps", None)
-        if ts:
-            for entry in ts:
-                word_text, start, end = _parse_ts_entry(entry)
-                if word_text is None:
-                    continue
-                words.append(Word(text=word_text, start=float(start), end=float(end)))
-        else:
-            # No aligner — synthesize one "word" per character-free segment so
-            # downstream sentence-grouping still gets something to chew on.
-            # In practice users will run with the aligner enabled.
-            text = first.text.strip()
-            if text:
-                words.append(Word(text=text, start=0.0, end=audio.duration))
+        results: list[dict[str, Any]] = []
+        for offset in range(0, len(clips), self.batch_size):
+            batch = clips[offset:offset + self.batch_size]
+            results.extend(self._transcribe_batch(batch, language))
+            done = min(len(clips), offset + self.batch_size)
+            ctx.progress("asr", 0.08 + 0.62 * done / len(clips), f"decoded {done}/{len(clips)}")
 
-        sentences = group_into_sentences(words)
+        texts = [str(r.get("transcription") or "").strip() for r in results]
+
+        # Align only the chunks that produced text; keep the mapping back.
+        timings: dict[int, list[dict[str, Any]]] = {}
+        can_align = self.aligner is not None and language in _ALIGNER_LANGS
+        if self.aligner is not None and not can_align:
+            ctx.progress("asr", 0.72, f"aligner has no {language} — chunk-level timings")
+        if can_align:
+            indices = [i for i, t in enumerate(texts) if t]
+            for offset in range(0, len(indices), self.batch_size):
+                group = indices[offset:offset + self.batch_size]
+                try:
+                    aligned = self._align_batch(
+                        [clips[i] for i in group], [texts[i] for i in group], language,
+                    )
+                except ImportError as exc:
+                    # ja/ko word splitting needs an optional tokenizer package.
+                    ctx.progress("asr", 0.8, f"aligner unavailable ({exc}) — chunk-level timings")
+                    break
+                for i, entries in zip(group, aligned):
+                    timings[i] = entries
+                done = min(len(indices), offset + self.batch_size)
+                ctx.progress("asr", 0.7 + 0.25 * done / max(1, len(indices)), f"aligned {done}/{len(indices)}")
+
+        words: list[Word] = []
+        sentences: list[Sentence] = []
+        for i, ((chunk_start, chunk_end), text) in enumerate(zip(chunks, texts)):
+            if not text or is_non_lexical(text):
+                continue
+
+            chunk_words: list[Word] = []
+            for entry in timings.get(i, []):
+                word_text = str(entry.get("text") or "").strip()
+                if not word_text or not word_in_target_script(word_text, language):
+                    continue
+                chunk_words.append(Word(
+                    text=word_text,
+                    start=chunk_start + float(entry.get("start_time", 0.0)),
+                    end=chunk_start + float(entry.get("end_time", 0.0)),
+                ))
+            chunk_words = filter_words_by_vad(chunk_words, vad)
+
+            # Narrow the sentence to where the speaker actually talks: the
+            # chunk carries VAD padding, and the mux places TTS at these times.
+            if chunk_words:
+                start = min(w.start for w in chunk_words)
+                end = max(w.end for w in chunk_words)
+            else:
+                start, end = chunk_start, chunk_end
+
+            words.extend(chunk_words)
+            sentences.append(Sentence(
+                idx=len(sentences),
+                text=text,
+                start=start,
+                end=end,
+                words=chunk_words,
+            ))
+
+        ctx.progress("asr", 1.0, f"{len(sentences)} sentences, {len(words)} words")
         transcript = Transcript(language=language, words=words, sentences=sentences)
         write_transcript(ctx.job_dir, transcript)
         return transcript
 
 
-def _parse_ts_entry(entry: Any) -> tuple[str | None, float, float]:
-    if isinstance(entry, dict):
-        text = entry.get("word") or entry.get("text") or entry.get("token")
-        start = entry.get("start") or entry.get("start_time") or entry.get("begin") or 0.0
-        end = entry.get("end") or entry.get("end_time") or entry.get("stop") or 0.0
-        return (str(text).strip() if text else None, float(start), float(end))
-    if isinstance(entry, (list, tuple)) and len(entry) >= 3:
-        text, start, end = entry[0], entry[1], entry[2]
-        return (str(text).strip() if text else None, float(start), float(end))
-    # Object with attributes
-    text = getattr(entry, "word", None) or getattr(entry, "text", None)
-    start = getattr(entry, "start", 0.0)
-    end = getattr(entry, "end", 0.0)
-    return (str(text).strip() if text else None, float(start), float(end))
-
-
-def build(config: dict[str, Any]) -> Qwen3ASR:
-    return Qwen3ASR(
+def build(config: dict[str, Any]) -> Qwen3ASRTorch:
+    return Qwen3ASRTorch(
         model_id=config["model_id"],
         device=config.get("device", "auto"),
         dtype=config.get("dtype", "bfloat16"),
-        forced_aligner=config.get("forced_aligner", "Qwen/Qwen3-ForcedAligner-0.6B"),
+        forced_aligner=config.get("forced_aligner", "Qwen/Qwen3-ForcedAligner-0.6B-hf"),
         aligner_dtype=config.get("aligner_dtype", "bfloat16"),
         max_new_tokens=int(config.get("max_new_tokens", 256)),
+        chunk_seconds=float(config.get("chunk_seconds", 28.0)),
+        batch_size=int(config.get("batch_size", 8)),
+        attn_implementation=config.get("attn_implementation", "sdpa"),
     )

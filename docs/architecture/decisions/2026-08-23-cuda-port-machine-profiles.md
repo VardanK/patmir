@@ -194,7 +194,7 @@ half right: it was indeed not a config change. It was ~150 lines in the candidat
 | --- | --- | --- |
 | separate | `htdemucs_vocals` | **new.** `vocals_only` added to the torch candidate, mirroring the MLX one |
 | diarize | `sortformer_nemo` | **new.** Same model as the Mac, on NVIDIA's own NeMo |
-| asr | `faster_whisper_large_v3_fp16` | **changed** — see the dependency conflict below |
+| asr | `qwen3_asr_1_7b` | **changed twice on the day.** The `qwen-asr` package's exact `transformers==4.57.6` pin forced an interim move to `faster_whisper_large_v3_fp16`; transformers 5.13's native `qwen3_asr` then removed the conflict and restored parity. See Decision 4 and its amendment |
 | tts | `higgs_v3_torch_bf16` | **new** |
 
 `separate` is worth the small port rather than falling back to the full `htdemucs_ft` bag: the stage
@@ -285,6 +285,55 @@ Two consequences:
   the hard part is word timestamps (the MLX path uses a bundled ForcedAligner). Deferred until a
   working baseline exists rather than written blind.
 
+### Amendment (2026-08-23, later the same day) — parity restored, `faster_whisper` demoted
+
+The "path back to parity" above was taken immediately, because the author's judgement was that
+Qwen3-ASR is needed for this pipeline rather than nice to have. Everything in Decision 4's diagnosis
+holds; only the conclusion changes.
+
+What was verified before writing code, rather than assumed:
+
+- `qwen-asr` 0.0.6 is the latest release, and its PyPI metadata pins `transformers==4.57.6` —
+  an exact pin, alongside exact pins on `accelerate`, `nagisa`, `soynlp`, and a `vllm` extra. The
+  conflict is real and has no looser version to wait for.
+- `src/transformers/models/qwen3_asr` is present in the v5.13.0 tree and absent from v5.12.0, which
+  pins the floor precisely instead of trusting the release note.
+- The registered classes are `Qwen3ASRForConditionalGeneration` (transcription) and
+  `Qwen3ASRForTokenClassification` (the forced aligner). **The aligner is included** — that was the
+  open question that had made this "new code with a hard part", and the answer is that transformers
+  ships it, exposed as `prepare_forced_aligner_inputs` / `decode_forced_alignment` on the processor.
+- `Qwen/Qwen3-ASR-1.7B-hf` and `Qwen/Qwen3-ForcedAligner-0.6B-hf` exist, declare
+  `model_type: qwen3_asr`, and carry no remote code. The **`-hf` suffix is load-bearing**: the
+  unsuffixed repos are the layout the `qwen-asr` package reads. The Mac's MLX candidate keeps the
+  unsuffixed aligner, since `mlx-qwen3-asr` reads that one.
+
+Since 5.13 also satisfies the Higgs checkpoint's `>=5.5`, there is nothing left to trade: the profile
+selects `qwen3_asr_1_7b` again, ASR is the same model family on both machines, and the dependency set
+*shrinks* — four exact pins plus `gradio`, `flask`, and `sox` never enter. `nagisa` and `soynlp` turn
+out to be Japanese and Korean word-splitting only, which this project does not transcribe.
+
+Two things this costs, stated plainly:
+
+- **Long-form segmentation became ours.** The package hid it inside `transcribe()`; the transformers
+  API is single-shot. `build_chunks()` cuts on the separate stage's Silero VAD silences, capped at
+  `chunk_seconds`, and the chunks run batched through both models. This is the one place the two
+  machines' ASR now genuinely differs in behaviour rather than runtime — and plausibly in our favour,
+  since the MLX path's coarse internal chunking is what pushed per-sentence TTS p90 to 21.4 s. That
+  is motivation, not a measurement.
+- **The version floor is now split**: `[cuda]` carries `transformers>=5.13` while `local` stays at
+  `>=5.5`, so the Mac is not forced to upgrade for a candidate it does not select. The module gates
+  on the version at build time, so selecting it on a stale environment reports the fix instead of
+  `KeyError: 'qwen3_asr'` — the failure that made this conflict confusing the first time.
+
+`faster_whisper_large_v3_fp16` stays registered as the no-Qwen fallback. Its virtue is unchanged and
+still worth having on record: CTranslate2 has no transformers dependency at all, so it is the escape
+hatch if this ever becomes a version fight again.
+
+Unit tests cover the chunker (no chunk exceeds the cap, chunks never overlap, speech that fits is
+never cut, over-long intervals hard-split, padding never crosses a neighbour), the version gate, and
+language normalization — 32 tests, 284 in the suite. **The models themselves have still never been
+executed on CUDA**, and `chunk_seconds=28` / `batch_size=8` are reasoned defaults, not swept.
+
 ## Status of verification
 
 Everything in this ADR that is *mechanism* is verified on the Mac: profile resolution and precedence
@@ -294,7 +343,7 @@ green.
 
 Nothing in it that *touches CUDA* has been executed. `higgs_v3_torch_bf16` was written against the
 upstream source and `sortformer_nemo` against the model card, neither against a running GPU;
-`htdemucs_vocals` and `qwen3_asr_1_7b` have never run in this pipeline at all.
+`htdemucs_vocals` and `qwen3_asr_1_7b` have never run in this pipeline at all — and `qwen3_asr_1_7b` was rewritten against transformers after this section was first written, so its long-form chunking is unexercised too.
 
 What *is* covered by tests is the runtime-independent part, which is more than it sounds:
 
