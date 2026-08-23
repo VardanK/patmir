@@ -251,8 +251,49 @@ def _publish(job_dir: Path, job_id: str, cfg: PipelineConfig, ctx: JobContext) -
     return str(dest)
 
 
+# Resolved once: the MLX cache-clear callable, or False when MLX is unusable on
+# this machine. Memoized because Python does NOT cache a failed import, so
+# probing per stage would redo the whole dlopen attempt nine times a job.
+_MLX_CLEAR_CACHE: Any = None
+
+
+def _mlx_clear_cache() -> None:
+    """Best-effort MLX cache free; a no-op where MLX isn't usable.
+
+    The exception handling is deliberately broad, and `except ImportError` was
+    NOT enough. On a non-Apple machine with the `mlx` wheel installed, importing
+    it fails inside dlopen with `OSError: libmlx.so: cannot open shared object
+    file` — which sailed past the old guard and took down every run after the
+    first stage, on a box whose active profile selected no MLX candidate at all.
+    Freeing a cache is never worth failing a job for.
+    """
+    global _MLX_CLEAR_CACHE
+    if _MLX_CLEAR_CACHE is None:
+        try:
+            import mlx.core as mx  # type: ignore[import-not-found]
+            # The API moved from `mx.metal.clear_cache` (deprecated in newer
+            # MLX) to `mx.clear_cache`. Prefer the new one, fall back, else None.
+            fn = getattr(mx, "clear_cache", None)
+            if fn is None:
+                fn = getattr(getattr(mx, "metal", None), "clear_cache", None)
+            _MLX_CLEAR_CACHE = fn if callable(fn) else False
+        except Exception:  # noqa: BLE001 — see the docstring
+            _MLX_CLEAR_CACHE = False
+    if _MLX_CLEAR_CACHE:
+        try:
+            _MLX_CLEAR_CACHE()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _free_accelerator_cache() -> None:
-    """Drop the just-finished stage's compute graph + free MPS/CUDA cache."""
+    """Drop the just-finished stage's compute graph + free MPS/CUDA/MLX cache.
+
+    Entirely best-effort: this is memory hygiene between stages, and nothing
+    about a run's correctness depends on it. So every backend probe swallows its
+    own failures rather than letting an accelerator that isn't even in use decide
+    whether the job completes.
+    """
     import gc
 
     gc.collect()
@@ -262,23 +303,9 @@ def _free_accelerator_cache() -> None:
             torch.mps.empty_cache()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except ImportError:
+    except Exception:  # noqa: BLE001 — same reasoning as _mlx_clear_cache
         pass
-    try:
-        import mlx.core as mx  # type: ignore[import-not-found]
-        # MLX cache-clear API moved from `mx.metal.clear_cache` (deprecated
-        # in newer MLX) to `mx.clear_cache`. Try the new one first, fall
-        # back to the old one, no-op if neither is available.
-        clear_cache = getattr(mx, "clear_cache", None)
-        if clear_cache is None:
-            clear_cache = getattr(getattr(mx, "metal", None), "clear_cache", None)
-        if callable(clear_cache):
-            try:
-                clear_cache()
-            except (AttributeError, RuntimeError):
-                pass
-    except ImportError:
-        pass
+    _mlx_clear_cache()
 
 
 def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobContext):

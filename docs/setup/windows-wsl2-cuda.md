@@ -281,6 +281,7 @@ to `.wslconfig` and `wsl --shutdown`.
 | `torch.cuda.is_available()` is False | Python 3.14 instead of 3.12 — check `python --version` first, always |
 | `nvidia-smi` works but torch sees no GPU | a Linux driver package was installed inside WSL |
 | Everything inexplicably slow | repo or `HF_HOME` sitting on `/mnt/c/` |
+| Run dies after the first stage with `libmlx.so: cannot open shared object file` | Two compounding causes, both fixed in-tree — `git pull` if you hit it. `[local]` used to install the Apple-only `mlx-*` wheels here (now gated on `sys_platform == 'darwin'`), and `_free_accelerator_cache()`, which runs after **every** stage, probed MLX under `except ImportError` while dlopen actually raises `OSError`. It fired regardless of the active profile, so a correct `PATMIR_PROFILE=cuda` did not save you. Belt and braces: `uv pip uninstall mlx mlx-audio mlx-whisper mlx-lm` |
 | Extension cannot reach the server | missing `networkingMode=mirrored` |
 | Mux stage fails | `rubberband-cli` not installed |
 | Higgs load report says `audio_head.weight \| MISSING \| newly initialized` | **Expected, not a problem.** The checkpoint omits that key because the model ties it to `audio_embedding.weight`; the tie is applied after the report is printed. Confirmed tied on the 3090 (shared storage, identical norms). The candidate asserts the tie at build time, so a genuinely broken tie is a hard error rather than silent noise |
