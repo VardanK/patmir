@@ -149,6 +149,40 @@ def normalize_tied_weights_keys(snapshot: str) -> bool:
     return False
 
 
+def tolerate_list_tied_weights_keys() -> bool:
+    """Make transformers' loading path accept the old LIST form of
+    `_tied_weights_keys`. Returns True if it installed the patch.
+
+    `normalize_tied_weights_keys` above patches the class we can resolve, which
+    is the tidier fix — but it only works if `from_pretrained` then uses that
+    same class object. Dynamic remote code is re-copied and re-imported under a
+    hashed module name in `HF_MODULES_CACHE`, so the loader can end up with a
+    *different* class object carrying the shipped list again. This patch does not
+    care which object it is: it coerces the attribute on every submodule at the
+    moment the loader reads it.
+
+    Scoped and idempotent, and it only ever rewrites a list into the dict the
+    installed transformers already expects — never the reverse. Removing it once
+    the checkpoint's remote code adopts the dict form is a one-line deletion.
+    """
+    import transformers.modeling_utils as mu
+
+    original = getattr(mu, "_get_tied_weight_keys", None)
+    if original is None or getattr(original, "_patmir_list_tolerant", False):
+        return False
+
+    def _list_tolerant(module):
+        for submodule in module.modules():
+            keys = getattr(submodule, "_tied_weights_keys", None)
+            if isinstance(keys, list):
+                submodule._tied_weights_keys = {k: _TIED_SOURCE for k in keys}
+        return original(module)
+
+    _list_tolerant._patmir_list_tolerant = True
+    mu._get_tied_weight_keys = _list_tolerant
+    return True
+
+
 class HiggsV3Torch:
     id = "higgs_v3_torch"
     # IVC-style: clones from audio alone; ref_text only improves fidelity.
@@ -217,8 +251,11 @@ class HiggsV3Torch:
             # the slow mirror (ADR 2026-05-26-prefer-fast-model-mirrors). The
             # tokenizer itself is a plain Qwen2 tokenizer with no auto_map.
             self.tok = Qwen2TokenizerFast.from_pretrained(snap)
-            # Must happen BEFORE from_pretrained — see the function's docstring.
+            # Both must happen BEFORE from_pretrained. The first patches the class
+            # we can resolve; the second covers the case where the loader
+            # re-imports the remote code and gets a different class object.
             normalize_tied_weights_keys(snap)
+            tolerate_list_tied_weights_keys()
             # The model class *does* need trust_remote_code — it is the repo's
             # own `modeling_higgs_multimodal_qwen3`. Loading from the local
             # snapshot keeps that resolution off the network.

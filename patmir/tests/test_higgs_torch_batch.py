@@ -556,6 +556,65 @@ class TiedWeightsShimTest(unittest.TestCase):
         )
 
 
+@unittest.skipIf(
+    _snapshot() is None,
+    f"Higgs checkpoint snapshot not found under {_hub_cache()}",
+)
+class ListTolerantLoadTest(unittest.TestCase):
+    """The class-level normalization only helps if `from_pretrained` uses the
+    class object we patched. Dynamic remote code is re-copied and re-imported
+    under a hashed module name, so the loader can hold a DIFFERENT object still
+    carrying the shipped list. This patch coerces the attribute where the loader
+    reads it, so class identity stops mattering."""
+
+    def setUp(self):
+        import transformers.modeling_utils as mu
+        self.mu = mu
+        self._saved_helper = mu._get_tied_weight_keys
+        self.snapshot = str(_snapshot())
+
+    def tearDown(self):
+        self.mu._get_tied_weight_keys = self._saved_helper
+
+    def test_loading_helper_tolerates_the_list_without_touching_the_class(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import (
+            tolerate_list_tied_weights_keys,
+        )
+
+        model = _tiny_model(self.snapshot)
+        # Simulate the loader's own class object, untouched by normalization.
+        type(model)._tied_weights_keys = ["audio_head.weight"]
+        with self.assertRaises(AttributeError):
+            self.mu._get_tied_weight_keys(model)
+
+        self.assertTrue(tolerate_list_tied_weights_keys())
+        self.assertEqual(
+            self.mu._get_tied_weight_keys(_tiny_model(self.snapshot)),
+            ["audio_head.weight"],
+        )
+
+    def test_patch_is_idempotent(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import (
+            tolerate_list_tied_weights_keys,
+        )
+
+        tolerate_list_tied_weights_keys()
+        self.assertFalse(tolerate_list_tied_weights_keys())
+
+    def test_a_dict_is_left_alone(self):
+        """It must only ever widen list -> dict, never the reverse."""
+        from patmir.eval.candidates.tts.higgs_v3_torch import (
+            tolerate_list_tied_weights_keys,
+        )
+
+        tolerate_list_tied_weights_keys()
+        model = _tiny_model(self.snapshot)
+        mapping = {"audio_head.weight": "audio_embedding.weight"}
+        type(model)._tied_weights_keys = dict(mapping)
+        self.mu._get_tied_weight_keys(model)
+        self.assertEqual(type(model)._tied_weights_keys, mapping)
+
+
 class AdapterBatchDispatchTest(unittest.TestCase):
     """`SentenceTTS` has to actually route to `synthesize_batch`, hand it the
     WHOLE sentence list (the candidate's length sort is only worth anything if
