@@ -288,12 +288,26 @@ to `.wslconfig` and `wsl --shutdown`.
 
 ## GPU power limit
 
-MSI Afterburner does not exist here. A bandwidth-bound workload loses very little to a reduced
-core power limit while shedding meaningful heat, which matters on a 3090 whose GDDR6X sits on both
-sides of the PCB:
+**Set it on the Windows side, not in WSL.** The GPU is owned by the Windows driver and WSL only gets
+a stub (`libcuda.so` is stubbed in, and `nvidia-smi` lives at `/usr/lib/wsl/lib/nvidia-smi`).
+NVIDIA's CUDA-on-WSL guide states that "modifiable state features (ECC, Compute mode, Persistence
+mode) will not be supported" — it does not name the power limit specifically, but that is the
+category it falls in, so expect `nvidia-smi -pl` inside WSL to be refused.
 
-```bash
-sudo nvidia-smi -pl 280      # 80% of a 350 W card
-```
+Whatever limit is applied on the Windows side applies to the card globally, so WSL workloads inherit
+it. There is nothing to configure inside WSL.
 
-Does not survive a reboot — put it in a systemd unit if it should persist.
+In order of reliability on a consumer GeForce card:
+
+1. **MSI Afterburner** — the Power Limit slider (set to 80%, then apply). Reliable on GeForce because
+   it goes through the vendor overclocking API rather than NVML. Tick the startup option to make it
+   persist across reboots.
+2. **Windows `nvidia-smi -pl 280`** in an Administrator prompt (280 W = 80% of a 350 W 3090). Often
+   refused on GeForce cards under WDDM, where power management through NVML is restricted; worth one
+   attempt, but Afterburner is the fallback.
+3. **WSL `nvidia-smi -pl`** — expect "not supported". Listed only so nobody spends time on it.
+
+Worth doing for long runs: a memory-bandwidth-bound workload gives up very little to a reduced core
+power limit while shedding real heat, which matters on a 3090 whose GDDR6X sits on both sides of the
+PCB. It is a mitigation, though, not a fix — if the memory junction runs hot, the cause is usually
+the thermal pads rather than the power target.
