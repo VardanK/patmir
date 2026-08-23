@@ -213,12 +213,17 @@ def run_job(
             raise
         finally:
             stage_obj = None  # noqa — drop reference
-            # Only reclaim scratch when we actually built something. On a cache
-            # hit there is no build scratch to drop, and running it anyway threw
-            # away the allocator pool the next stage immediately re-requested —
-            # 9 times per section in watch-along.
-            if not cache_hit:
-                _free_accelerator_cache()
+            # ALWAYS reclaim, including on a cache hit. Skipping it on hits was
+            # tried 2026-08-23 on the theory that a hit has no build scratch to
+            # drop; watch-along regressed from 1.71 to 3.02 agg RTF with every
+            # stage ~65-72% slower — the signature of a uniform system-level
+            # stall, and vm_stat showed heavy swapping. MLX's Metal buffers live
+            # in unified memory but sit largely outside RSS (peak RSS read only
+            # 10.1 GB, which is why RSS was a misleading instrument here), so the
+            # accumulating scratch is invisible to process accounting while still
+            # driving the machine into swap. Do not re-introduce the gate without
+            # a memory instrument that actually sees Metal allocations.
+            _free_accelerator_cache()
 
         if stop_after and name == stop_after:
             break

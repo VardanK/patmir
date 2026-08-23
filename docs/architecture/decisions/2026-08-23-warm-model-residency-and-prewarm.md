@@ -68,9 +68,23 @@ Costs and caveats:
   batch and watch-along on separate Higgs candidates, a shared cache would have
   held two 4B instances (8.6 GB of TTS alone) and would not fit 24 GB of VRAM.
   One candidate id means one instance serves both modes.
-- **Skipping `_free_accelerator_cache()` on hits is not yet measured.** It should
-  help, but it also lets MLX/MPS scratch accumulate across nine stages per
-  section. Re-bench watch-along peak memory before treating it as settled.
+- **Skipping `_free_accelerator_cache()` on hits was tried and REVERTED the same
+  day.** Watch-along regressed from 1.710 to **3.018** agg RTF with every stage
+  ~65–72% slower — the signature of a uniform system-level stall, not a logic
+  bug. Peak RSS read 10.4 GB with the gate vs 7.3 GB without it, and `vm_stat`
+  showed heavy swapping. MLX's Metal buffers live in unified memory but sit
+  largely outside RSS, so accumulating scratch is invisible to process
+  accounting while still pushing the machine into swap — which is why RSS was a
+  misleading instrument for this question. Reverting recovered to 2.011 (a 33%
+  improvement) but not to the 1.710 baseline; that residual is unexplained and
+  the confirming run was contaminated by machine sleep, so treat the causal link
+  as directional rather than proven. **Do not re-introduce the gate without a
+  memory instrument that actually sees Metal allocations.**
+- **This laptop is not a usable benchmark host for 15-minute GPU-saturating
+  runs.** It suspends mid-run (per-stage walls come from `time.time()` and so
+  absorb suspended time, while `agg_rtf` comes from `perf_counter` and does
+  not), carries pre-existing swap pressure, and throttles under sustained load.
+  Re-measure perf changes of this size on the dedicated workstation.
 - `bench.py` batch still passes no cache deliberately, so `--repeat` continues to
   measure the cold-build path.
 

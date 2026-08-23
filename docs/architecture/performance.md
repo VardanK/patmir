@@ -174,12 +174,18 @@ baselines below rebuilt every stage model on both calls.
   Roadmap #2 (warm-model loop) is confirmed landed and effective.
 - **Dubbed audio 301.0s == source 301.1s**, so the pad is no longer analyzed twice.
   Roadmap #5 confirmed landed (masha previously read 314.7s dubbed over 300s source).
-- **Section pipelining is now the largest remaining software win.** The analysis half
+- **Section pipelining: big on paper, small on MLX.** The analysis half
   (ingest+separate+diarize+emotion+asr) is 0.578 RTF; the dub half (translate+tts+mux) is
-  0.992 RTF. They run strictly sequentially today, so the two sum to 1.71. Overlapping them
-  caps the result at `max(0.578, 0.992)` ≈ **0.99 RTF — a 42% cut** if they parallelize
-  cleanly. They contend for one GPU, so the real gain is smaller, but the cloud-translate
-  wait (25.3s) and the CPU-only ECAPA/remap work overlap for free.
+  0.992 RTF, and they run strictly sequentially, so the two sum to 1.71. Overlapping them
+  would cap at `max(0.578, 0.992)` ≈ 0.99 RTF — a 42% cut — **but only with real
+  parallelism, which MLX does not provide.** The D3 spike measured this directly
+  (`spike/d3_throughput/FINDINGS.md`): "thread-concurrency is a dead end — MLX serializes on
+  one GPU stream; conc 2/4 leave wall-clock flat and just inflate per-sentence latency."
+  Both halves are GPU-bound, so on this machine only the cloud-translate wait (25.3s, 5.3%)
+  and the CPU-only ECAPA/remap work would actually overlap — call it **5–8%, not 42%**.
+  Worth building on CUDA, where streams overlap for real; not worth the concurrency
+  complexity (two workers, two-level coverage, seek-vs-in-flight reconciliation) for single
+  digits on MLX.
 - **ASR is 17.4% here vs 10.8% in batch** because each section re-runs ASR on its own
   padded slice. The ForcedAligner (a second 0.6B encode+forward per chunk) is the
   droppable part — worth ~5–6% of wall, not the ~29% it would have been under Whisper.
@@ -308,7 +314,33 @@ Full matrix (all warm except the noted cold first-run):
 7. **Cold-start is real for one-shot batch:** first-ever Higgs use costs ~240s of
    model-fetch + MLX Metal-kernel JIT compilation (one-time per process).
 
-**Realtime gaps to close (2026-08-23, Reacher):** batch **0.17 RTF**; watch-along **0.71 RTF**. Section pipelining is the largest remaining software lever (watch-along ceiling ≈ 0.99). Neither gap closes on this machine while `tts_rtf > 1` — the Higgs q8 decode runs at ~154 GB/s effective, 77% of the M1 Pro's 200 GB/s peak, so it is bandwidth-saturated rather than inefficient.
+### Rejected: skipping the inter-stage accelerator-cache free on warm hits
+
+Tried 2026-08-23 alongside the warm-model residency work, on the theory that a cache
+hit has no build scratch to reclaim. **Reverted the same day.**
+
+| watch-along run | agg RTF | peak RSS |
+| --- | --: | --: |
+| baseline | **1.710** | – |
+| skipping the free on hits | **3.018** | 10.4 GB |
+| reverted to unconditional | 2.011 (sleep-contaminated) | 7.3 GB |
+
+Every stage slowed ~65–72% — uniform across Demucs, Qwen3-ASR and Higgs, which is a
+system-level stall rather than a bug in any one stage. MLX's Metal buffers live in
+unified memory but sit largely **outside RSS**, so the accumulating scratch never showed
+up in process accounting while still driving the machine into swap. RSS was the wrong
+instrument for the question.
+
+Two cautions for whoever revisits this:
+
+- The confirming run spanned a machine suspend, so the 2.011 is directional, not a clean
+  measurement. The residual gap to 1.710 is unexplained.
+- **Do not benchmark changes of this size on the laptop.** It suspends mid-run (per-stage
+  walls come from `time.time()` and absorb suspended time; `agg_rtf` comes from
+  `perf_counter` and does not), carries pre-existing swap pressure, and throttles under
+  sustained load. Three of the four runs that night were confounded by the host.
+
+**Realtime gaps to close (2026-08-23, Reacher):** batch **0.17 RTF**; watch-along **0.71 RTF**. No remaining MLX-side software lever closes either: section pipelining is 5–8% here (MLX serializes on one GPU stream), dropping the watch-along ForcedAligner is ~5–6%, and splitting ASR chunks flattens the TTS p90 tail without cutting total TTS time. The MLX optimization well is essentially dry — Neither gap closes on this machine while `tts_rtf > 1` — the Higgs q8 decode runs at ~154 GB/s effective, 77% of the M1 Pro's 200 GB/s peak, so it is bandwidth-saturated rather than inefficient.
 
 ---
 
