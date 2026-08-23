@@ -414,7 +414,9 @@ remain rejected. See `stages/asr/qwen3-asr-mlx.md`.
 
 ### 4. TTS per-speaker prefix-KV caching  ·  ❌ DROPPED 2026-08-23
 
-Measured ceiling was −14% of TTS time on the MLX port. Dropped because the CUDA move deletes `eval/candidates/tts/higgs_v3_mlx.py` for the upstream PyTorch implementation, which supplies bf16, flash-attention and batched decode across sentences — strictly more than the prefix-KV win, with no hand-maintained runtime to carry. Do not tune code that is being removed. Original measurement retained below.
+Measured ceiling was −14% of TTS time on the MLX port. Dropped because the CUDA move leaves that port behind for a PyTorch candidate on the 3090. Do not tune code the active machine no longer runs. Original measurement retained below.
+
+**Correction (2026-08-23):** this entry originally justified the drop by saying the PyTorch path "supplies bf16, flash-attention and batched decode across sentences." Only bf16 was right. Upstream's port declares `_supports_sdpa` only, so flash-attention is refused; and its `generate_speech()` is batch-1, so batched decode had to be written (see #6), not inherited. The drop still stands — prefix-KV was an MLX-only optimization — but it was not free.
 
 #### Original entry  ·  measured ceiling: −14% of TTS time
 **Update 2026-07-14:** mlx-audio's native Higgs v3 runtime measured (the ADR
@@ -457,6 +459,34 @@ decoding — research-grade).
 - **Risk:** low–medium — the pad exists so VAD can find the next silence; shrink
   carefully or cache the boundary analysis instead of recomputing.
 - **Becomes:** folds into the warm-model-loop spec (#2) or a small standalone.
+
+### 6. TTS batched decode across sentences  ·  ✅ LANDED 2026-08-23 (CUDA only, UNMEASURED)
+
+The successor to #4, and a much larger lever on paper. The prefill/decode split measured under #4
+is what makes the case: **decode is 73% of TTS time and is memory-bandwidth-bound**. At batch 1
+every step reads all 4B weights to advance one sentence. Reading them once to advance B sentences is
+close to free, so the ceiling here is roughly the batch size — where prefix-KV caching capped out at
+−14%.
+
+- **Where:** `patmir/eval/candidates/tts/higgs_v3_torch.py` (`synthesize_batch` /
+  `_decode_chunk`), dispatched by `patmir/pipeline/stages/tts/adapter.py`. CUDA only — the MLX port
+  is untouched, and MLX would not benefit the same way since it serializes on one GPU stream.
+- **Knob:** `max_batch` on the candidate entry, default 8. Chosen from memory arithmetic, not
+  measurement: ~8 GB of bf16 weights, and the KV cache is only ~144 KiB/token (GQA, 8 KV heads), so
+  B=8 over a 1500-token context adds ~1.7 GiB on a 24 GB card. The ceiling should be compute.
+- **Chunks are sorted by expected length.** A chunk costs `max(steps)`, not `mean(steps)`, so
+  pairing a one-word line with a long sentence wastes the short row's slot. Sorting by the token cap
+  (proportional to text length) keeps `sum/max` per chunk near the batch size — without it the win
+  degrades badly on mixed-length dialogue.
+- **Verified:** batch-vs-single decode equivalence, bitwise, on a tiny randomly-initialized model on
+  CPU at temperature 0 — including a row retiring mid-batch on a smaller cap while its neighbours
+  continue (the masking path). **Not verified:** anything about throughput.
+- **Measuring it:** `tts/timings.jsonl` rows become per **chunk** under batching (`"kind": "chunk"`)
+  because a per-sentence wall no longer exists. `total_s` and `tts_rtf` stay truthful; mean/median/
+  p90/max now describe chunks. The per-sentence p90/max that flagged the watch-along buffer risk has
+  no direct successor — the chunk distribution is the thing to watch instead.
+- **Open follow-up:** a finished row still occupies its slot until the whole chunk drains. With
+  length-sorted chunks the waste is bounded, but compacting the batch mid-flight would recover it.
 
 ### Not recommended now
 - **Cold-start MLX kernel pre-warm** (~240s first-run) — only affects the first

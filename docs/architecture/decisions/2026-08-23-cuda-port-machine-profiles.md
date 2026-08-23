@@ -53,7 +53,7 @@ Storage roots are unaffected. Profiles change `entries`, which `ui.cache.config_
 the two machines have different cache keys and cannot serve each other a dub built from a different
 model set (verified: `3fceb31d` vs `e9ab98d0`).
 
-## Decision 2 — `higgs_v3_torch_bf16` wraps upstream instead of porting again
+## Decision 2 — `higgs_v3_torch_bf16` reuses upstream's model, not its decode loop
 
 The MLX candidate (`eval/candidates/tts/higgs_v3_mlx.py`, 367 lines) exists because torch-MPS
 cannot do fast quantized matmul, and the 4B decode is memory-bandwidth-bound: ~69 ms/step at
@@ -62,10 +62,24 @@ the AR graph — weight remap, fused multi-codebook embed/head, delay-pattern sa
 machine — by hand.
 
 None of that argument survives on a discrete NVIDIA GPU: bf16 is native, bandwidth is ~4.7x, and
-`multimodalart/higgs-audio-v3-tts-4b-transformers` already ships a complete transformers
-implementation with a public `generate_speech()`. So the new candidate is a thin wrapper (~250 lines,
-most of it commentary) that adds only what the pipeline needs on top:
+`multimodalart/higgs-audio-v3-tts-4b-transformers` ships a complete transformers implementation with
+a public `generate_speech()`. The first cut of this candidate was therefore a thin wrapper around
+that call.
 
+**It no longer is, and the reason is batching.** `generate_speech()` is batch-1, and batch-1 is
+exactly the wrong shape for a bandwidth-bound decode: every step reads all 4B weights to produce one
+sentence's next frame. Reading them once to advance B sentences is close to free, so batching is the
+single largest lever on this stage — and TTS is ~69% of batch wall. There is no way to reach it
+through upstream's public API, so the decode loop now lives in the candidate.
+
+That is still not a second port. Everything model-specific is reused from the *loaded checkpoint's
+own module*, reached through `sys.modules[type(self.model).__module__]` rather than re-imported: the
+delay-pattern helpers, the codec constants, and — the part that matters — `_SamplerState` /
+`_sampler_step`, so the delay ramp-up and EOC wind-down state machine is upstream's, run once per
+row. What the candidate adds is only:
+
+- **the batching mechanics** — left-padded prefill with `position_ids` derived from the attention
+  mask, per-row caps and stop state, per-row de-delay and codec decode;
 - **reference-code caching** — upstream re-encodes the reference clip on every call; with one pinned
   ref per speaker that is the same clip re-encoded once per sentence;
 - **the emotion-bin to inline `<|emotion:..|>` tag map**, byte-identical to the MLX candidate's, so
@@ -73,25 +87,52 @@ most of it commentary) that adds only what the pipeline needs on top:
   `test_config_profiles.RuntimeParityTest`);
 - **the non-termination guardrail** — length-proportional token cap plus reseed-and-retry.
 
-The MLX candidate stays registered. This is a second runtime for one model, not a replacement:
-the laptop still needs the MLX one.
+Three consequences worth recording:
 
-### Two claims from the planning phase that turned out to be wrong
+- **Chunks are sorted by expected length.** A chunk costs `max(steps)`, not `mean(steps)`, so a
+  one-word line batched with a long sentence waits for it. Requests are sorted by their token cap
+  (proportional to text length, which predicts generation length) before chunking, which keeps
+  `sum/max` per chunk near the batch size. The sort has to be global to be worth anything, which is
+  why the adapter hands the candidate the whole sentence list in one call and takes progress back
+  through an `on_chunk` callback instead of chunking itself.
+- **Overflow detection became exact.** The `generate_speech` version had to *infer* overflow from
+  the output waveform's length against the token cap, calibrating frames-to-samples off the first
+  reference encode and giving up entirely on a job with no reference clip. Owning the loop means row
+  counts are simply known. The inference, and its calibration, are gone.
+- **`synthesize()` is a batch of one.** Deliberately, so there is one decode implementation rather
+  than two that can drift.
+
+Sampling is not batch-invariant: rows share one global RNG stream, so a sentence's output depends on
+which batch it landed in. That is inherent to sampled decoding rather than a defect, and it is why
+the equivalence test pins temperature to 0.
+
+The MLX candidate stays registered. This is a second runtime for one model, not a replacement: the
+laptop still needs the MLX one.
+
+### How the batching is verified without a GPU
+
+A tiny randomly-initialized `HiggsMultimodalQwen3` (10M params, 2 layers) runs on CPU in the test
+suite, driven through the real decode path. At temperature 0 the comparison is deterministic, and a
+row decoded inside a batch comes out **bitwise identical** to the same row decoded alone — across
+differing prompt lengths, a reference-conditioned row batched with text-only rows, and a row that
+retires mid-batch on a smaller cap while its neighbours keep going. That last case is the one that
+matters most: it is the masking path, and if a finished row leaked into a live one the live rows
+would diverge. Random weights never emit a stop token, so the EOC path is forced separately by
+stubbing the audio head.
+
+This catches the mistakes batching actually invites — padding corrupting a row, `position_ids`
+drifting from the attention mask so RoPE sees the wrong positions, finished-row state bleeding
+across. It says nothing about GPU throughput, which is still unmeasured.
+
+### One claim from the planning phase that remains wrong
 
 - **Flash-attention is not available.** The upstream port declares `_supports_sdpa` only — no
   `_supports_flash_attn` — so requesting `flash_attention_2` is refused by transformers. The knob
   exists on the candidate (`attn_implementation`) but defaults to `sdpa` and cannot usefully be
   changed until upstream flags support.
-- **Batched decode across sentences is not available either.** `generate_speech()` is batch-1. It
-  remains a real optimization on CUDA, but it is upstream work or a fork, not a config change.
 
-Overflow detection is weaker than on MLX and this is a deliberate trade. Our MLX loop knows how many
-rows it generated; `generate_speech()` returns only a waveform. The wrapper infers overflow from
-output length against the token cap, calibrating frames-to-samples from the first reference encode
-(exact for this codec, no magic constant) and skipping detection when a job has no reference clip.
-Driving our own decode loop over upstream's private methods would restore the exact signal at the
-cost of coupling to internals — not worth it for a net that measured 0 overflows in 122 sentences
-across three clips at temperature 0.8.
+(The companion claim, that batched decode was "upstream work or a fork, not a config change", was
+half right: it was indeed not a config change. It was ~150 lines in the candidate.)
 
 ## Decision 3 — the `cuda` profile's candidate set
 
@@ -148,16 +189,29 @@ green.
 
 Nothing in it that *touches CUDA* has been executed. `higgs_v3_torch_bf16` was written against the
 upstream source and `sortformer_nemo` against the model card, neither against a running GPU;
-`htdemucs_vocals` and `qwen3_asr_1_7b` have never run in this pipeline at all. What *is* covered by
-tests is the runtime-independent part: 35 tests over the shared diarize post-processing and the NeMo
-return parser, including the one genuinely ambiguous case (a 3-element sequence is both a valid
-segment and a valid group of three). First-run expectations, and what to check, are in
+`htdemucs_vocals` and `qwen3_asr_1_7b` have never run in this pipeline at all.
+
+What *is* covered by tests is the runtime-independent part, which is more than it sounds:
+
+- batch-vs-single decode equivalence, bitwise, on a real (tiny, CPU) model — see above;
+- the batching orchestration on stubs: chunking, cap-sorting, output ordering through the reorder,
+  the overflow retry touching only failed rows, and the silence fallback;
+- the adapter's dispatch to the batch path, including that per-chunk bench timings keep `total_s`
+  and `tts_rtf` truthful (attributing a chunk's wall to each of its sentences would multiply both by
+  the batch size);
+- the shared diarize post-processing and the NeMo return parser, including the one genuinely
+  ambiguous case (a 3-element sequence is both a valid segment and a valid group of three).
+
+229 tests green. What remains unverified is throughput: whether batching delivers on the 3090, and
+at what `max_batch`. First-run expectations, and what to check, are in
 `docs/setup/windows-wsl2-cuda.md` Phase 9.
 
 ## Revisit
 
-- Upstream flags flash-attention support, or batched decode arrives (both are TTS speedups the
-  wrapper can then take for free).
+- Upstream flags flash-attention support (a TTS speedup the candidate can then take for free).
+- `max_batch` is tuned against the 3090. 8 is a conservative guess from the memory math, not a
+  measurement; the ceiling should be compute, not memory, since the KV cache is small (GQA, 8 KV
+  heads, 144 KiB/token).
 - NeMo's `diarize()` return shape turns out to be something the tolerant parser rejects — tighten it
   to the real shape and drop the tolerance rather than widening it further.
 - The 3090 baseline comes in far from the ~0.35 batch / ~0.51 watch-along projection — the

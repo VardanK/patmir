@@ -62,6 +62,27 @@ class SentenceTTS:
             self._supports_emotion = False
             self._supports_speaker = False
             self._supports_voice_id = False
+        # Batched engines (Higgs on CUDA) synthesize many sentences in one
+        # decode pass, because an AR decode that is memory-bandwidth-bound on
+        # the model weights gets most of a second sentence for free. Such a
+        # candidate exposes `synthesize_batch` + `tts_max_batch`; everything
+        # else keeps the per-sentence loop below.
+        #
+        # The whole sentence list goes to the candidate in ONE call rather than
+        # being chunked here, because the candidate sorts by expected length
+        # before chunking — a chunk costs max(steps), not mean — and that sort
+        # has to be global to be worth anything. In exchange the candidate calls
+        # back per chunk (`on_chunk`) so progress and timing stay per-chunk
+        # instead of going dark for the whole stage.
+        batch_fn = getattr(inner, "synthesize_batch", None)
+        self._batch_fn = batch_fn if callable(batch_fn) else None
+        self._max_batch = max(1, int(getattr(inner, "tts_max_batch", 1)))
+        self._batch_on_chunk = False
+        if self._batch_fn is not None:
+            try:
+                self._batch_on_chunk = "on_chunk" in inspect.signature(self._batch_fn).parameters
+            except (TypeError, ValueError):
+                pass
         # IVC-style candidates (ElevenLabs) clone from audio alone and don't
         # need the reference transcript. They set `ref_text_optional = True`
         # so we treat refs with empty `ref_text` as usable for them.
@@ -265,6 +286,12 @@ class SentenceTTS:
         concurrency = max(1, int(getattr(self.inner, "tts_concurrency", 1)))
         results: list[bytes | None] = [None] * len(jobs)
         elapsed: list[float | None] = [None] * len(jobs)
+        # Populated only on the batched path: one entry per decode chunk. Under
+        # batching a per-SENTENCE wall does not exist — the chunk's cost is
+        # shared — so timings are reported per chunk instead of inventing a
+        # per-sentence number, which would multiply the true total by the batch
+        # size in bench's `total_s` and `tts_rtf`.
+        chunk_spans: list[tuple[list[int], float]] = []
 
         def _synth(idx: int) -> None:
             s, kwargs = jobs[idx]
@@ -272,7 +299,32 @@ class SentenceTTS:
             results[idx] = self.inner.synthesize(s.target_text, **kwargs)
             elapsed[idx] = time.perf_counter() - t0
 
-        if concurrency > 1 and len(jobs) > 1:
+        use_batch = self._batch_fn is not None and self._max_batch > 1 and len(jobs) > 1
+        if use_batch:
+            payload = [{"text": s.target_text, **kwargs} for s, kwargs in jobs]
+            done = 0
+
+            def _on_chunk(indices: list[int], wall_s: float) -> None:
+                nonlocal done
+                done += len(indices)
+                chunk_spans.append((list(indices), wall_s))
+                ctx.progress("tts", min(done / total, 1.0),
+                             f"sentence {done}/{total} (batch of {len(indices)})")
+
+            batch_kwargs: dict[str, Any] = {}
+            if self._batch_on_chunk:
+                batch_kwargs["on_chunk"] = _on_chunk
+            t0 = time.perf_counter()
+            outs = self._batch_fn(payload, **batch_kwargs)
+            whole = time.perf_counter() - t0
+            for i, wav_bytes in enumerate(outs[:len(jobs)]):
+                results[i] = wav_bytes
+            if not chunk_spans:
+                # Candidate batches but doesn't report chunks: attribute the one
+                # call as a single span so the totals stay right.
+                chunk_spans.append((list(range(len(jobs))), whole))
+            ctx.progress("tts", 1.0, f"{total} sentences in {len(chunk_spans)} batches")
+        elif concurrency > 1 and len(jobs) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=concurrency) as ex:
                 futs = {ex.submit(_synth, i): i for i in range(len(jobs))}
@@ -288,13 +340,15 @@ class SentenceTTS:
 
         # Write WAVs + build the index in source order.
         bench_rows: list[dict[str, Any]] = []
-        for (s, _kwargs), wav_bytes, dt in zip(jobs, results, elapsed):
+        durations: list[float] = [0.0] * len(jobs)
+        for job_i, ((s, _kwargs), wav_bytes, dt) in enumerate(zip(jobs, results, elapsed)):
             if wav_bytes is None:
                 continue
             wav_path = out_dir / f"{s.idx:04d}.wav"
             wav_path.write_bytes(wav_bytes)
             sr, duration = _wav_header_meta(wav_bytes)
             sample_rate = sample_rate or sr
+            durations[job_i] = duration
             sentences.append(SynthesizedSentence(
                 idx=s.idx,
                 wav_path=wav_path,
@@ -310,6 +364,25 @@ class SentenceTTS:
                     "audio_s": round(duration, 4),
                     "chars": len(s.target_text),
                 })
+
+        if chunk_spans:
+            # Per-chunk rows. `sum(elapsed_s)` is still the true synthesis wall
+            # and `audio_s` the true audio, so bench's `total_s` / `tts_rtf`
+            # remain correct; the distribution stats (mean/median/p90/max)
+            # describe CHUNKS rather than sentences, which `kind` records.
+            bench_rows = [
+                {
+                    "kind": "chunk",
+                    "sentences": len(idxs),
+                    "elapsed_s": round(wall_s, 4),
+                    "audio_s": round(sum(durations[i] for i in idxs), 4),
+                    "chars": sum(len(jobs[i][0].target_text) for i in idxs),
+                }
+                for idxs, wall_s in (
+                    ([i for i in raw if 0 <= i < len(jobs)], w) for raw, w in chunk_spans
+                )
+                if idxs
+            ]
 
         out = SynthesizedAudio(sentences=sentences, sample_rate=sample_rate)
         _write_index(ctx.job_dir, out)

@@ -191,7 +191,7 @@ source ~/.bashrc
 | `separate` | `htdemucs_vocals` | torch twin of `htdemucs_mlx_vocals`; same vocals-specialist sub-model (`04573f0d`), `accompaniment = mix - vocals` |
 | `asr` | `qwen3_asr_1_7b` | torch sibling of the MLX candidate; bf16 rather than 8-bit |
 | `diarize` | `sortformer_nemo` | Same Sortformer model as the Mac, on NVIDIA's own NeMo. Needs the extra install below |
-| `tts` | `higgs_v3_torch_bf16` | same Higgs v3 model on the repo's own transformers runtime |
+| `tts` | `higgs_v3_torch_bf16` | same Higgs v3 model, decoded **batched across sentences** (`max_batch`, default 8) |
 
 Watch-along additionally picks up `[pipeline.profiles.cuda.streaming]`, which replaces the MLX-only
 `separate` override that `streaming/runner.py` hardcodes.
@@ -239,9 +239,27 @@ Two things to watch on the first run, both consequences of the profile rather th
   raises, its message carries the offending value, which should make it a one-line fix. Check
   `diarize/turns.json` for a plausible speaker count either way; if NeMo won't install at all, flip
   the profile's `diarize` to `pyannote_3_1` and accept the short-turn merging (quality issue #13).
-- **TTS output.** `higgs_v3_torch_bf16` had never been executed when it was written — it was built
-  against the upstream source, not against a running GPU. Ear-test one line before benching a full
-  clip, and check `tts/voice_cloning_summary.json` for the `overflows` count.
+- **TTS output.** `higgs_v3_torch_bf16` had never been executed on a GPU when it was written. Its
+  batching is verified bitwise against single-sentence decode on a tiny CPU model, but throughput is
+  not. Ear-test one line before benching a full clip, then check
+  `tts/voice_cloning_summary.json` for `overflows` and `batches`.
+
+  `max_batch = 8` in the candidate entry is a conservative guess from memory arithmetic, not a
+  measurement — weights are ~8 GB bf16 and the KV cache only ~144 KiB/token (GQA, 8 KV heads), so
+  B=8 over a 1500-token context adds just ~1.7 GiB. The ceiling should be compute, not memory, so
+  sweep it upward once a baseline exists:
+
+  ```bash
+  for b in 4 8 16; do
+    # edit max_batch in patmir.toml, then:
+    patmir bench samples/Reacher-S02E01-5min.mkv --mode batch \
+      --report runs/bench/reacher-cuda-b$b.json --label "max_batch=$b"
+  done
+  ```
+
+  Under batching, `tts/timings.jsonl` rows are per **chunk**, not per sentence (`"kind": "chunk"`),
+  because a per-sentence wall no longer exists — the chunk's cost is shared. Bench's `total_s` and
+  `tts_rtf` stay correct; its mean/median/p90/max describe chunks.
 
 Then, in order: fix whatever the first run surfaces, capture the baseline, and only then look at
 optimizations (batched TTS decode across sentences, section pipelining — which pays here in a way

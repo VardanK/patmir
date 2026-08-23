@@ -446,15 +446,26 @@ seed          = 0
 max_retries   = 1
 codec_device  = "mps"
 
-# Same Higgs Audio v3 model on PyTorch — the CUDA path (thin wrapper over the
-# repo's own transformers implementation, no hand-written AR loop). bf16 is the
-# checkpoint's native dtype, so unlike the MLX path there is no quantization
-# step and no q8-vs-bf16 quality question. `attn_implementation` stays "sdpa":
-# the upstream port declares `_supports_sdpa` only, so flash_attention_2 would
-# be refused by transformers until upstream flags support for it.
-# UNMEASURED as of 2026-08-23 — written from the upstream source, not yet run
-# on the 3090. Baseline to beat: MLX q8 on the M1 Pro, batch agg RTF 1.17 with
-# TTS 244.4 s (69.4% of wall) on samples/Reacher-S02E01-5min.mkv.
+# Same Higgs Audio v3 model on PyTorch — the CUDA path. bf16 is the checkpoint's
+# native dtype, so unlike the MLX path there is no quantization step and no
+# q8-vs-bf16 quality question.
+#
+# `max_batch` is the headline knob: the AR decode is memory-bandwidth-bound on
+# the 4B weights, so a step reads all of them to advance ONE sentence at batch 1.
+# Batching amortizes that read, which is why TTS (~69% of batch wall) is the
+# stage worth batching. 8 is chosen to be safely conservative on 24 GB rather
+# than measured: weights are ~8 GB bf16 and the KV cache is cheap here because
+# the model is GQA with 8 KV heads — 144 KiB/token, so B=8 over a 1500-token
+# context is only ~1.7 GiB. Raise it after measuring; the ceiling is compute,
+# not memory. Set to 1 to fall back to the adapter's per-sentence loop.
+#
+# `attn_implementation` stays "sdpa": the upstream port declares `_supports_sdpa`
+# only, so flash_attention_2 is refused by transformers until upstream flags it.
+#
+# UNMEASURED on GPU as of 2026-08-23 — never run on the 3090. Batch-vs-single
+# decode equivalence IS verified (bitwise, on a tiny CPU model — see
+# test_higgs_torch_batch.py). Baseline to beat: MLX q8 on the M1 Pro, batch agg
+# RTF 1.17 with TTS 244.4 s (69.4% of wall) on samples/Reacher-S02E01-5min.mkv.
 [[eval.tts.candidates]]
 id            = "higgs_v3_torch_bf16"
 enabled       = true
@@ -467,6 +478,7 @@ temperature   = 0.8
 top_p         = 0.95
 seed          = 0
 max_retries   = 2
+max_batch     = 8
 
 [[eval.tts.candidates]]
 id            = "omnivoice_mlx_bf16"
