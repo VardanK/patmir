@@ -12,7 +12,16 @@ dependencies = [
 # Translation / TTS via HuggingFace transformers (NLLB, MMS-TTS).
 local = [
   "torch>=2.2",
-  "transformers>=4.40",
+  # >=5.5, not >=4.40. The Higgs TTS checkpoint declares
+  # `transformers_version: 5.5.0` and relies on 5.x contracts: its
+  # tokenizer_config gives `extra_special_tokens` as a LIST (62 entries), which
+  # 4.x feeds to `_set_model_specific_special_tokens` expecting a dict, dying on
+  # `.keys()`; and its remote code passes `key_mapping` to `from_pretrained`.
+  # The old permissive floor let installing nemo_toolkit silently resolve
+  # transformers down to 4.57 and break the TTS stage — after it had already
+  # worked on the same machine. A floor that matches the checkpoint turns that
+  # into an install-time conflict instead of a runtime one.
+  "transformers>=5.5",
   "sentencepiece>=0.2",
   "numpy>=1.26",
   "piper-tts>=1.4",       # Eastern-Armenian community voice (the local TTS baseline)
