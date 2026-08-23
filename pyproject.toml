@@ -57,7 +57,10 @@ cloud = [
 # anyway. Install explicitly on the workstation:
 #     uv pip install -e ".[local,ui,dev,cuda]"
 cuda = [
-  "qwen-asr>=0.1",           # `qwen3_asr_1_7b` (torch sibling of the MLX ASR candidate)
+  # qwen-asr is young: every release to date is on the 0.0.x line (0.0.6 latest,
+  # checked 2026-08-23), so the floor is the newest rather than a rounded-up
+  # guess — `>=0.1` does not exist and makes the extra unresolvable.
+  "qwen-asr>=0.0.6",         # `qwen3_asr_1_7b` (torch sibling of the MLX ASR candidate)
   "nemo_toolkit[asr]>=2.0",  # `sortformer_nemo` (NVIDIA's own Sortformer runtime)
 ]
 # Local FastAPI progress UI (Phase 1).
