@@ -98,7 +98,7 @@ across three clips at temperature 0.8.
 | Stage | Candidate | Notes |
 | --- | --- | --- |
 | separate | `htdemucs_vocals` | **new.** `vocals_only` added to the torch candidate, mirroring the MLX one |
-| diarize | `pyannote_3_1` | **interim, a known regression** — see below |
+| diarize | `sortformer_nemo` | **new.** Same model as the Mac, on NVIDIA's own NeMo |
 | asr | `qwen3_asr_1_7b` | already registered; bf16 rather than 8-bit |
 | tts | `higgs_v3_torch_bf16` | **new** |
 
@@ -109,11 +109,35 @@ re-verified independently while writing this — `htdemucs_ft.yaml` lists sub-mo
 contributes weight 1.0 to source index 3 (vocals) and nothing else. It resolves through torch's
 `demucs.pretrained.get_model` directly, needing none of the registry patching the MLX path required.
 
-`diarize` is the uncomfortable one. Sortformer replaced pyannote on 2026-06-15 *because* pyannote
-community-1 merged short turns from distinct characters into a single speaker — the exact failure
-that drove the original Scribe swap. Selecting `pyannote_3_1` on CUDA reintroduces it. NVIDIA's own
-NeMo runs Sortformer natively on CUDA, so the fix is a NeMo candidate; this line is the interim, and
-it is tracked as quality issue #13 rather than left to be rediscovered by ear.
+`diarize` was the uncomfortable one and is no longer. The first cut of this profile selected
+`pyannote_3_1`, which reintroduced the exact failure that moved diarize off pyannote on 2026-06-15:
+community-1 merges short turns from distinct characters into a single speaker, and those characters
+then share one pinned ref clip and so one voice. `sortformer_nemo` removes the compromise — it is the
+**same model**, run on NVIDIA's own NeMo. NeMo is Sortformer's reference implementation; `mlx-audio`
+is the third-party Apple port. So this is two runtimes for one diarizer, exactly like Higgs above,
+and the same discipline applies: the label normalization, same-speaker merge, overlap derivation and
+VAD filter moved to `_postprocess.py` and are now shared, so the runtimes cannot drift apart in
+post-processing and have the difference mistaken for a model difference. That extraction also gave
+those functions their first tests — they were entirely uncovered, despite deciding the speaker ids
+everything downstream keys off.
+
+Two things about NeMo's runtime are documented thinly, and both are handled defensively rather than
+guessed:
+
+- **Input format.** The card specifies mono 16 kHz; the vocals stem arrives at Demucs's native rate
+  in stereo. `mlx-audio` and pyannote both resample internally, but whether NeMo's dataloader
+  downmixes is documented nowhere, so the stem is converted with ffmpeg into an inspectable job
+  artifact (`diarize/vocals_16k_mono.wav`) first.
+- **Return shape.** All three Sortformer model cards describe `diarize()` as returning segments
+  "formatted as 'begin_seconds, end_seconds, speaker_index'" and **none shows a literal example**, so
+  whether an element is a string, a tuple or an object is genuinely unspecified — as is whether the
+  result is nested per input file. The parser accepts every plausible shape and **raises** on anything
+  else, with the offending value in the message. Guessing here would be the worst option available:
+  a silently mis-parsed diarization does not fail, it resurfaces several stages later as two
+  characters sharing a voice.
+
+`pyannote_3_1` stays registered as the fallback, because NeMo is the heaviest dependency in the stack
+(built from git, wants Cython first) and is the most likely thing to refuse to install.
 
 ## Status of verification
 
@@ -123,15 +147,19 @@ real `cuda` profile selecting no MLX module or `mps` device in either execution 
 green.
 
 Nothing in it that *touches CUDA* has been executed. `higgs_v3_torch_bf16` was written against the
-upstream source, not against a running GPU; `htdemucs_vocals`, `qwen3_asr_1_7b` and `pyannote_3_1`
-have never run in this pipeline at all. First-run expectations, and what to check, are in
+upstream source and `sortformer_nemo` against the model card, neither against a running GPU;
+`htdemucs_vocals` and `qwen3_asr_1_7b` have never run in this pipeline at all. What *is* covered by
+tests is the runtime-independent part: 35 tests over the shared diarize post-processing and the NeMo
+return parser, including the one genuinely ambiguous case (a 3-element sequence is both a valid
+segment and a valid group of three). First-run expectations, and what to check, are in
 `docs/setup/windows-wsl2-cuda.md` Phase 9.
 
 ## Revisit
 
-- NeMo Sortformer candidate lands (closes the diarize regression).
 - Upstream flags flash-attention support, or batched decode arrives (both are TTS speedups the
   wrapper can then take for free).
+- NeMo's `diarize()` return shape turns out to be something the tolerant parser rejects — tighten it
+  to the real shape and drop the tolerance rather than widening it further.
 - The 3090 baseline comes in far from the ~0.35 batch / ~0.51 watch-along projection — the
   projection scales TTS/ASR decode by memory bandwidth and holds cloud translate fixed, so a large
   miss means the model of the bottleneck is wrong, not just the constant.

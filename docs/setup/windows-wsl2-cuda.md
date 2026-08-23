@@ -145,6 +145,19 @@ uv pip install -e ".[local,ui,dev]"
 pytest patmir/tests/ -q
 ```
 
+NeMo, for the `sortformer_nemo` diarize candidate, installs separately — it wants Cython present
+first and is not a published wheel:
+
+```bash
+uv pip install Cython
+uv pip install "git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]"
+python -c "from nemo.collections.asr.models import SortformerEncLabelModel; print('nemo ok')"
+```
+
+This is the heaviest dependency in the stack and the most likely to fight the Python version — it is
+why 3.12 is pinned. If it refuses to build, the pipeline still runs: flip the profile's `diarize` to
+`pyannote_3_1` and revisit.
+
 ## Phase 8 — Model cache and filesystem placement
 
 ```bash
@@ -177,7 +190,7 @@ source ~/.bashrc
 | `translate` | unchanged | cloud (OpenRouter), platform-independent |
 | `separate` | `htdemucs_vocals` | torch twin of `htdemucs_mlx_vocals`; same vocals-specialist sub-model (`04573f0d`), `accompaniment = mix - vocals` |
 | `asr` | `qwen3_asr_1_7b` | torch sibling of the MLX candidate; bf16 rather than 8-bit |
-| `diarize` | `pyannote_3_1` | Sortformer is MLX-only in our tree. A known quality step **down**, not a neutral swap — see below |
+| `diarize` | `sortformer_nemo` | Same Sortformer model as the Mac, on NVIDIA's own NeMo. Needs the extra install below |
 | `tts` | `higgs_v3_torch_bf16` | same Higgs v3 model on the repo's own transformers runtime |
 
 Watch-along additionally picks up `[pipeline.profiles.cuda.streaming]`, which replaces the MLX-only
@@ -218,11 +231,14 @@ bandwidth — **measure it, do not assume it.**
 
 Two things to watch on the first run, both consequences of the profile rather than the hardware:
 
-- **Diarization quality.** `pyannote_3_1` is the interim. Sortformer replaced it (ADR
-  `2026-06-15-local-asr-diarize-via-mlx-audio`) precisely because pyannote merged short turns from
-  distinct characters into one speaker. NVIDIA's own NeMo runs Sortformer natively on CUDA, so the
-  real fix is a NeMo candidate, not a permanent downgrade. Check `diarize/turns.json` for a
-  plausible speaker count before trusting the dub's voice assignment.
+- **Diarization.** `sortformer_nemo` was written against the model card, and two things about
+  NeMo's runtime are documented thinly: `diarize()`'s return type is described but never shown
+  literally, and the model wants mono 16 kHz input. Both are handled defensively — the parser
+  accepts string/tuple/object segments and **raises** on anything else rather than guessing, and the
+  stem is converted with ffmpeg into `diarize/vocals_16k_mono.wav` before NeMo sees it. If the parser
+  raises, its message carries the offending value, which should make it a one-line fix. Check
+  `diarize/turns.json` for a plausible speaker count either way; if NeMo won't install at all, flip
+  the profile's `diarize` to `pyannote_3_1` and accept the short-turn merging (quality issue #13).
 - **TTS output.** `higgs_v3_torch_bf16` had never been executed when it was written — it was built
   against the upstream source, not against a running GPU. Ear-test one line before benching a full
   clip, and check `tts/voice_cloning_summary.json` for the `overflows` count.

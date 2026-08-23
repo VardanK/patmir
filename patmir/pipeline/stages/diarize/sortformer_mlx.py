@@ -15,6 +15,10 @@ Output contract mirrors `pyannote.py`: a `Diarization` with `turns` +
 `overlaps`, `refs={}` (the runner's `pick_refs` fills refs after the emotion
 stage), normalized `SPEAKER_NN` ids, and `diarize/turns.json` on disk.
 
+The post-processing (label normalization, same-speaker merge, overlap
+derivation, VAD filter) lives in `_postprocess.py`, shared with the NeMo/CUDA
+runtime of the same model (`sortformer_nemo.py`) so the two cannot drift.
+
 Capped at 4 speakers (model architecture). VAD post-filter drops turns with
 zero intersection with the Silero VAD intervals from the separate stage.
 
@@ -26,70 +30,13 @@ import json
 from typing import Any
 
 from patmir.pipeline.context import JobContext
-from patmir.pipeline.stage import (
-    Diarization,
-    OverlapInterval,
-    SeparatedAudio,
-    SpeakerTurn,
+from patmir.pipeline.stage import Diarization, SeparatedAudio, SpeakerTurn
+from patmir.pipeline.stages.diarize._postprocess import (
+    derive_overlaps,
+    merge_same_speaker,
+    norm_speaker,
+    passes_vad,
 )
-
-
-def _passes_vad(start: float, end: float, vad_intervals: list[tuple[float, float]] | None) -> bool:
-    if not vad_intervals:
-        return True
-    for vs, ve in vad_intervals:
-        if vs < end and ve > start:
-            return True
-    return False
-
-
-def _norm_speaker(spk: Any) -> str:
-    """Normalize Sortformer's speaker label (int 0..3 or 'speaker_0') to the
-    `SPEAKER_NN` convention `apply_speaker_tags` and the ref-picker expect."""
-    s = str(spk)
-    digits = "".join(c for c in s if c.isdigit())
-    if digits:
-        return f"SPEAKER_{int(digits):02d}"
-    return s
-
-
-def _merge_same_speaker(turns: list[SpeakerTurn], gap: float) -> list[SpeakerTurn]:
-    """Merge consecutive same-speaker turns separated by ≤ `gap` seconds."""
-    merged: list[SpeakerTurn] = []
-    for t in sorted(turns, key=lambda x: (x.start, x.end)):
-        if merged and merged[-1].speaker_id == t.speaker_id and t.start - merged[-1].end <= gap:
-            merged[-1] = SpeakerTurn(
-                start=merged[-1].start,
-                end=max(merged[-1].end, t.end),
-                speaker_id=t.speaker_id,
-            )
-        else:
-            merged.append(SpeakerTurn(start=t.start, end=t.end, speaker_id=t.speaker_id))
-    return merged
-
-
-def _derive_overlaps(turns: list[SpeakerTurn]) -> list[OverlapInterval]:
-    """Time regions where ≥2 distinct speakers are simultaneously active.
-    Within a speaker the merged turns are non-overlapping, so an active count
-    ≥2 necessarily means ≥2 distinct speakers."""
-    events: list[tuple[float, int]] = []
-    for t in turns:
-        events.append((t.start, 1))
-        events.append((t.end, -1))
-    events.sort()
-    overlaps: list[OverlapInterval] = []
-    active = 0
-    ov_start: float | None = None
-    for time, delta in events:
-        prev = active
-        active += delta
-        if prev < 2 <= active:
-            ov_start = time
-        elif prev >= 2 > active and ov_start is not None:
-            if time > ov_start:
-                overlaps.append(OverlapInterval(start=ov_start, end=time))
-            ov_start = None
-    return overlaps
 
 
 class SortformerMLX:
@@ -116,13 +63,13 @@ class SortformerMLX:
                 raw.append(SpeakerTurn(
                     start=float(getattr(seg, "start", 0.0)),
                     end=float(getattr(seg, "end", 0.0)),
-                    speaker_id=_norm_speaker(getattr(seg, "speaker", getattr(seg, "speaker_id", "0"))),
+                    speaker_id=norm_speaker(getattr(seg, "speaker", getattr(seg, "speaker_id", "0"))),
                 ))
         ctx.progress("diarize", 0.8, f"{len(raw)} raw segments")
 
-        merged = _merge_same_speaker(raw, self.merge_gap_seconds)
-        kept = [t for t in merged if _passes_vad(t.start, t.end, separated.vad_intervals)]
-        overlaps = _derive_overlaps(kept)
+        merged = merge_same_speaker(raw, self.merge_gap_seconds)
+        kept = [t for t in merged if passes_vad(t.start, t.end, separated.vad_intervals)]
+        overlaps = derive_overlaps(kept)
         speakers = sorted({t.speaker_id for t in kept})
 
         diarize_dir = ctx.job_dir / "diarize"

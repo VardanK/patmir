@@ -743,12 +743,12 @@ output    = "mkv_default"
 # device "auto" -> cuda with no change.
 [pipeline.profiles.cuda]
 separate  = "htdemucs_vocals"      # torch twin of htdemucs_mlx_vocals (sig 04573f0d)
-# Sortformer is MLX-only in our tree (via mlx-audio), so CUDA falls back to
-# pyannote. NOTE this is a known quality step DOWN, not a neutral swap: pyannote
-# community-1 merged short cartoon turns, which is exactly why diarize moved to
-# Sortformer (ADR 2026-06-15). NVIDIA's own NeMo has Sortformer natively on
-# CUDA — that is the follow-up, and this line is the interim.
-diarize   = "pyannote_3_1"
+# Same Sortformer model as the Mac, on NVIDIA's own NeMo rather than mlx-audio.
+# Keeps diarization quality at parity instead of falling back to pyannote, which
+# merges short turns from distinct characters — the failure that moved diarize
+# off pyannote in the first place (ADR 2026-06-15). `pyannote_3_1` stays
+# registered as the fallback if NeMo won't install.
+diarize   = "sortformer_nemo"
 asr       = "qwen3_asr_1_7b"       # torch sibling of qwen3_asr_1_7b_mlx_8bit; bf16, not 8-bit
 tts       = "higgs_v3_torch_bf16"  # same Higgs v3 model, upstream transformers runtime
 
@@ -897,6 +897,39 @@ id                = "sortformer_mlx"
 module            = "patmir.pipeline.stages.diarize.sortformer_mlx"
 repo_id           = "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp32"
 chunk_duration    = 5.0
+merge_gap_seconds = 0.5    # merge adjacent same-speaker segments separated by ≤ this gap into one turn
+
+# Same Sortformer model on NVIDIA's own NeMo — the CUDA runtime, selected by
+# [pipeline.profiles.cuda]. NeMo is Sortformer's reference implementation
+# (mlx-audio is the third-party Apple port), so this is the same diarizer, not a
+# different one: post-processing is shared with the MLX candidate in
+# `_postprocess.py`. Exists so the CUDA box is not forced back to pyannote,
+# which merges short turns from distinct characters (quality issue #13).
+#
+# `model_id` may also be a local `.nemo` checkpoint path for a fully offline box.
+# Install (Linux + CUDA): `uv pip install Cython` then
+# `uv pip install "git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]"`.
+#
+# The five streaming knobs below are in 80 ms frames and are LEFT UNSET, so the
+# checkpoint's own configuration stands. We run offline over a whole stem, so the
+# presets' headline "latency" is irrelevant here — they trade accuracy against
+# compute. NVIDIA's published sets, if you want to pin one:
+#   very high latency (~30.4 s buffer): chunk_len=340, chunk_right_context=40,
+#       fifo_len=40, spkcache_update_period=300, spkcache_len=188
+#   low latency (~1.04 s buffer):       chunk_len=6,   chunk_right_context=7,
+#       fifo_len=188, spkcache_update_period=144, spkcache_len=188
+# Setting any one of them applies all that are set and then runs NeMo's own
+# `_check_streaming_parameters()`, so an inconsistent combination fails at build
+# time rather than mid-run.
+#
+# UNMEASURED as of 2026-08-23 — written against the model card, never executed.
+# Capped at 4 speakers (model architecture), same as the MLX candidate.
+[[stages.diarize.candidates]]
+id                = "sortformer_nemo"
+module            = "patmir.pipeline.stages.diarize.sortformer_nemo"
+model_id          = "nvidia/diar_streaming_sortformer_4spk-v2.1"
+device            = "auto"   # auto → cuda > mps > cpu
+batch_size        = 1
 merge_gap_seconds = 0.5    # merge adjacent same-speaker segments separated by ≤ this gap into one turn
 
 [[stages.diarize.candidates]]
