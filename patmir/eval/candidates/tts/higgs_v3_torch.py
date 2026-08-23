@@ -211,6 +211,47 @@ class HiggsV3Torch:
             "batches": 0,
         }
 
+        self._check_audio_head_tied()
+
+    def _check_audio_head_tied(self) -> None:
+        """Fail loudly if `audio_head` is not tied to `audio_embedding`.
+
+        The checkpoint deliberately omits `audio_head.weight` — upstream lists it
+        in `_tied_weights_keys` and points it at `audio_embedding.weight` in
+        `tie_weights()`. transformers therefore reports it on load as:
+
+            audio_head.weight | MISSING | newly initialized
+
+        which reads like a broken checkpoint and is not one; the tie overwrites
+        the fresh init afterwards. Verified tied on the 3090 (shared storage,
+        identical norms), 2026-08-23.
+
+        The check exists because the failure mode is invisible. If a future
+        transformers re-initialized that key *after* tying, the head producing
+        every audio logit would be random — and nothing downstream would notice:
+        the decode still runs, sentences still terminate, `overflows` still reads
+        0, RTF still looks fine. The only symptom is that the output is noise. So
+        assert the invariant rather than trusting a load report that actively
+        suggests the opposite of the truth.
+        """
+        enc = getattr(self.model.config, "audio_encoder_config", None) or {}
+        if not bool(enc.get("tie_word_embeddings", True)):
+            return  # a checkpoint that genuinely ships its own head
+        head = getattr(self.model.audio_head, "weight", None)
+        embed = getattr(self.model.audio_embedding, "weight", None)
+        if head is None or embed is None:
+            return  # a stubbed head (tests) — nothing to verify
+        if head.data_ptr() != embed.data_ptr():
+            raise RuntimeError(
+                "Higgs audio_head is NOT tied to audio_embedding, so it holds "
+                "randomly-initialized weights and every synthesized line would be "
+                "noise. The checkpoint omits `audio_head.weight` by design and "
+                "relies on the model's `tie_weights()`; something (most likely a "
+                "transformers version change re-initializing missing keys after "
+                "tying) has broken that. Fix by calling `model.tie_weights()` "
+                "after `from_pretrained`, or pin transformers."
+            )
+
     # ---- reference encoding (cached) ---- #
     def _encode_ref(self, path: str):
         """Reference clip -> raw `[T, N]` codes, cached by path.

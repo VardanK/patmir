@@ -398,6 +398,33 @@ class BatchEquivalenceTest(unittest.TestCase):
         # Delay ramp (N steps) + EOC detection + (N-2) wind-down, far below 200.
         self.assertLess(wav.shape[0], 30)
 
+    def test_audio_head_is_tied_to_the_embedding(self):
+        """The checkpoint omits `audio_head.weight` and relies on `tie_weights()`,
+        so transformers reports it as MISSING/newly-initialized on EVERY load.
+        That report is a red herring — but only while the tie actually holds."""
+        self._candidate(max_batch=8)  # constructing it runs the check
+        self.assertEqual(
+            self.model.audio_head.weight.data_ptr(),
+            self.model.audio_embedding.weight.data_ptr(),
+        )
+
+    def test_an_untied_audio_head_is_refused(self):
+        """If a transformers change ever re-initialized that key after tying, the
+        head behind every audio logit would be random — and nothing would notice:
+        the decode runs, sentences terminate, overflows reads 0, RTF looks fine.
+        The only symptom is that the output is noise, so refuse to start."""
+        import torch
+
+        cand = self._candidate(max_batch=8)
+        real = self.model.audio_head.weight
+        try:
+            self.model.audio_head.weight = torch.nn.Parameter(real.detach().clone())
+            with self.assertRaises(RuntimeError) as ctx:
+                cand._check_audio_head_tied()
+            self.assertIn("noise", str(ctx.exception))
+        finally:
+            self.model.audio_head.weight = real
+
     def test_single_entry_point_goes_through_the_batch_path(self):
         """`synthesize` is a batch of one on purpose — one decode loop, not two
         that can drift."""

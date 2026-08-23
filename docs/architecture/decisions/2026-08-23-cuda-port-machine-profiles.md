@@ -124,6 +124,27 @@ This catches the mistakes batching actually invites — padding corrupting a row
 drifting from the attention mask so RoPE sees the wrong positions, finished-row state bleeding
 across. It says nothing about GPU throughput, which is still unmeasured.
 
+### A load report that lies, found on first GPU run
+
+The first real load on the 3090 prints:
+
+```
+audio_head.weight | MISSING | newly initialized
+```
+
+`audio_head` is the fused head behind every audio logit, so a random one means the output is noise.
+It is a red herring: the checkpoint omits that key **by design** because upstream lists it in
+`_tied_weights_keys` and points it at `audio_embedding.weight` in `tie_weights()`, which runs after
+the report is printed. Verified on the card — shared storage, identical norms — and the waveform
+statistics agreed (RMS varying 6x across three sentences is content-dependent output, not noise).
+
+Worth recording because the failure mode it *describes* would be invisible. Were the tie ever broken
+(a transformers version re-initializing missing keys after tying), the decode would still run,
+sentences would still terminate, `overflows` would still read 0 and RTF would look normal. Nothing
+in the pipeline or the bench output would flag it; only listening would. So the candidate now asserts
+the tie at build time and refuses to start otherwise, and the test suite covers both the invariant
+and the refusal.
+
 ### One claim from the planning phase that remains wrong
 
 - **Flash-attention is not available.** The upstream port declares `_supports_sdpa` only — no
