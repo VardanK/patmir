@@ -194,7 +194,7 @@ half right: it was indeed not a config change. It was ~150 lines in the candidat
 | --- | --- | --- |
 | separate | `htdemucs_vocals` | **new.** `vocals_only` added to the torch candidate, mirroring the MLX one |
 | diarize | `sortformer_nemo` | **new.** Same model as the Mac, on NVIDIA's own NeMo |
-| asr | `qwen3_asr_1_7b` | already registered; bf16 rather than 8-bit |
+| asr | `faster_whisper_large_v3_fp16` | **changed** — see the dependency conflict below |
 | tts | `higgs_v3_torch_bf16` | **new** |
 
 `separate` is worth the small port rather than falling back to the full `htdemucs_ft` bag: the stage
@@ -251,6 +251,39 @@ guessed:
 
 `pyannote_3_1` stays registered as the fallback, because NeMo is the heaviest dependency in the stack
 (built from git, wants Cython first) and is the most likely thing to refuse to install.
+
+## Decision 4 — ASR yields to TTS in a hard dependency conflict
+
+The profile originally selected `qwen3_asr_1_7b`, the torch sibling of the Mac's active ASR, which
+looked like a free config flip. It is not installable alongside the TTS:
+
+```
+qwen-asr>=0.0.6 depends on transformers==4.57.6
+patmir[local] depends on transformers>=5.5
+```
+
+`qwen-asr` pins transformers **exactly**, and the Higgs checkpoint requires >=5.5. One environment
+cannot hold both. Discovered the expensive way: installing `nemo_toolkit` pulled transformers down to
+4.57 (nemo declares no constraint — our own `>=4.40` floor simply permitted it), which broke a TTS
+stage that had already worked on that machine.
+
+**ASR yields.** TTS is ~69% of batch wall and ASR ~11%, so the stage with the smaller share and a
+viable alternative is the one to move. `faster_whisper_large_v3_fp16` is Whisper large-v3 through
+CTranslate2, which has no transformers dependency at all — that is what makes it a clean exit rather
+than another version negotiation. fp16 rather than the existing int8 entry, which exists only because
+CT2 has no MPS backend and falls back to CPU on the Mac.
+
+Two consequences:
+
+- **The ASR stage now differs between machines**, so its per-stage timing is not comparable across
+  the two baselines. Aggregate RTF still is, roughly, but not the ASR line. Whisper large-v3 is at
+  least well characterized here — it was the Mac default until 2026-07-14: clean on fast cartoon
+  speech, prone to hallucinated repeats on singing.
+- **There is a path back to parity.** transformers gained native Qwen3-ASR support in 5.13, so a
+  candidate written against transformers instead of the `qwen-asr` package would sidestep the pin
+  entirely. Not taken now: our candidate imports `qwen_asr.Qwen3ASRModel`, so this is new code, and
+  the hard part is word timestamps (the MLX path uses a bundled ForcedAligner). Deferred until a
+  working baseline exists rather than written blind.
 
 ## Status of verification
 

@@ -210,7 +210,7 @@ source ~/.bashrc
 | `emotion` | unchanged | `emotion2vec.py` resolves device `auto` to cuda |
 | `translate` | unchanged | cloud (OpenRouter), platform-independent |
 | `separate` | `htdemucs_vocals` | torch twin of `htdemucs_mlx_vocals`; same vocals-specialist sub-model (`04573f0d`), `accompaniment = mix - vocals` |
-| `asr` | `qwen3_asr_1_7b` | torch sibling of the MLX candidate; bf16 rather than 8-bit |
+| `asr` | `faster_whisper_large_v3_fp16` | Whisper large-v3 via CTranslate2. Not Qwen3-ASR — see the dependency note below |
 | `diarize` | `sortformer_nemo` | Same Sortformer model as the Mac, on NVIDIA's own NeMo. Needs the extra install below |
 | `tts` | `higgs_v3_torch_bf16` | same Higgs v3 model, decoded **batched across sentences** (`max_batch`, default 8) |
 
@@ -305,6 +305,7 @@ to `.wslconfig` and `wsl --shutdown`.
 | Run dies after the first stage with `libmlx.so: cannot open shared object file` | Two compounding causes, both fixed in-tree — `git pull` if you hit it. `[local]` used to install the Apple-only `mlx-*` wheels here (now gated on `sys_platform == 'darwin'`), and `_free_accelerator_cache()`, which runs after **every** stage, probed MLX under `except ImportError` while dlopen actually raises `OSError`. It fired regardless of the active profile, so a correct `PATMIR_PROFILE=cuda` did not save you. Belt and braces: `uv pip uninstall mlx mlx-audio mlx-whisper mlx-lm` |
 | Extension cannot reach the server | missing `networkingMode=mirrored` |
 | Mux stage fails | `rubberband-cli` not installed |
+| `uv pip install` reports transformers 4.57.6 vs >=5.5 unsatisfiable | Expected if `qwen-asr` is installed: it pins transformers exactly, and the Higgs TTS checkpoint needs >=5.5. `uv pip uninstall qwen-asr`; the cuda profile uses `faster_whisper_large_v3_fp16` for ASR precisely to avoid this |
 | TTS stage dies on `'list' object has no attribute 'keys'` | `transformers` got resolved down to 4.x — check with `uv pip list \| grep -i transformers`. The Higgs checkpoint needs >=5.5 (its tokenizer_config gives `extra_special_tokens` as a list, which 4.x mishandles). Installing `nemo_toolkit` was what pulled it down. `uv pip install -U "transformers>=5.5"`, then re-verify torch is still the cu128 build |
 | Higgs load report says `audio_head.weight \| MISSING \| newly initialized` | **Expected, not a problem.** The checkpoint omits that key because the model ties it to `audio_embedding.weight`; the tie is applied after the report is printed. Confirmed tied on the 3090 (shared storage, identical norms). The candidate asserts the tie at build time, so a genuinely broken tie is a hard error rather than silent noise |
 | flash-attention will not build | use a prebuilt cu128 wheel instead of compiling |

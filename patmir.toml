@@ -761,7 +761,10 @@ separate  = "htdemucs_vocals"      # torch twin of htdemucs_mlx_vocals (sig 0457
 # off pyannote in the first place (ADR 2026-06-15). `pyannote_3_1` stays
 # registered as the fallback if NeMo won't install.
 diarize   = "sortformer_nemo"
-asr       = "qwen3_asr_1_7b"       # torch sibling of qwen3_asr_1_7b_mlx_8bit; bf16, not 8-bit
+# NOT `qwen3_asr_1_7b`: the `qwen-asr` package pins transformers==4.57.6, which
+# is mutually exclusive with the Higgs TTS checkpoint's >=5.5. TTS is 69% of
+# wall and ASR 11%, so ASR yields. CTranslate2 has no transformers dependency.
+asr       = "faster_whisper_large_v3_fp16"
 tts       = "higgs_v3_torch_bf16"  # same Higgs v3 model, upstream transformers runtime
 
 # Watch-along layer: applied AFTER the hardcoded overrides in
@@ -1082,6 +1085,32 @@ module        = "patmir.pipeline.stages.asr.faster_whisper"
 model_id      = "large-v3"
 device        = "auto"
 compute_type  = "int8"
+vad_filter    = true
+
+# ACTIVE ASR under [pipeline.profiles.cuda]. Same Whisper large-v3 via
+# CTranslate2, but fp16 — int8 above exists because CT2 has no MPS backend and
+# falls back to CPU on the Mac, where int8 is the only tolerable option. On a
+# 3090 fp16 is both faster and closer to the reference checkpoint.
+#
+# Why not `qwen3_asr_1_7b` (the torch sibling of the Mac's active ASR): the
+# `qwen-asr` package pins `transformers==4.57.6` EXACTLY, and the Higgs TTS
+# checkpoint requires >=5.5 (its tokenizer_config gives `extra_special_tokens`
+# as a list, which 4.x mishandles). Those two cannot coexist in one environment,
+# and TTS is 69% of wall while ASR is 11% — so ASR is the stage that yields.
+# CTranslate2 does not depend on transformers at all, which is what makes this
+# the clean way out rather than another version negotiation.
+#
+# NOTE this makes the ASR stage differ between machines (Mac runs
+# qwen3_asr_1_7b_mlx_8bit), so per-stage ASR timings are NOT directly comparable
+# across the two baselines. Whisper large-v3 is well characterized here: it was
+# the Mac default until 2026-07-14 — clean on fast cartoon speech, prone to
+# hallucinated repeats on singing/music windows.
+[[stages.asr.candidates]]
+id            = "faster_whisper_large_v3_fp16"
+module        = "patmir.pipeline.stages.asr.faster_whisper"
+model_id      = "large-v3"
+device        = "auto"       # auto -> cuda on the GPU box
+compute_type  = "float16"
 vad_filter    = true
 
 # Qwen3-ASR (Apache-2.0, Jan 2026). 52 languages incl. EN + RU. Beats
