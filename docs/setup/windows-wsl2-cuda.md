@@ -164,6 +164,11 @@ why 3.12 is pinned. If it refuses to build, the pipeline still runs: flip the pr
 echo 'export HF_HOME=$HOME/.cache/huggingface' >> ~/.bashrc
 ```
 
+The test suite locates the model cache through `HF_HUB_CACHE` / `HF_HOME` too, so a cache on another
+drive is fine — but if those are unset in the shell running `pytest`, the eight batched-decode
+equivalence tests skip rather than fail, and the summary still looks green. Check for `s` characters
+in pytest's progress output, or run with `-rs` to see skip reasons.
+
 Keep both the repo and `HF_HOME` **inside** the WSL filesystem (`~/`), never under `/mnt/c/`.
 Cross-OS access goes through a slow translation layer, and `runs/` is a live working directory with
 an appended-and-seek-tailed progress log, non-atomic per-stage manifest rewrites, and in-place

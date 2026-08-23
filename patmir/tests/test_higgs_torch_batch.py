@@ -25,6 +25,7 @@ Two layers of testing, because the risks are different:
 """
 from __future__ import annotations
 
+import os
 import unittest
 import wave
 from pathlib import Path
@@ -37,16 +38,35 @@ from patmir.eval.candidates.tts.higgs_v3_torch import (
     token_cap,
 )
 
-_SNAPSHOT_GLOB = (
-    Path.home() / ".cache/huggingface/hub"
-    / "models--multimodalart--higgs-audio-v3-tts-4b-transformers" / "snapshots"
-)
+_REPO_CACHE_DIR = "models--multimodalart--higgs-audio-v3-tts-4b-transformers"
+
+
+def _hub_cache() -> Path:
+    """The resolved HuggingFace hub cache directory.
+
+    Must honour `HF_HUB_CACHE` / `HF_HOME` rather than assuming
+    `~/.cache/huggingface`. Hardcoding the default meant the CUDA workstation —
+    whose cache lives on a separate drive — silently SKIPPED every test in
+    `BatchEquivalenceTest`, i.e. the ones that prove the batched decode is
+    correct, on the only machine where that decode actually runs. A skip is not a
+    pass, and eight of them hid behind a green summary.
+    """
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+        return Path(HF_HUB_CACHE)
+    except Exception:  # noqa: BLE001 - fall back to the documented env precedence
+        if os.environ.get("HF_HUB_CACHE"):
+            return Path(os.environ["HF_HUB_CACHE"])
+        if os.environ.get("HF_HOME"):
+            return Path(os.environ["HF_HOME"]) / "hub"
+        return Path.home() / ".cache" / "huggingface" / "hub"
 
 
 def _snapshot() -> Path | None:
-    if not _SNAPSHOT_GLOB.is_dir():
+    snaps = _hub_cache() / _REPO_CACHE_DIR / "snapshots"
+    if not snaps.is_dir():
         return None
-    for child in sorted(_SNAPSHOT_GLOB.iterdir()):
+    for child in sorted(snaps.iterdir()):
         if (child / "config.json").exists() and (child / "tokenizer.json").exists():
             return child
     return None
@@ -254,7 +274,11 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(sum(1 for s in seen if s == "hello"), 2)
 
 
-@unittest.skipIf(_snapshot() is None, "Higgs checkpoint snapshot not cached locally")
+@unittest.skipIf(
+    _snapshot() is None,
+    f"Higgs checkpoint snapshot not found under {_hub_cache()} "
+    "(set HF_HOME/HF_HUB_CACHE, or run the TTS smoke test to populate it)",
+)
 class BatchEquivalenceTest(unittest.TestCase):
     """A row decoded in a batch must equal the same row decoded alone.
 
