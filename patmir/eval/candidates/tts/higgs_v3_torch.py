@@ -115,55 +115,25 @@ def _chunks(items: list[int], size: int) -> list[list[int]]:
 _TIED_SOURCE = "audio_embedding.weight"
 
 
-def normalize_tied_weights_keys(snapshot: str) -> bool:
-    """Convert the checkpoint's `_tied_weights_keys` list into the dict form
-    that current transformers requires. Returns True if it patched anything.
-
-    The repo's remote code declares the old list form,
-    `_tied_weights_keys = ["audio_head.weight"]`. transformers 5.9's
-    `_get_tied_weight_keys` does `tied.keys()` on that attribute, so loading the
-    checkpoint dies with `AttributeError: 'list' object has no attribute 'keys'`.
-    The newer contract is a `{target: source}` mapping.
-
-    Only `from_pretrained` is affected: the helper runs on the weight-loading
-    path, which is why building the same class with `from_config` (as the tests
-    do) works fine and hid this until the first real load on the 3090.
-
-    Patched on the class rather than worked around at the call site because the
-    attribute is read by transformers internals we do not drive. Verified to
-    leave the tie itself intact — `_check_audio_head_tied` asserts that after
-    every load, so a wrong mapping here fails loudly rather than producing noise.
-    """
-    from transformers import AutoConfig
-    from transformers.dynamic_module_utils import get_class_from_dynamic_module
-
-    config = AutoConfig.from_pretrained(snapshot, trust_remote_code=True)
-    ref = (getattr(config, "auto_map", None) or {}).get("AutoModelForCausalLM")
-    if not ref:
-        return False
-    klass = get_class_from_dynamic_module(ref, snapshot)
-    keys = getattr(klass, "_tied_weights_keys", None)
-    if isinstance(keys, list):
-        klass._tied_weights_keys = {k: _TIED_SOURCE for k in keys}
-        return True
-    return False
-
-
 def tolerate_list_tied_weights_keys() -> bool:
-    """Make transformers' loading path accept the old LIST form of
-    `_tied_weights_keys`. Returns True if it installed the patch.
+    """Let the loader accept the checkpoint's LIST form of `_tied_weights_keys`.
+    Returns True if it installed the patch.
 
-    `normalize_tied_weights_keys` above patches the class we can resolve, which
-    is the tidier fix — but it only works if `from_pretrained` then uses that
-    same class object. Dynamic remote code is re-copied and re-imported under a
-    hashed module name in `HF_MODULES_CACHE`, so the loader can end up with a
-    *different* class object carrying the shipped list again. This patch does not
-    care which object it is: it coerces the attribute on every submodule at the
-    moment the loader reads it.
+    The checkpoint's remote code declares `_tied_weights_keys =
+    ["audio_head.weight"]`. Newer transformers treats that attribute as a
+    `{target: source}` mapping and calls `.keys()` on it, so loading fails with
+    `'list' object has no attribute 'keys'`; older transformers wants the list.
 
-    Scoped and idempotent, and it only ever rewrites a list into the dict the
-    installed transformers already expects — never the reverse. Removing it once
-    the checkpoint's remote code adopts the dict form is a one-line deletion.
+    Deliberately **self-detecting**: try the original first and only coerce after
+    it raises AttributeError. An earlier version of this shim rewrote the class
+    attribute to a dict up front, which fixed the new contract and would have
+    broken the old one — patching for one version of a dependency while
+    silently breaking another is not a fix. Trying first means the same code is
+    correct on both.
+
+    Also independent of class identity, which matters: dynamic remote code is
+    re-copied and re-imported under a hashed module name, so the class object the
+    loader ends up using need not be the one we could resolve ahead of time.
     """
     import transformers.modeling_utils as mu
 
@@ -172,11 +142,14 @@ def tolerate_list_tied_weights_keys() -> bool:
         return False
 
     def _list_tolerant(module):
-        for submodule in module.modules():
-            keys = getattr(submodule, "_tied_weights_keys", None)
-            if isinstance(keys, list):
-                submodule._tied_weights_keys = {k: _TIED_SOURCE for k in keys}
-        return original(module)
+        try:
+            return original(module)
+        except AttributeError:
+            for submodule in module.modules():
+                keys = getattr(submodule, "_tied_weights_keys", None)
+                if isinstance(keys, list):
+                    submodule._tied_weights_keys = {k: _TIED_SOURCE for k in keys}
+            return original(module)
 
     _list_tolerant._patmir_list_tolerant = True
     mu._get_tied_weight_keys = _list_tolerant
@@ -251,10 +224,7 @@ class HiggsV3Torch:
             # the slow mirror (ADR 2026-05-26-prefer-fast-model-mirrors). The
             # tokenizer itself is a plain Qwen2 tokenizer with no auto_map.
             self.tok = Qwen2TokenizerFast.from_pretrained(snap)
-            # Both must happen BEFORE from_pretrained. The first patches the class
-            # we can resolve; the second covers the case where the loader
-            # re-imports the remote code and gets a different class object.
-            normalize_tied_weights_keys(snap)
+            # Must happen BEFORE from_pretrained; see the function's docstring.
             tolerate_list_tied_weights_keys()
             # The model class *does* need trust_remote_code — it is the repo's
             # own `modeling_higgs_multimodal_qwen3`. Loading from the local
