@@ -179,6 +179,8 @@ def _profile_overrides(
     pipe: dict[str, Any],
     profile: str | None,
     layer: str | None,
+    *,
+    explicit: bool = False,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Stage selectors from `[pipeline.profiles.<profile>]` and its `<layer>`.
 
@@ -187,18 +189,42 @@ def _profile_overrides(
     the watch-along path so a profile can override the streaming candidate set
     too (e.g. a faster `separate` for sections).
 
-    Raises on an unknown profile name: a typo'd `PATMIR_PROFILE` must not fall
-    back to the `[pipeline]` defaults, because on a CUDA box that means quietly
-    trying to load MLX-only candidates.
+    An unknown profile name raises — *except* for one case, which the first
+    version got wrong. `$PATMIR_PROFILE` is ambient and machine-scoped: once it
+    is exported in a shell profile it applies to every config this process
+    loads, including small ones that define no `[pipeline.profiles]` table at
+    all. Hard-failing those is wrong; the variable is not addressed to them.
+
+    So the rule keys on provenance:
+
+      * asked for explicitly (`--profile` / `profile=`) and not found -> raise,
+        the caller named something specific that does not exist;
+      * from the environment, and the config defines OTHER profiles but not this
+        one -> raise, that is a real mismatch (a typo, or a config that still
+        needs the profile added);
+      * from the environment, and the config defines no profiles whatsoever ->
+        ignore it and use `[pipeline]`.
+
+    The safety property that motivated raising still holds. A profile-less config
+    that selects MLX candidates on a CUDA box does not silently succeed — it
+    fails at build time, where `_build_failure_message` names the stage, the
+    candidate and `$PATMIR_PROFILE`.
     """
     if not profile:
         return {}, {}
     profiles = pipe.get("profiles") or {}
     if profile not in profiles:
-        known = sorted(profiles) or ["<none defined>"]
+        if not explicit and not profiles:
+            return {}, {}  # ambient variable, config does not use profiles
+        if profiles:
+            raise RuntimeError(
+                f"Unknown pipeline profile {profile!r} "
+                f"(via {'--profile' if explicit else '$' + PROFILE_ENV}). "
+                f"Defined profiles: {sorted(profiles)}."
+            )
         raise RuntimeError(
-            f"Unknown pipeline profile {profile!r} (via ${PROFILE_ENV} or --profile). "
-            f"Defined profiles: {known}."
+            f"Profile {profile!r} was requested explicitly but this config "
+            "defines no [pipeline.profiles] table."
         )
     table = profiles[profile] or {}
     base = {s: str(v) for s, v in table.items() if s in _STAGE_NAMESPACE}
@@ -250,7 +276,9 @@ def load_pipeline_config(
         raise RuntimeError(f"No [pipeline] section in {config_path}.")
 
     profile_name = active_profile(profile)
-    prof_base, prof_layer = _profile_overrides(pipe, profile_name, layer)
+    prof_base, prof_layer = _profile_overrides(
+        pipe, profile_name, layer, explicit=bool(profile),
+    )
 
     selectors = {stage: pipe.get(stage) for stage in _STAGE_NAMESPACE}
     for source in (prof_base, overrides or {}, prof_layer):

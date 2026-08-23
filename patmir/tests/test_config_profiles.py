@@ -204,6 +204,38 @@ class EnvSelectionTest(ProfileFixture):
         self.assertEqual(ids["tts"], "v_torch")
         self.assertEqual(ids["separate"], "s_mlx")  # 'bare' doesn't touch separate
 
+    def test_ambient_env_var_is_ignored_by_a_config_with_no_profiles(self):
+        """The bug this rule exists for. `$PATMIR_PROFILE` is machine-scoped and
+        exported from a shell profile, so it applies to every config the process
+        loads — including small ones that define no profiles at all. Hard-failing
+        those made the whole test suite fail on the CUDA box, where the variable
+        is permanently set."""
+        stripped = _CONFIG[:_CONFIG.index("[pipeline.profiles.cuda]")] + _CONFIG[
+            _CONFIG.index("[[stages.ingest.candidates]]"):]
+        self.assertNotIn("profiles", stripped)
+        path = Path(self._td.name) / "noprofiles.toml"
+        path.write_text(stripped)
+
+        os.environ["PATMIR_PROFILE"] = "cuda"
+        ids = _ids(load_pipeline_config(path))
+        self.assertEqual(ids["tts"], "v_mlx")  # fell through to [pipeline]
+
+    def test_ambient_env_var_still_raises_when_other_profiles_exist(self):
+        """A config that DOES use profiles but lacks this one is a real mismatch
+        — a typo, or a config that needs the profile added — so it still raises."""
+        os.environ["PATMIR_PROFILE"] = "rocm"
+        with self.assertRaises(RuntimeError) as ctx:
+            load_pipeline_config(self.cfg_path)
+        msg = str(ctx.exception)
+        self.assertIn("rocm", msg)
+        self.assertIn("PATMIR_PROFILE", msg)   # names how it was supplied
+        self.assertIn("cuda", msg)             # and what is available
+
+    def test_explicit_unknown_profile_names_the_flag_not_the_env_var(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            load_pipeline_config(self.cfg_path, profile="rocm")
+        self.assertIn("--profile", str(ctx.exception))
+
     def test_blank_env_var_is_treated_as_unset(self):
         os.environ["PATMIR_PROFILE"] = "   "
         self.assertIsNone(active_profile())

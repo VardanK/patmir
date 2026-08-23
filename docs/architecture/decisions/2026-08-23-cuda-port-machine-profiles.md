@@ -45,9 +45,42 @@ it, while a Mac watch-along run — no profile active — keeps its own choices 
   the copies drift.
 - **Autodetect from `torch.cuda.is_available()`.** The tempting option, and the wrong one. Which
   model ran has to be a stated choice or a benchmark stops being attributable, and it would remove
-  the ability to run a CPU or MLX set on the CUDA box deliberately. For the same reason an unknown
-  profile name is a **hard error** rather than a fall back to the defaults — on a CUDA box, falling
-  back means quietly trying to load MLX-only candidates.
+  the ability to run a CPU or MLX set on the CUDA box deliberately.
+
+### What "unknown profile" should do — corrected 2026-08-23
+
+The first version of this rule was "an unknown profile name is a hard error, never a fall back to the
+defaults; on a CUDA box falling back means quietly loading MLX-only candidates." That reasoning is
+sound and the rule as stated was still wrong, in two ways found by running it.
+
+**It covered the wrong failure.** A *typo'd* name raised; an *omitted* one did not, because there is
+nothing to validate when the variable is unset — resolution just falls through to `[pipeline]`, which
+off Apple Silicon selects candidates that cannot load. The symptom was a bare
+`libmlx.so: cannot open shared object file`. Fixed downstream instead: `_build_failure_message` now
+names the stage, the candidate and the module on any build failure, and points at `$PATMIR_PROFILE`
+when an MLX candidate fails with no profile active. That is the real safety net, and it works for
+both the typo and the omission.
+
+**It was too aggressive.** `$PATMIR_PROFILE` is machine-scoped and exported from a shell profile, so
+it applies to every config the process loads — including small ones with no `[pipeline.profiles]`
+table. Hard-failing those is wrong; the variable is not addressed to them. It broke the test suite
+outright on the workstation: `test_paths.py` builds minimal configs, so with the variable exported
+five of its tests failed on profile resolution rather than on what they test. Green on the laptop,
+red on the workstation, same commit.
+
+The rule now keys on provenance:
+
+| Where the name came from | Config defines profiles | Behaviour |
+| --- | --- | --- |
+| `--profile` / `profile=` | any | raise — the caller named something specific that does not exist |
+| `$PATMIR_PROFILE` | yes, but not this one | raise — a real mismatch (typo, or a config needing the profile added) |
+| `$PATMIR_PROFILE` | none at all | ignore, use `[pipeline]` |
+
+Nothing is lost by the third row: a profile-less config selecting MLX on a CUDA box still fails, just
+at build time with a message that explains itself.
+
+A `conftest.py` now clears `$PATMIR_PROFILE` for the whole test suite as well. Tests that need a
+profile set it explicitly, so the suite no longer reads the developer's shell.
 
 Storage roots are unaffected. Profiles change `entries`, which `ui.cache.config_hash` hashes, so
 the two machines have different cache keys and cannot serve each other a dub built from a different
