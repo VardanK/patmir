@@ -141,22 +141,38 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 Requires `True` and the GPU name before going further.
 
 ```bash
-uv pip install -e ".[local,ui,dev]"
+uv pip install -e ".[local,ui,dev,cuda]"
 pytest patmir/tests/ -q
 ```
 
-NeMo, for the `sortformer_nemo` diarize candidate, installs separately — it wants Cython present
-first and is not a published wheel:
+The `cuda` extra carries the deps only this machine needs — `qwen-asr` for the torch
+ASR candidate and `nemo_toolkit[asr]` for Sortformer. It is deliberately excluded from
+`all`, since neither belongs on the Apple-Silicon laptop where those candidates cannot
+be selected anyway.
+
+NeMo is the heaviest dependency in the stack and the most likely to fight the Python version — it is
+why 3.12 is pinned. The `cuda` extra installs it from PyPI; verify it landed:
+
+```bash
+python -c "from nemo.collections.asr.models import SortformerEncLabelModel; print('nemo ok')"
+```
+
+If the PyPI build fails, try the git tip, which the model card recommends:
 
 ```bash
 uv pip install Cython
 uv pip install "git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]"
-python -c "from nemo.collections.asr.models import SortformerEncLabelModel; print('nemo ok')"
 ```
 
-This is the heaviest dependency in the stack and the most likely to fight the Python version — it is
-why 3.12 is pinned. If it refuses to build, the pipeline still runs: flip the profile's `diarize` to
-`pyannote_3_1` and revisit.
+Then re-check torch — NeMo pins a version and can quietly replace the cu128 build with a generic
+wheel, leaving you on CPU with no error anywhere:
+
+```bash
+python -c "import torch;print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+If it refuses to build at all, the pipeline still runs: flip the profile's `diarize` to
+`pyannote_3_1` and accept the short-turn merging (quality issue #13).
 
 ## Phase 8 — Model cache and filesystem placement
 
