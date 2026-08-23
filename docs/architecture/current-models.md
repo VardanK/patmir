@@ -4,6 +4,8 @@ Last updated: 2026-06-15
 
 The single source of truth is `patmir.toml [pipeline]`. This table mirrors it for quick reference; if the two ever disagree, `patmir.toml` wins and this file is stale.
 
+**The table below is the Apple-Silicon set.** On the CUDA workstation four of these stages are replaced by a machine profile — see the **Machine profiles** section below before assuming a given model is what ran.
+
 | Stage     | Active candidate id              | Model                                       | Device | Key knobs                                                              |
 | --------- | -------------------------------- | ------------------------------------------- | ------ | ---------------------------------------------------------------------- |
 | ingest    | `ffmpeg`                         | n/a (ffmpeg + ffprobe)                      | cpu    | 16 kHz mono PCM                                                        |
@@ -17,6 +19,49 @@ The single source of truth is `patmir.toml [pipeline]`. This table mirrors it fo
 | tts (prev) | `omnivoice_mlx_bf16`             | `mlx-community/OmniVoice-bfloat16` (MLX, bf16) | mps    | **Superseded 2026-06-20 by `higgs_v3_mlx_q8` (batch) + `higgs_v3_mlx_q8_fast` (watch-along); both OmniVoice variants stay registered as fallbacks.** Switched from q8 (`lightsofapollo/omnivoice-mlx-q8-g64`) to bf16 on 2026-06-16 after an **ear-test** ranked bf16@32 EXCELLENT > q8@32 > bf16@16 > q8@16 (q8 was demoted to a registered fallback). bf16 is also faster at every step count in our pipeline (RTF 0.46/0.89 @16/32 vs q8 0.67/1.20) with a faster load (1.7s vs 6.1s). Batch = bf16@32, watch-along = bf16@16. Zero-shot per-speaker voice cloning via `diarize/refs/<speaker>/<emotion>.wav`. `guidance_scale` mapped per emotion bin in `[emotion_guidance]` (neutral 1.8, sad 2.0, happy 2.8, angry 3.0, fearful 2.6). No explicit emotion knob — emotion fidelity is bounded by what's audible in the source character's range (ADR `2026-05-26-emotion-routed-through-ref-clip-binning`). Switched back from `elevenlabs_multilingual_v2` on 2026-05-27 PM after ElevenLabs' captcha system blocked cloned voices of real celebrities (HTTP 403 `voice_access_denied` / `detected_captcha_voice`) on YouTube content. ElevenLabs stays registered + the in-code per-speaker fallback-to-default-voice retry stays as a hedge; flip `[pipeline].tts` to revert. Piper `hy_AM-gor-medium` is the no-ref fallback. **Watch-along (D3)** TTS moved off ElevenLabs `elevenlabs_pool` to local `omnivoice_mlx_bf16_fast` (bf16, `num_steps=16`) — ADR `2026-06-15-local-asr-diarize-via-mlx-audio`. At RTF ~0.46 this still does not fully clear realtime on its own; TTS is one of several serial per-section stages (OmniVoice diffusion is serial on MLX) → needs a pre-buffer / section pipelining. Rejected TTS variants: `mlx-community/OmniVoice-8bit` + `OmniVoice-4bit` (no quant config → won't load on mlx-audio; built for the `ailuntx/OmniVoice-MLX` runtime), `OmniVoice-bf16` (no audio tokenizer → no cloning); `ailuntx/OmniVoice-MLX` runtime + q4@16 ear-rejected; Piper tried for watch-along and rejected (quality too low). **OmniVoice GGUF via `omnivoice.cpp`** (Serveurperso/OmniVoice-GGUF, BF16/Q8_0/Q4_K_M @ 32 steps, Metal) ear-tested + benchmarked 2026-06-17 and **rejected** — ~2× slower than MLX bf16 (internal RTF ~1.9–2.0 vs ~1.1–1.5) and MLX bf16 won the ear-test; adds a C++/Metal build dep for no gain. See `stages/tts/omnivoice-cpp-gguf.md`. |
 | mux       | `ffmpeg_pad_stretch`             | n/a (ffmpeg + pyrubberband)                 | cpu    | `stretch_cap=0.20`, `music_bed_gain=0.6`, 50 ms afade in/out on synthesized track, per-sentence RMS loudness-match against source vocals (±12 dB cap). **Duck pre-roll** (`duck_lead_seconds=0.25` / `duck_tail_seconds=0.10`) silences the original vocals stem *before* each line's onset — ASR word-onsets run ~0.24s late, so without it the original leaked at every line start (quality issue #9). **Original vocals floor** (`vocals_bed_gain=0.12`): in gaps between ASR sentences the original vocals play only at 0.12 (not `music_bed_gain` 0.6), so dialogue ASR missed doesn't leak at full level (quality issue #10). |
 | output    | `mkv_default`                    | n/a (ffmpeg mux)                            | cpu    | Armenian default audio, original retained, Armenian SRT default subs   |
+
+## Machine profiles (`patmir.toml [pipeline.profiles.<name>]`)
+
+`[pipeline]` above is the Apple-Silicon dev laptop: every model stage runs on MLX. A **profile**
+overlays a different candidate per stage so one committed `patmir.toml` serves machines with
+different accelerators instead of two working copies diverging on the file that decides which model
+runs.
+
+Selected by environment, never autodetected:
+
+```bash
+export PATMIR_PROFILE=cuda          # or: patmir bench <clip> --profile cuda
+```
+
+Resolution order, last wins:
+
+```
+[pipeline]  <  [pipeline.profiles.<p>]  <  code overrides  <  [pipeline.profiles.<p>.<layer>]
+```
+
+The `<layer>` tier exists because `streaming/runner.py:streaming_config()` hardcodes MLX-only
+candidates as code overrides for watch-along; `[pipeline.profiles.cuda.streaming]` displaces them.
+An unknown profile name is a **hard error**, not a fall back to the defaults — on a CUDA box that
+would mean quietly trying to load MLX-only candidates. Profiles change `entries`, so each profile
+has its own cache key and the two machines cannot serve each other a dub built from a different
+model set.
+
+### The `cuda` profile (RTX 3090 / WSL2)
+
+| Stage | Candidate | Status |
+| --- | --- | --- |
+| ingest / mux / output | unchanged | ffmpeg + rubberband, no accelerator |
+| emotion | `emotion2vec_plus_base` unchanged | device `auto` resolves to cuda |
+| translate | `openrouter_gemini_flash` unchanged | cloud |
+| separate | `htdemucs_vocals` | **new.** Torch twin of `htdemucs_mlx_vocals` — same vocals-specialist sub-model (sig `04573f0d`), `accompaniment = mix − vocals`. Resolves straight through `demucs.pretrained.get_model`, no registry patching. UNMEASURED |
+| asr | `qwen3_asr_1_7b` | Torch sibling of the MLX candidate, bf16 rather than 8-bit. Was already registered. UNMEASURED |
+| diarize | `pyannote_3_1` | **Interim and a known regression** — Sortformer is MLX-only, and pyannote merging short turns is exactly why diarize left it on 2026-06-15. Fix is a NeMo candidate. Quality issue #13 |
+| tts | `higgs_v3_torch_bf16` | **new.** Same Higgs Audio v3 4B model, but a thin wrapper over the repo's own transformers `generate_speech()` instead of our hand-written MLX AR loop. bf16 native (no quantization question). Adds ref-code caching, the shared emotion-tag map, and the non-termination guardrail. `attn_implementation` is pinned to `sdpa`: upstream declares `_supports_sdpa` only, so flash-attention is refused — and `generate_speech()` is batch-1, so batched decode across sentences is upstream work too. UNMEASURED |
+
+Every CUDA candidate above is written but has **never been executed** (2026-08-23). The MLX set
+stays registered and active by default; nothing about the Mac path changed. First-run checks and
+the baselines to beat are in `docs/setup/windows-wsl2-cuda.md` Phase 9. ADR:
+`decisions/2026-08-23-cuda-port-machine-profiles.md`.
 
 ## Pipeline options (`patmir.toml [pipeline.options]`)
 
@@ -42,6 +87,9 @@ The single source of truth is `patmir.toml [pipeline]`. This table mirrors it fo
 
 ## How to swap a model
 
+0. Decide whether the swap is for **every machine** (edit `[pipeline]`) or **one machine**
+   (edit that machine's `[pipeline.profiles.<name>]`). Editing `[pipeline]` on a non-default
+   machine is the thing profiles exist to prevent.
 1. Add or enable a candidate in the relevant `[[stages.<stage>.candidates]]` (or legacy `[[eval.<stage>.candidates]]`) section of `patmir.toml`.
 2. Change `[pipeline].<stage>` to the new candidate id.
 3. Update this file's row + `docs/architecture/stages/<stage>/current.md` + the relevant model file in `docs/architecture/stages/<stage>/<model>.md`.

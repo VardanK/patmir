@@ -446,6 +446,28 @@ seed          = 0
 max_retries   = 1
 codec_device  = "mps"
 
+# Same Higgs Audio v3 model on PyTorch — the CUDA path (thin wrapper over the
+# repo's own transformers implementation, no hand-written AR loop). bf16 is the
+# checkpoint's native dtype, so unlike the MLX path there is no quantization
+# step and no q8-vs-bf16 quality question. `attn_implementation` stays "sdpa":
+# the upstream port declares `_supports_sdpa` only, so flash_attention_2 would
+# be refused by transformers until upstream flags support for it.
+# UNMEASURED as of 2026-08-23 — written from the upstream source, not yet run
+# on the 3090. Baseline to beat: MLX q8 on the M1 Pro, batch agg RTF 1.17 with
+# TTS 244.4 s (69.4% of wall) on samples/Reacher-S02E01-5min.mkv.
+[[eval.tts.candidates]]
+id            = "higgs_v3_torch_bf16"
+enabled       = true
+module        = "patmir.eval.candidates.tts.higgs_v3_torch"
+repo_id       = "multimodalart/higgs-audio-v3-tts-4b-transformers"
+device        = "auto"        # auto -> cuda > mps > cpu
+dtype         = "bfloat16"
+attn_implementation = "sdpa"
+temperature   = 0.8
+top_p         = 0.95
+seed          = 0
+max_retries   = 2
+
 [[eval.tts.candidates]]
 id            = "omnivoice_mlx_bf16"
 enabled       = true
@@ -700,6 +722,43 @@ tts       = "higgs_v3_mlx_q8"
 mux       = "ffmpeg_pad_stretch"
 output    = "mkv_default"
 
+# ── Machine profiles ──────────────────────────────────────────────────────────
+# `[pipeline]` above is the Apple-Silicon dev laptop: every model stage runs on
+# MLX. A profile overlays a different candidate per stage so ONE committed
+# patmir.toml serves both machines instead of the two working copies diverging.
+#
+# Select with the environment, not autodetection:
+#
+#     export PATMIR_PROFILE=cuda        # on the WSL2 + RTX 3090 workstation
+#
+# Autodetection was deliberately rejected: which model ran has to be a stated
+# choice or a benchmark stops being attributable, and an unknown profile name is
+# a hard error rather than a silent fall back to the MLX defaults (which on a
+# CUDA box would fail at model load, or worse, half-work). Resolution order is
+#
+#     [pipeline]  <  profile  <  code overrides  <  profile.<layer>
+#
+# Stages not listed here inherit `[pipeline]`: `ingest`/`mux`/`output` are
+# ffmpeg, `translate` is cloud, and `emotion` (emotion2vec via funasr) resolves
+# device "auto" -> cuda with no change.
+[pipeline.profiles.cuda]
+separate  = "htdemucs_vocals"      # torch twin of htdemucs_mlx_vocals (sig 04573f0d)
+# Sortformer is MLX-only in our tree (via mlx-audio), so CUDA falls back to
+# pyannote. NOTE this is a known quality step DOWN, not a neutral swap: pyannote
+# community-1 merged short cartoon turns, which is exactly why diarize moved to
+# Sortformer (ADR 2026-06-15). NVIDIA's own NeMo has Sortformer natively on
+# CUDA — that is the follow-up, and this line is the interim.
+diarize   = "pyannote_3_1"
+asr       = "qwen3_asr_1_7b"       # torch sibling of qwen3_asr_1_7b_mlx_8bit; bf16, not 8-bit
+tts       = "higgs_v3_torch_bf16"  # same Higgs v3 model, upstream transformers runtime
+
+# Watch-along layer: applied AFTER the hardcoded overrides in
+# `streaming/runner.py:streaming_config`, which name MLX candidates that do not
+# exist off Apple Silicon. `translate` is left alone — the batched OpenRouter
+# candidate that override selects is cloud and platform-independent.
+[pipeline.profiles.cuda.streaming]
+separate  = "htdemucs_fast"        # base single-model torch Demucs
+
 [pipeline.options]
 stretch_cap            = 0.20    # max ±20% time-stretch ratio per sentence (preserves pitch)
 asr_int8               = true
@@ -803,6 +862,18 @@ id     = "htdemucs_fast"
 module = "patmir.pipeline.stages.separate.htdemucs"
 model  = "htdemucs"
 device = "auto"
+
+# PyTorch twin of htdemucs_mlx_vocals — the ft bag's vocals-specialist
+# sub-model alone (sig 04573f0d), accompaniment = mix - vocals. Same trick,
+# same ADR (2026-06-19-vocals-only-separation); this one runs on CUDA, where
+# the MLX candidate cannot. Keeps the CUDA profile at parity with the Mac's
+# separate stage instead of falling back to the 4-model bag.
+[[stages.separate.candidates]]
+id          = "htdemucs_vocals"
+module      = "patmir.pipeline.stages.separate.htdemucs"
+model       = "04573f0d"
+vocals_only = true
+device      = "auto"
 
 # ─── Diarize (who-spoke-when) ─────────────────────────────────────────────────
 # Runs on the Demucs vocal stem; pyannote 3.1 is SOTA on DIHARD/AMI and has

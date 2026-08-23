@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -22,6 +23,7 @@ from pathlib import Path
 
 from patmir.env import load_dotenv
 from patmir.paths import StoragePaths
+from patmir.pipeline import config as config_mod
 from patmir.pipeline.config import load_pipeline_config
 from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.runner import run_job
@@ -75,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     p_dub.add_argument("--source-lang", type=str, default=None,
                        help="ISO source language hint (e.g. 'ru', 'en'). "
                             "Used by ASR as a fallback if it can't detect language.")
+    p_dub.add_argument("--profile", type=str, default=None,
+                       help='Machine profile from [pipeline.profiles.<name>] in patmir.toml (e.g. "cuda"). Sugar for $PATMIR_PROFILE — it is exported into the environment so the watch-along path picks it up too.')
 
     p_runs = sub.add_parser("runs", help="Inspect prior runs.")
     p_runs_sub = p_runs.add_subparsers(dest="runs_cmd", required=True)
@@ -90,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     p_ui.add_argument("--runs-root", type=Path, default=None,
                       help="Override [storage].runs_root for this server.")
     p_ui.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    p_ui.add_argument("--profile", type=str, default=None,
+                      help='Machine profile from [pipeline.profiles.<name>] in patmir.toml (e.g. "cuda"). Sugar for $PATMIR_PROFILE — it is exported into the environment so the watch-along path picks it up too.')
 
     p_bench = sub.add_parser(
         "bench",
@@ -105,6 +111,8 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("--report", type=Path, default=None,
                          help="Write machine-readable bench.json to this path.")
     p_bench.add_argument("--label", type=str, default=None)
+    p_bench.add_argument("--profile", type=str, default=None,
+                         help='Machine profile from [pipeline.profiles.<name>] in patmir.toml (e.g. "cuda"). Sugar for $PATMIR_PROFILE — it is exported into the environment so the watch-along path picks it up too.')
 
     p_submit = sub.add_parser(
         "submit",
@@ -120,6 +128,12 @@ def main(argv: list[str] | None = None) -> int:
                           help="Read the bearer token from this config's [storage].state_root.")
 
     args = parser.parse_args(argv)
+    # A profile has to reach every config load in the process, including
+    # `streaming_config()` deep inside the watch-along path, which only ever
+    # receives a config path. Exporting it makes the flag and the env var the
+    # same mechanism instead of the flag silently applying to batch only.
+    if getattr(args, "profile", None):
+        os.environ[config_mod.PROFILE_ENV] = args.profile
     if args.cmd == "dub":
         return cmd_dub(args)
     if args.cmd == "runs":

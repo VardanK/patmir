@@ -54,8 +54,15 @@ def streaming_config(config_path: Path) -> PipelineConfig:
 
     All remaining overrides shrink per-section time so the stream keeps ahead of
     playback. See ADRs 2026-06-13-near-realtime-d3-spike and
-    2026-06-15-local-asr-diarize-via-mlx-audio."""
-    return load_pipeline_config(config_path, overrides={
+    2026-06-15-local-asr-diarize-via-mlx-audio.
+
+    The overrides above name MLX candidates, so they are only right for the
+    Apple-Silicon profile. `layer="streaming"` lets an active machine profile
+    replace them via `[pipeline.profiles.<name>.streaming]` — that sub-table is
+    applied *after* this dict, so the CUDA profile can point `separate` at the
+    torch candidate instead of `htdemucs_mlx_fast`, which does not exist off
+    Apple Silicon."""
+    return load_pipeline_config(config_path, layer="streaming", overrides={
         "separate": "htdemucs_mlx_fast",
         "translate": "openrouter_gemini_flash_batch",
     })

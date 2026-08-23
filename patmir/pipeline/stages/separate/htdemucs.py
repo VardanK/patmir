@@ -39,9 +39,19 @@ def _resolve_device(requested: str) -> str:
 class HTDemucs:
     id = "htdemucs"
 
-    def __init__(self, model_name: str = "htdemucs_ft", device: str = "auto") -> None:
+    def __init__(self, model_name: str = "htdemucs_ft", device: str = "auto",
+                 vocals_only: bool = False) -> None:
         from demucs.pretrained import get_model  # lazy import (heavy)
 
+        # Vocals-only mode: `model_name` is the bare signature of htdemucs_ft's
+        # vocals-specialist sub-model (`04573f0d`) rather than the 4-model bag.
+        # The bag's vocals stem comes 100% from that sub-model (its BagOfModels
+        # weight matrix is the identity: vocals model -> [0,0,0,1]), so vocals
+        # are mathematically identical while the drums/bass/other models are
+        # skipped. accompaniment is then derived as `mix - vocals` — this
+        # model's own non-vocals stems are not trusted. Mirrors the MLX
+        # candidate; ADR 2026-06-19-vocals-only-separation.
+        self.vocals_only = vocals_only
         self.device = _resolve_device(device)
         self.model_name = model_name
         self.model = get_model(model_name)
@@ -94,12 +104,21 @@ class HTDemucs:
         ctx.progress("separate", 0.85, "stems ready")
 
         stems = {name: sources[0, i] for i, name in enumerate(self.stem_names)}
-        accompaniment = torch.zeros_like(stems[self.stem_names[0]])
-        for name in self.stem_names:
-            if name == "vocals":
-                continue
-            accompaniment = accompaniment + stems[name]
         vocals = stems.get("vocals")
+        if self.vocals_only and vocals is not None:
+            # accompaniment = original mix - vocals (the residual). apply_model
+            # can return a slightly different length than it was given, so trim
+            # both to the shorter one before subtracting.
+            mix = wav[0]
+            n = min(mix.shape[-1], vocals.shape[-1])
+            vocals = vocals[..., :n]
+            accompaniment = mix[..., :n] - vocals
+        else:
+            accompaniment = torch.zeros_like(stems[self.stem_names[0]])
+            for name in self.stem_names:
+                if name == "vocals":
+                    continue
+                accompaniment = accompaniment + stems[name]
 
         accomp_path = ctx.job_dir / "accompaniment.wav"
         vocals_path = ctx.job_dir / "vocals.wav"
@@ -145,6 +164,7 @@ class HTDemucs:
             "sample_rate": self.sample_rate,
             "channels": self.channels,
             "model": self.model_name,
+            "vocals_only": self.vocals_only,
             "device": self.device,
         }
         (ctx.job_dir / "separated.meta.json").write_text(json.dumps(meta, indent=2))
@@ -249,4 +269,5 @@ def build(config: dict[str, Any]) -> HTDemucs:
     return HTDemucs(
         model_name=config.get("model", "htdemucs_ft"),
         device=config.get("device", "auto"),
+        vocals_only=bool(config.get("vocals_only", False)),
     )

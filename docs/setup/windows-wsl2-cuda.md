@@ -157,27 +157,79 @@ an appended-and-seek-tailed progress log, non-atomic per-stage manifest rewrites
 ffmpeg/soundfile writes. Around 20 GB of models land in the cache; WSL's virtual disk grows on
 demand, so the space comes off the Windows drive.
 
-## Phase 9 — End-to-end CUDA run before porting anything
+## Phase 9 — Select the CUDA profile, then run end to end
 
-Four of the five model stages move to CUDA with **config flips alone** in `patmir.toml [pipeline]`.
-Do this first, to prove the environment before touching the Higgs port.
+Do **not** edit `[pipeline]` in `patmir.toml`. That table is the Apple-Silicon dev laptop, and
+editing it on this box makes the two working copies diverge on the one file that decides which
+model runs. Instead select the machine profile:
 
-| Stage | Set to | Note |
+```bash
+echo 'export PATMIR_PROFILE=cuda' >> ~/.bashrc
+source ~/.bashrc
+```
+
+`[pipeline.profiles.cuda]` in `patmir.toml` overlays the stages that have to change:
+
+| Stage | Profile selects | Note |
 | --- | --- | --- |
-| `emotion` | unchanged | `emotion2vec.py` resolves `auto` to cuda |
-| `asr` | `qwen3_asr_1_7b` | torch sibling of the MLX candidate |
-| `diarize` | `pyannote_3_1` | already CUDA-capable |
-| `separate` | `htdemucs` | torch fallback; loses the vocals-only optimization for now |
-| `tts` | a torch OmniVoice candidate | takes a device string |
+| `ingest` / `mux` / `output` | unchanged | ffmpeg + rubberband, no accelerator |
+| `emotion` | unchanged | `emotion2vec.py` resolves device `auto` to cuda |
+| `translate` | unchanged | cloud (OpenRouter), platform-independent |
+| `separate` | `htdemucs_vocals` | torch twin of `htdemucs_mlx_vocals`; same vocals-specialist sub-model (`04573f0d`), `accompaniment = mix - vocals` |
+| `asr` | `qwen3_asr_1_7b` | torch sibling of the MLX candidate; bf16 rather than 8-bit |
+| `diarize` | `pyannote_3_1` | Sortformer is MLX-only in our tree. A known quality step **down**, not a neutral swap — see below |
+| `tts` | `higgs_v3_torch_bf16` | same Higgs v3 model on the repo's own transformers runtime |
+
+Watch-along additionally picks up `[pipeline.profiles.cuda.streaming]`, which replaces the MLX-only
+`separate` override that `streaming/runner.py` hardcodes.
+
+Anything unexpected here should fail loudly: a typo'd profile name is a hard error rather than a
+silent fall back to the MLX candidates. Confirm the resolved set before running anything long:
+
+```bash
+python -c "
+from pathlib import Path
+from patmir.pipeline.config import load_pipeline_config
+cfg = load_pipeline_config(Path('patmir.toml'))
+for stage, entry in cfg.entries.items():
+    print(f'{stage:10} {entry[\"id\"]}')
+"
+```
+
+Every id should be the profile's, and none should contain `mlx`.
+
+### First run
 
 ```bash
 patmir bench samples/Reacher-S02E01-5min.mkv --mode batch \
   --report runs/bench/reacher-cuda-baseline.json --label cuda-first-run
 ```
 
-That baseline is what later optimization is measured against. Then port Higgs TTS (upstream is
-PyTorch, so this replaces the hand-written MLX port and gains bf16 + flash-attention + batched
-decode), then decide whether Sortformer is worth NeMo or whether pyannote is good enough.
+Baselines to beat, measured warm on the M1 Pro against the same clip (301.1 s of source):
+
+| | batch | watch-along |
+| --- | --- | --- |
+| agg RTF | 1.17 | 1.611 |
+| TTS share of wall | 244.4 s (69.4%) | 242.5 s (54.9%) |
+| ASR share of wall | 38.0 s (10.8%) | 69.4 s (15.7%) |
+
+The projection for this box is ~0.35 batch / ~0.51 watch-along. It is a projection from memory
+bandwidth — **measure it, do not assume it.**
+
+Two things to watch on the first run, both consequences of the profile rather than the hardware:
+
+- **Diarization quality.** `pyannote_3_1` is the interim. Sortformer replaced it (ADR
+  `2026-06-15-local-asr-diarize-via-mlx-audio`) precisely because pyannote merged short turns from
+  distinct characters into one speaker. NVIDIA's own NeMo runs Sortformer natively on CUDA, so the
+  real fix is a NeMo candidate, not a permanent downgrade. Check `diarize/turns.json` for a
+  plausible speaker count before trusting the dub's voice assignment.
+- **TTS output.** `higgs_v3_torch_bf16` had never been executed when it was written — it was built
+  against the upstream source, not against a running GPU. Ear-test one line before benching a full
+  clip, and check `tts/voice_cloning_summary.json` for the `overflows` count.
+
+Then, in order: fix whatever the first run surfaces, capture the baseline, and only then look at
+optimizations (batched TTS decode across sentences, section pipelining — which pays here in a way
+it cannot on MLX, where everything serializes on one GPU stream).
 
 ## Phase 10 — Server reachability
 

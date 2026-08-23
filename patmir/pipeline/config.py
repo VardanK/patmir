@@ -19,6 +19,7 @@ The four pipeline-specific stages (ingest, asr, mux, output) live under
 from __future__ import annotations
 
 import importlib
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,11 +98,69 @@ def _build_candidate(entry: dict[str, Any]) -> Any:
         ) from exc
 
 
+PROFILE_ENV = "PATMIR_PROFILE"
+
+
+def active_profile(explicit: str | None = None) -> str | None:
+    """Machine profile name: the explicit argument, else `$PATMIR_PROFILE`.
+
+    A profile is how one committed `patmir.toml` serves machines with different
+    accelerators — the Apple-Silicon dev laptop selects MLX candidates from
+    `[pipeline]`, the CUDA workstation exports `PATMIR_PROFILE=cuda` and gets
+    the torch siblings from `[pipeline.profiles.cuda]`.
+
+    Deliberately NOT auto-detected from `torch.cuda.is_available()`: which model
+    ran has to be a stated choice, not something the machine picks silently, or
+    a benchmark stops being attributable. An unknown name is a hard error for
+    the same reason (see `_profile_overrides`).
+    """
+    if explicit:
+        return explicit
+    name = os.environ.get(PROFILE_ENV, "").strip()
+    return name or None
+
+
+def _profile_overrides(
+    pipe: dict[str, Any],
+    profile: str | None,
+    layer: str | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Stage selectors from `[pipeline.profiles.<profile>]` and its `<layer>`.
+
+    Returns `(base, layered)`. `base` is the profile's own stage map; `layered`
+    is the optional `[pipeline.profiles.<profile>.<layer>]` sub-table, used by
+    the watch-along path so a profile can override the streaming candidate set
+    too (e.g. a faster `separate` for sections).
+
+    Raises on an unknown profile name: a typo'd `PATMIR_PROFILE` must not fall
+    back to the `[pipeline]` defaults, because on a CUDA box that means quietly
+    trying to load MLX-only candidates.
+    """
+    if not profile:
+        return {}, {}
+    profiles = pipe.get("profiles") or {}
+    if profile not in profiles:
+        known = sorted(profiles) or ["<none defined>"]
+        raise RuntimeError(
+            f"Unknown pipeline profile {profile!r} (via ${PROFILE_ENV} or --profile). "
+            f"Defined profiles: {known}."
+        )
+    table = profiles[profile] or {}
+    base = {s: str(v) for s, v in table.items() if s in _STAGE_NAMESPACE}
+    layered: dict[str, str] = {}
+    if layer:
+        sub = table.get(layer) or {}
+        layered = {s: str(v) for s, v in sub.items() if s in _STAGE_NAMESPACE}
+    return base, layered
+
+
 def load_pipeline_config(
     config_path: Path,
     *,
     skip_before: str | None = None,
     overrides: dict[str, str] | None = None,
+    profile: str | None = None,
+    layer: str | None = None,
 ) -> PipelineConfig:
     """Load and instantiate the pipeline configuration.
 
@@ -114,6 +173,17 @@ def load_pipeline_config(
     `overrides`, a {stage: candidate_id} map, replaces the `[pipeline]`
     selectors — used by the streaming/watch-along path to swap in a different
     candidate (e.g. `tts = "elevenlabs_pool"`) without editing patmir.toml.
+
+    `profile` (defaulting to `$PATMIR_PROFILE`) selects a machine profile from
+    `[pipeline.profiles.<name>]`, and `layer` an optional sub-table of it. The
+    four layers resolve in this order, last wins:
+
+        [pipeline]  <  profile base  <  overrides  <  profile <layer>
+
+    `overrides` sits above the profile base so the watch-along path keeps its
+    per-mode candidate choices, and the profile's `<layer>` sits above those so
+    a machine that cannot run the overridden candidate at all (an MLX-only
+    `separate` on a CUDA box) can still replace it.
     """
     from patmir.pipeline.stage import STAGE_ORDER  # local import to avoid cycle
 
@@ -124,10 +194,14 @@ def load_pipeline_config(
     if not pipe:
         raise RuntimeError(f"No [pipeline] section in {config_path}.")
 
+    profile_name = active_profile(profile)
+    prof_base, prof_layer = _profile_overrides(pipe, profile_name, layer)
+
     selectors = {stage: pipe.get(stage) for stage in _STAGE_NAMESPACE}
-    for stage, cid in (overrides or {}).items():
-        if stage in selectors:
-            selectors[stage] = cid
+    for source in (prof_base, overrides or {}, prof_layer):
+        for stage, cid in source.items():
+            if stage in selectors:
+                selectors[stage] = cid
     missing = [s for s, v in selectors.items() if not v]
     if missing:
         raise RuntimeError(f"[pipeline] is missing selectors for: {missing}")
