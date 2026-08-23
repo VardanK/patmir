@@ -259,6 +259,68 @@ class RepoCudaProfileTest(unittest.TestCase):
         self.assertEqual(ids["diarize"], "sortformer_mlx")
 
 
+class BuildFailureMessageTest(ProfileFixture):
+    """A stage that cannot build must say which stage, which candidate, and — for
+    the case that actually bit us — that a machine profile is missing.
+
+    An unset profile is the dangerous one, not a typo. A typo raises in
+    `_profile_overrides` naming the known profiles. Omitting the variable falls
+    through to `[pipeline]`, which off Apple Silicon selects MLX candidates whose
+    only symptom is `libmlx.so: cannot open shared object file`.
+    """
+
+    def _config_with_module(self, module: str, candidate: str = "v_mlx") -> Path:
+        """Point one tts candidate's module at something unimportable."""
+        text = _CONFIG.replace(
+            'id = "%s"\nmodule = "x"' % candidate,
+            'id = "%s"\nmodule = "%s"' % (candidate, module),
+        )
+        self.assertIn(module, text)
+        path = Path(self._td.name) / "broken.toml"
+        path.write_text(text)
+        return path
+
+    def test_message_names_the_stage_and_candidate(self):
+        cfg = load_pipeline_config(self._config_with_module("patmir.tests.no_such_module"))
+        with self.assertRaises(RuntimeError) as ctx:
+            cfg.build_stage("tts")
+        msg = str(ctx.exception)
+        self.assertIn("'tts'", msg)
+        self.assertIn("v_mlx", msg)
+        self.assertIn("patmir.tests.no_such_module", msg)
+        # The underlying cause survives rather than being swallowed.
+        self.assertIn("ModuleNotFoundError", msg)
+        self.assertIsInstance(ctx.exception.__cause__, ImportError)
+
+    def test_mlx_candidate_with_no_profile_points_at_the_env_var(self):
+        cfg = load_pipeline_config(self._config_with_module("patmir.tests.absent_mlx_thing"))
+        with self.assertRaises(RuntimeError) as ctx:
+            cfg.build_stage("tts")
+        msg = str(ctx.exception)
+        self.assertIn("Apple Silicon", msg)
+        self.assertIn("PATMIR_PROFILE=cuda", msg)
+
+    def test_mlx_candidate_under_an_active_profile_says_the_profile_is_incomplete(self):
+        """Different fix: the profile exists but forgot to override this stage."""
+        # Profile 'bare' selects v_torch for tts, so that is the one to break.
+        cfg = load_pipeline_config(
+            self._config_with_module("patmir.tests.absent_mlx_thing", candidate="v_torch"),
+            profile="bare")
+        with self.assertRaises(RuntimeError) as ctx:
+            cfg.build_stage("tts")
+        msg = str(ctx.exception)
+        self.assertIn("'bare'", msg)
+        self.assertIn("pipeline.profiles.bare", msg)
+        self.assertNotIn("PATMIR_PROFILE=cuda", msg)
+
+    def test_non_mlx_failure_gets_no_profile_advice(self):
+        """Don't blame the profile for an unrelated missing dependency."""
+        cfg = load_pipeline_config(self._config_with_module("patmir.tests.absent_plain_thing"))
+        with self.assertRaises(RuntimeError) as ctx:
+            cfg.build_stage("tts")
+        self.assertNotIn("PATMIR_PROFILE", str(ctx.exception))
+
+
 class RuntimeParityTest(unittest.TestCase):
     """The MLX and torch Higgs candidates are two runtimes for ONE model, so the
     knobs that shape delivery must not drift apart between them."""

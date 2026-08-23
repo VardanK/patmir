@@ -60,12 +60,22 @@ class PipelineConfig:
     storage: StoragePaths = field(
         default_factory=lambda: paths_mod.defaults(None)
     )
+    # Which machine profile produced these entries, if any. Provenance: the
+    # selected candidates are already in `entries`, so this adds nothing to the
+    # cache key — it exists so build failures can say whether a profile was
+    # active, and so a bench report can record what actually ran.
+    profile: str | None = None
 
     def build_stage(self, name: str) -> Any:
         entry = self.entries.get(name)
         if entry is None:
             raise RuntimeError(f"No candidate entry resolved for stage {name!r}.")
-        instance = _build_candidate(entry)
+        try:
+            instance = _build_candidate(entry)
+        except Exception as exc:
+            raise RuntimeError(
+                _build_failure_message(name, entry, exc, self.profile)
+            ) from exc
         if name == "translate":
             from patmir.pipeline.stages.translate.adapter import SentenceTranslator
             if not isinstance(instance, SentenceTranslator):
@@ -75,6 +85,51 @@ class PipelineConfig:
             if not isinstance(instance, SentenceTTS):
                 instance = SentenceTTS(inner=instance)
         return instance
+
+
+def _build_failure_message(
+    name: str,
+    entry: dict[str, Any],
+    exc: Exception,
+    profile: str | None = None,
+) -> str:
+    """Explain a stage build failure in terms of the config that caused it.
+
+    A raw ImportError/OSError from deep inside a candidate's dependencies names
+    the missing library and nothing else — not which stage, not which candidate
+    id, not what to change. The worst case is an Apple-only candidate selected on
+    a CUDA box, where the entire message is `libmlx.so: cannot open shared object
+    file`: a configuration problem wearing a linker error's clothes.
+
+    Note an unset profile is the dangerous case, not a typo'd one. A typo raises
+    in `_profile_overrides` naming the known profiles; omitting the variable
+    entirely just falls through to the `[pipeline]` defaults, which off Apple
+    Silicon means MLX candidates that cannot load.
+    """
+    cid = entry.get("id", "?")
+    module = str(entry.get("module", "?"))
+    lines = [
+        f"Stage {name!r} failed to build candidate {cid!r} (module {module}).",
+        f"  cause: {type(exc).__name__}: {exc}",
+    ]
+    looks_mlx = "mlx" in module.lower() or "mlx" in str(exc).lower()
+    if looks_mlx and not profile:
+        lines += [
+            "  That candidate needs MLX, which exists only on Apple Silicon, and no",
+            f"  machine profile is active. Set ${PROFILE_ENV} to a profile that selects",
+            "  candidates native to this machine:",
+            "",
+            f"      export {PROFILE_ENV}=cuda",
+            "",
+            "  Available profiles are the [pipeline.profiles.*] tables in patmir.toml.",
+        ]
+    elif looks_mlx and profile:
+        lines += [
+            f"  Profile {profile!r} is active but still resolved an MLX candidate for",
+            f"  this stage. Add a {name!r} key to [pipeline.profiles.{profile}] pointing",
+            "  at a candidate that runs on this machine.",
+        ]
+    return "\n".join(lines)
 
 
 def _find_candidate(toml: dict[str, Any], namespace: tuple[str, str], cid: str) -> dict[str, Any]:
@@ -255,4 +310,5 @@ def load_pipeline_config(
         entries=entries,
         options=options,
         storage=load_storage(toml, config_path),
+        profile=profile_name,
     )
