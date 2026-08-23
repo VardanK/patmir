@@ -321,9 +321,10 @@ hit has no build scratch to reclaim. **Reverted the same day.**
 
 | watch-along run | agg RTF | peak RSS |
 | --- | --: | --: |
-| baseline | **1.710** | – |
+| baseline | 1.710 | – |
 | skipping the free on hits | **3.018** | 10.4 GB |
-| reverted to unconditional | 2.011 (sleep-contaminated) | 7.3 GB |
+| reverted, run spanned a machine suspend | 2.011 (discard) | 7.3 GB |
+| **reverted, clean run under `caffeinate`** | **1.611** | **6.1 GB** |
 
 Every stage slowed ~65–72% — uniform across Demucs, Qwen3-ASR and Higgs, which is a
 system-level stall rather than a bug in any one stage. MLX's Metal buffers live in
@@ -331,14 +332,21 @@ unified memory but sit largely **outside RSS**, so the accumulating scratch neve
 up in process accounting while still driving the machine into swap. RSS was the wrong
 instrument for the question.
 
-Two cautions for whoever revisits this:
+The clean re-measure came in at **1.611 — better than the 1.710 baseline** — which confirms
+the gate as the sole cause and shows the same-day TTS unification (`max_retries` 2 vs 1)
+costs nothing in the normal path. Peak RSS tracked the mechanism directly: 10.4 GB with the
+gate, 6.1 GB without.
 
-- The confirming run spanned a machine suspend, so the 2.011 is directional, not a clean
-  measurement. The residual gap to 1.710 is unexplained.
-- **Do not benchmark changes of this size on the laptop.** It suspends mid-run (per-stage
-  walls come from `time.time()` and absorb suspended time; `agg_rtf` comes from
-  `perf_counter` and does not), carries pre-existing swap pressure, and throttles under
-  sustained load. Three of the four runs that night were confounded by the host.
+Two notes for whoever revisits this:
+
+- **Always run benches under `caffeinate -i -m -s`.** An intermediate run suspended
+  mid-bench and read 2.011; that number is an artifact and was discarded. Per-stage walls
+  come from `time.time()` and absorb suspended time, while `agg_rtf` comes from
+  `perf_counter` and does not — so a suspended run yields impossible per-stage rows (one
+  showed `tts` 13562 s inside a 605 s run) beside a plausible-looking aggregate.
+- Roughly 28 GB is swapped out during a *healthy* watch-along run on this host, so swap
+  activity alone is not a red flag. It was the gate's extra footprint on top that tipped
+  the machine into pathological swapping.
 
 **Realtime gaps to close (2026-08-23, Reacher):** batch **0.17 RTF**; watch-along **0.71 RTF**. No remaining MLX-side software lever closes either: section pipelining is 5–8% here (MLX serializes on one GPU stream), dropping the watch-along ForcedAligner is ~5–6%, and splitting ASR chunks flattens the TTS p90 tail without cutting total TTS time. The MLX optimization well is essentially dry — Neither gap closes on this machine while `tts_rtf > 1` — the Higgs q8 decode runs at ~154 GB/s effective, 77% of the M1 Pro's 200 GB/s peak, so it is bandwidth-saturated rather than inefficient.
 
