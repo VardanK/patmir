@@ -144,13 +144,23 @@ def _find_candidate(toml: dict[str, Any], namespace: tuple[str, str], cid: str) 
 
 
 def _build_candidate(entry: dict[str, Any]) -> Any:
+    """Import a candidate module and call its `build(config)`.
+
+    The missing-`build` check is a `getattr`, NOT a `try/except AttributeError`
+    around the call. The old form wrapped the call itself, so ANY AttributeError
+    raised *inside* a candidate's constructor — a renamed attribute after a
+    dependency upgrade, say — was reported as "module must export build(config)".
+    That is a wrong diagnosis of a real bug, and it sent two investigations down
+    the wrong path before it was noticed. Let the constructor's own exception
+    through; `_build_failure_message` adds the stage/candidate context around it.
+    """
     module = importlib.import_module(entry["module"])
-    try:
-        return module.build(entry)
-    except AttributeError as exc:
+    builder = getattr(module, "build", None)
+    if not callable(builder):
         raise RuntimeError(
             f"Candidate module {entry['module']!r} must export `build(config)`."
-        ) from exc
+        )
+    return builder(entry)
 
 
 PROFILE_ENV = "PATMIR_PROFILE"

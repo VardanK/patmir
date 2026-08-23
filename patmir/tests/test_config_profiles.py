@@ -345,6 +345,55 @@ class BuildFailureMessageTest(ProfileFixture):
         self.assertIn("pipeline.profiles.bare", msg)
         self.assertNotIn("PATMIR_PROFILE=cuda", msg)
 
+    def test_attributeerror_inside_build_is_not_called_a_missing_build(self):
+        """`_build_candidate` used to wrap the CALL to build() in
+        `except AttributeError`, so any AttributeError from inside a candidate's
+        constructor was reported as "module must export build(config)" — a wrong
+        diagnosis of a real bug, which sent two investigations down the wrong
+        path. The constructor's own error must survive."""
+        import types
+
+        from patmir.pipeline import config as config_mod
+
+        module = types.ModuleType("fake_candidate")
+
+        def build(_cfg):
+            raise AttributeError("'Thing' object has no attribute 'wibble'")
+
+        module.build = build
+        real = config_mod.importlib.import_module
+        config_mod.importlib.import_module = (
+            lambda name, *a, **k: module if name == "fake.candidate" else real(name, *a, **k)
+        )
+        try:
+            cfg = load_pipeline_config(self._config_with_module("fake.candidate"))
+            with self.assertRaises(RuntimeError) as ctx:
+                cfg.build_stage("tts")
+        finally:
+            config_mod.importlib.import_module = real
+        msg = str(ctx.exception)
+        self.assertNotIn("must export", msg)
+        self.assertIn("wibble", msg)
+        self.assertIsInstance(ctx.exception.__cause__, AttributeError)
+
+    def test_a_genuinely_missing_build_still_says_so(self):
+        import types
+
+        from patmir.pipeline import config as config_mod
+
+        module = types.ModuleType("no_build_candidate")   # deliberately no `build`
+        real = config_mod.importlib.import_module
+        config_mod.importlib.import_module = (
+            lambda name, *a, **k: module if name == "fake.candidate" else real(name, *a, **k)
+        )
+        try:
+            cfg = load_pipeline_config(self._config_with_module("fake.candidate"))
+            with self.assertRaises(RuntimeError) as ctx:
+                cfg.build_stage("tts")
+        finally:
+            config_mod.importlib.import_module = real
+        self.assertIn("must export", str(ctx.exception))
+
     def test_non_mlx_failure_gets_no_profile_advice(self):
         """Don't blame the profile for an unrelated missing dependency."""
         cfg = load_pipeline_config(self._config_with_module("patmir.tests.absent_plain_thing"))
