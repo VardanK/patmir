@@ -192,11 +192,29 @@ guessed:
   artifact (`diarize/vocals_16k_mono.wav`) first.
 - **Return shape.** All three Sortformer model cards describe `diarize()` as returning segments
   "formatted as 'begin_seconds, end_seconds, speaker_index'" and **none shows a literal example**, so
-  whether an element is a string, a tuple or an object is genuinely unspecified — as is whether the
-  result is nested per input file. The parser accepts every plausible shape and **raises** on anything
-  else, with the offending value in the message. Guessing here would be the worst option available:
+  whether an element is a string, a tuple or an object was unspecified — as was whether the result is
+  nested per input file. The parser accepts every plausible shape and **raises** on anything else,
+  with the offending value in the message. Guessing here would have been the worst option available:
   a silently mis-parsed diarization does not fail, it resurfaces several stages later as two
   characters sharing a voice.
+
+  **Resolved on first run (2026-08-23, RTX 3090):**
+
+  ```
+  [['0.000 1.840 speaker_0', '2.000 3.680 speaker_1', '3.840 5.280 speaker_2']]
+  ```
+
+  A list per input file, of **whitespace**-separated strings — *not* the comma-separated form the
+  prose implies — with `speaker_N` labels rather than bare integers. The tolerance was not wasted:
+  had the parser been written to the documented prose it would have split on commas, found one field,
+  and raised on the very first call. The tuple and object branches are now insurance against a NeMo
+  change rather than live unknowns, and the observed shape is pinned in
+  `test_diarize_sortformer.ObservedNeMoShapeTest`.
+
+  The first real call also landed precisely on the one genuinely ambiguous case the parser was
+  written for — a nested list of *three* string segments, which is structurally indistinguishable
+  from a single 3-element segment. Disambiguating on whether the first two elements parse as times
+  was load-bearing on call one, not a hypothetical.
 
 `pyannote_3_1` stays registered as the fallback, because NeMo is the heaviest dependency in the stack
 (built from git, wants Cython first) and is the most likely thing to refuse to install.
@@ -233,8 +251,8 @@ at what `max_batch`. First-run expectations, and what to check, are in
 - `max_batch` is tuned against the 3090. 8 is a conservative guess from the memory math, not a
   measurement; the ceiling should be compute, not memory, since the KV cache is small (GQA, 8 KV
   heads, 144 KiB/token).
-- NeMo's `diarize()` return shape turns out to be something the tolerant parser rejects — tighten it
-  to the real shape and drop the tolerance rather than widening it further.
+- A NeMo upgrade changes the `diarize()` return shape. It is now pinned by test, so this surfaces as
+  a failure rather than as silent mis-parsing; retarget the parser at the new shape then.
 - The 3090 baseline comes in far from the ~0.35 batch / ~0.51 watch-along projection — the
   projection scales TTS/ASR decode by memory bandwidth and holds cloud translate fixed, so a large
   miss means the model of the bottleneck is wrong, not just the constant.

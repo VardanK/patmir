@@ -237,6 +237,54 @@ class IterSegmentsTest(unittest.TestCase):
         self.assertEqual(iter_segments([[]]), [])
 
 
+class ObservedNeMoShapeTest(unittest.TestCase):
+    """The real thing, captured from NeMo on the RTX 3090 (2026-08-23).
+
+    Until this ran, `diarize()`'s return type was documented only in prose
+    ("begin_seconds, end_seconds, speaker_index") on all three Sortformer model
+    cards, none of which showed a literal example. The observed shape is:
+
+        [['0.000 1.840 speaker_0', '2.000 3.680 speaker_1', ...]]
+
+    i.e. a list per input file, of **whitespace**-separated strings — not the
+    comma-separated form the prose suggests — with `speaker_N` labels rather than
+    bare integers. Pinned here so a NeMo upgrade that changes it fails loudly.
+    """
+
+    RAW = [[
+        "0.000 1.840 speaker_0",
+        "2.000 3.680 speaker_1",
+        "3.840 5.280 speaker_2",
+    ]]
+
+    def test_end_to_end_through_the_real_shape(self):
+        segments = iter_segments(self.RAW)
+        self.assertEqual(len(segments), 3)
+        turns = [
+            SpeakerTurn(*parse_segment(seg)[:2], norm_speaker(parse_segment(seg)[2]))
+            for seg in segments
+        ]
+        self.assertEqual(
+            [(t.start, t.end, t.speaker_id) for t in turns],
+            [(0.0, 1.84, "SPEAKER_00"),
+             (2.0, 3.68, "SPEAKER_01"),
+             (3.84, 5.28, "SPEAKER_02")],
+        )
+        # Distinct speakers, non-overlapping -> nothing merges, no overlaps.
+        self.assertEqual(len(merge_same_speaker(turns, 0.5)), 3)
+        self.assertEqual(derive_overlaps(turns), [])
+
+    def test_the_ambiguous_case_was_not_hypothetical(self):
+        """The first real call returned a nested list of EXACTLY three string
+        segments — both a valid group of three and, structurally, a valid
+        3-element segment. `_is_segment` disambiguating on whether the first two
+        elements are times is what makes this parse correctly, and it was load
+        bearing on call one."""
+        self.assertEqual(len(self.RAW), 1)
+        self.assertEqual(len(self.RAW[0]), 3)
+        self.assertEqual(iter_segments(self.RAW), self.RAW[0])
+
+
 class RuntimeParityTest(unittest.TestCase):
     """The MLX and NeMo candidates are two runtimes for ONE model. They must
     share post-processing rather than each carrying a copy that can drift."""

@@ -24,10 +24,23 @@ Two things this handles that the MLX path does not have to:
   * **Return shape.** `diarize()` is documented across all three Sortformer
     model cards as returning segments "formatted as 'begin_seconds,
     end_seconds, speaker_index'", but none of them shows a literal example, so
-    whether an element is a string, a tuple or an object is genuinely
-    unspecified. `parse_segment` accepts all three and raises on anything else
-    rather than guessing — a silently mis-parsed diarization is worse than a
-    crash, since it would surface much later as characters sharing a voice.
+    whether an element is a string, a tuple or an object was unspecified when
+    this was written. `parse_segment` accepts all three and raises on anything
+    else rather than guessing — a silently mis-parsed diarization is worse than
+    a crash, since it would surface much later as characters sharing a voice.
+
+    **Observed on NeMo 2026-08-23** (RTX 3090), and pinned in
+    `test_diarize_sortformer.ObservedNeMoShapeTest`:
+
+        [['0.000 1.840 speaker_0', '2.000 3.680 speaker_1', ...]]
+
+    A list per input file, of **whitespace**-separated strings — not the
+    comma-separated form the prose implies — with `speaker_N` labels rather than
+    bare integers. That is the live branch; the tuple and object branches are
+    now insurance against a NeMo change rather than genuine unknowns. Note the
+    first real call landed exactly on the ambiguous case the parser was written
+    for: a nested list of *three* string segments, which is structurally also a
+    valid 3-element segment.
 
 Install (Linux + CUDA):
     uv pip install Cython
