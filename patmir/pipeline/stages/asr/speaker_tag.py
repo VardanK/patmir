@@ -11,11 +11,18 @@ Algorithm per sentence:
   1. Compute overlap-duration with each speaker turn.
   2. If one speaker covers >= DOMINANT_THRESHOLD of the sentence's duration,
      tag the sentence with that speaker. Done.
-  3. Otherwise pick the speaker-change boundary inside the sentence: the
-     mid-point between the dominant-speaker's last-second and the next
-     speaker's first-second within the sentence. Split words at the first
-     word whose `start` >= boundary. If both halves contain >= 1 word,
-     emit two re-indexed sentences; else fall back to dominant.
+  3. Otherwise split at the first speaker change inside the sentence,
+     measured against the speaker who OPENS the sentence (not the dominant
+     one — see `_boundary_time`). Split words at the first word whose
+     `start` >= boundary. If both halves contain >= 1 word, emit two
+     re-indexed sentences; else fall back to dominant.
+
+Note this splits a sentence at most ONCE. That was load-bearing while the
+Qwen3 ASR candidates emitted one sentence per 28-second chunk (a span could
+cover five turns and still get one voice); since those candidates group
+properly a sentence rarely spans more than two turns. If a clip ever shows
+three speakers inside one sentence, make this recursive rather than widening
+the chunk.
 
 Also exposes `backfill_ref_text(diarization, transcript)` — fills in
 `SpeakerRef.ref_text` for each speaker by joining the ASR words whose
@@ -57,20 +64,34 @@ def _dominant_speaker(sent: Sentence, turns: list[SpeakerTurn]) -> tuple[str | N
 
 
 def _boundary_time(sent: Sentence, turns: list[SpeakerTurn], dominant: str) -> float | None:
-    """For a mixed-speaker sentence, return the time at which the speaker first
-    changes away from `dominant`, or `None` if there is no clean change inside
-    the sentence."""
+    """For a mixed-speaker sentence, return the time of the first speaker
+    change inside it, or `None` if there is no clean change.
+
+    The boundary is measured against the speaker who OPENS the sentence, not
+    against `dominant`. Until 2026-08-24 this looked for the first turn whose
+    speaker differed from `dominant`, which silently failed whenever the
+    dominant speaker was the *later* one: for "A speaks, then B speaks longer",
+    dominant is B, the first non-B turn is A starting at (or before) the
+    sentence start, `change > sent.start` is False, and the function returned
+    None — so the sentence was never split and B's voice spoke A's words. That
+    is half of all two-speaker sentences.
+
+    `dominant` is still accepted (callers pass it, and it remains the fallback
+    speaker) but is no longer what the boundary is derived from.
+    """
     in_window = [
         t for t in turns
         if t.end > sent.start and t.start < sent.end
     ]
+    if not in_window:
+        return None
     in_window.sort(key=lambda t: t.start)
-    # Find the first turn inside the sentence whose speaker != dominant.
+    opening = in_window[0].speaker_id
     for t in in_window:
-        if t.speaker_id == dominant:
+        if t.speaker_id == opening:
             continue
         change = max(t.start, sent.start)
-        if change > sent.start and change < sent.end:
+        if sent.start < change < sent.end:
             return change
     return None
 

@@ -32,9 +32,14 @@ Silero VAD silences (`ctx.extra["vad_intervals"]`, set by the separate stage),
 capped at `chunk_seconds`, and run them **batched** — the ASR and the aligner
 both support batch inference natively.
 
-Cutting on VAD boundaries means no decode budget is spent on silence, and it
-yields finer sentence granularity than the MLX path's coarse internal chunking
-(which pushed per-sentence TTS p90 to 21 s — see `stages/asr/qwen3-asr-mlx.md`).
+Cutting on VAD boundaries means no decode budget is spent on silence.
+
+It does **not** by itself give finer sentences — that claim was in this docstring
+until 2026-08-24 and was wrong. A chunk is up to `chunk_seconds` of audio, and
+until then each chunk became one `Sentence`, so a 5-minute clip yielded 23
+sentences with spans up to 26.3 s. Sentences now come from
+`group_into_sentences` over the aligned words (`sentence_gap_s`), like every
+other ASR candidate. See `stages/asr/qwen3-asr-transformers.md`.
 
 ## Word timestamps
 
@@ -48,6 +53,7 @@ Install: `uv pip install "transformers>=5.13" torch torchaudio soundfile`
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -56,6 +62,7 @@ from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import AudioTrack, Sentence, Transcript, Word
 from patmir.pipeline.stages.asr._sentence import (
     filter_words_by_vad,
+    group_into_sentences,
     is_non_lexical,
     word_in_target_script,
     write_transcript,
@@ -200,6 +207,8 @@ class Qwen3ASRTorch:
         aligner_dtype: str = "bfloat16",
         max_new_tokens: int = 256,
         chunk_seconds: float = 28.0,
+        sentence_gap_s: float = 0.35,
+        max_sentence_s: float = 8.0,
         batch_size: int = 8,
         attn_implementation: str = "sdpa",
     ) -> None:
@@ -214,6 +223,8 @@ class Qwen3ASRTorch:
         self.model_id = model_id
         self.max_new_tokens = max_new_tokens
         self.chunk_seconds = chunk_seconds
+        self.sentence_gap_s = sentence_gap_s
+        self.max_sentence_s = max_sentence_s
         self.batch_size = max(1, batch_size)
 
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -370,22 +381,47 @@ class Qwen3ASRTorch:
                 ))
             chunk_words = filter_words_by_vad(chunk_words, vad)
 
-            # Narrow the sentence to where the speaker actually talks: the
-            # chunk carries VAD padding, and the mux places TTS at these times.
-            if chunk_words:
-                start = min(w.start for w in chunk_words)
-                end = max(w.end for w in chunk_words)
-            else:
-                start, end = chunk_start, chunk_end
-
             words.extend(chunk_words)
-            sentences.append(Sentence(
-                idx=len(sentences),
-                text=text,
-                start=start,
-                end=end,
-                words=chunk_words,
-            ))
+
+            if chunk_words:
+                # A chunk is up to `chunk_seconds` of audio, so it is NOT a
+                # sentence. Emitting one Sentence per chunk (which this did
+                # until 2026-08-24) broke everything downstream that assumes a
+                # sentence is one utterance by one speaker: `apply_speaker_tags`
+                # gave the whole span a single DOMINANT speaker, so a chunk
+                # covering several diarization turns was synthesized in one
+                # character's voice, and the TTS decoded 13-26 s of speech as one
+                # unit. Measured on a 5-minute clip: 23 sentences against
+                # diarization's 108 turns, spans up to 26.3 s.
+                #
+                # Group like every other ASR candidate does. The helper splits on
+                # terminal punctuation OR a word gap — and the gap branch is what
+                # carries this candidate, because Qwen3-ASR emits no punctuation
+                # at all (0 of 398 words on that clip), so punctuation alone would
+                # never split anything.
+                #
+                # Sentence start/end come from the grouped words, which also
+                # narrows them to where the speaker actually talks: the chunk
+                # carries VAD padding, and the mux places TTS at these times.
+                for sent in group_into_sentences(
+                    chunk_words,
+                    max_gap_s=self.sentence_gap_s,
+                    max_sentence_s=self.max_sentence_s,
+                ):
+                    sentences.append(replace(sent, idx=len(sentences)))
+            else:
+                # No aligner coverage for this language (or the aligner is
+                # disabled): there are no word timings to group on, so the chunk
+                # stays one sentence with the model's own text and chunk-level
+                # timings. This is the documented degradation path, not the
+                # normal one.
+                sentences.append(Sentence(
+                    idx=len(sentences),
+                    text=text,
+                    start=chunk_start,
+                    end=chunk_end,
+                    words=[],
+                ))
 
         ctx.progress("asr", 1.0, f"{len(sentences)} sentences, {len(words)} words")
         transcript = Transcript(language=language, words=words, sentences=sentences)
@@ -402,6 +438,8 @@ def build(config: dict[str, Any]) -> Qwen3ASRTorch:
         aligner_dtype=config.get("aligner_dtype", "bfloat16"),
         max_new_tokens=int(config.get("max_new_tokens", 256)),
         chunk_seconds=float(config.get("chunk_seconds", 28.0)),
+        sentence_gap_s=float(config.get("sentence_gap_s", 0.35)),
+        max_sentence_s=float(config.get("max_sentence_s", 8.0)),
         batch_size=int(config.get("batch_size", 8)),
         attn_implementation=config.get("attn_implementation", "sdpa"),
     )
