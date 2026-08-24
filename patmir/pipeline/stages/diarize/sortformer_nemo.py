@@ -186,6 +186,7 @@ class SortformerNeMo:
         merge_gap_seconds: float = 0.5,
         duplicate_containment: float = 0.4,
         duplicate_min_seconds: float = 1.0,
+        duplicate_min_speaker_seconds: float = 10.0,
         batch_size: int = 1,
         streaming: dict[str, Any] | None = None,
     ) -> None:
@@ -197,6 +198,7 @@ class SortformerNeMo:
         self.merge_gap_seconds = float(merge_gap_seconds)
         self.duplicate_containment = float(duplicate_containment)
         self.duplicate_min_seconds = float(duplicate_min_seconds)
+        self.duplicate_min_speaker_seconds = float(duplicate_min_speaker_seconds)
         self.batch_size = int(batch_size)
 
         # A local `.nemo` checkpoint is supported so a box can run fully offline
@@ -261,6 +263,7 @@ class SortformerNeMo:
             merged, self.merge_gap_seconds,
             min_containment=self.duplicate_containment,
             min_shared_seconds=self.duplicate_min_seconds,
+            min_speaker_seconds=self.duplicate_min_speaker_seconds,
         )
         if aliases:
             ctx.progress("diarize", 0.85, "one speaker on two slots: " + ", ".join(
@@ -300,6 +303,8 @@ def build(config: dict[str, Any]) -> SortformerNeMo:
         merge_gap_seconds=float(config.get("merge_gap_seconds", 0.5)),
         duplicate_containment=float(config.get("duplicate_containment", 0.4)),
         duplicate_min_seconds=float(config.get("duplicate_min_seconds", 1.0)),
+        duplicate_min_speaker_seconds=float(
+            config.get("duplicate_min_speaker_seconds", 10.0)),
         batch_size=int(config.get("batch_size", 1)),
         streaming=streaming or None,
     )

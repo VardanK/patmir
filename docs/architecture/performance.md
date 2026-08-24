@@ -287,6 +287,33 @@ content, no for dense. TTS + ASR are the two levers; both scale with speech.
 
 ## Watch-along (D3, streaming mode)
 
+### sample_1.mkv (Reacher) on CUDA / RTX 3090 — 2026-08-24, re-measured after the speaker-identity work
+
+`agg RTF 1.456 · steady-state sections 1-9 = 0.877 · wall 438s · build 147s`
+(Report: `runs/bench/sample_1-cuda-watch-fixed.json`.)
+
+Against the first CUDA baseline below (1.420 / 0.831), the per-word speaker
+attribution and the duplicate-slot merge cost **+5.5 % on steady state** — more
+sentences per section, so more translate calls and more TTS lines. Still under
+realtime. Per-section RTF ranges 0.43-1.43 with 5 of the 9 steady-state sections
+at or above 1.0, so the buffer is doing real work; the aggregate is what clears.
+
+**One regression found and fixed by this run**, which is the reason to run
+watch-along after any diarize change: the duplicate-slot merge
+(`merge_duplicate_speakers`) was calibrated on 5-minute totals and **over-fired on
+~35 s sections**, collapsing 4 speakers to 2 in every section and the ~40 s
+prelude to **1** — which put the mother and a male character on one identity and
+left three lines with no speaker at all. Since the prelude establishes the cast
+for the whole stream, that is the worst place for it to happen. Fixed with a
+`min_speaker_seconds` floor (quality issue #16); the middle row below is the
+broken run, kept because the timings are still valid.
+
+| run | agg RTF | steady state | note |
+| --- | --: | --: | --- |
+| first CUDA baseline | 1.420 | 0.831 | before the speaker-identity work |
+| merge over-firing | 1.432 | 0.858 | timings valid, **output invalid** (cast collapsed) |
+| + `min_speaker_seconds` floor | 1.456 | 0.877 | current |
+
 ### sample_1.mkv (Reacher) on CUDA / RTX 3090 — 2026-08-24 (FIRST CUDA BASELINE)
 
 `source 301.11s · dubbed audio 300.97s · wall 427.37s · agg RTF 1.42 · 10 sections`
@@ -466,7 +493,7 @@ Full matrix (all warm except the noted cold first-run):
 | run | RTF | TTS | ASR | rebuild | note |
 | --- | --: | --: | --: | ------: | ---- |
 | **sample_1 batch, CUDA/3090** (warm) | **0.461** | **55%** | **15%** | 0% | first CUDA baseline 2026-08-24; cold 0.958 with builds 53% of wall |
-| **sample_1 watch-along, CUDA/3090** | **1.42** | 43% | 31% | 37% | **steady-state sections 1-9 = 0.831, clears realtime**; all build cost in section 0 |
+| **sample_1 watch-along, CUDA/3090** | **1.456** | — | — | 34% | **steady-state sections 1-9 = 0.877, clears realtime**; all build cost in section 0. Was 1.42 / 0.831 before the 2026-08-24 speaker-identity work (+5.5% steady state for more sentences per section) |
 | **Reacher batch, M1 Pro** (dense, ~70% speech, qwen3+higgs) | **1.17** | **69%** | **11%** | – | Apple Silicon reference |
 | **Reacher watch-along** (qwen3+higgs) | **1.71** | 57% | 17% | 2.1% | current active set |
 | masha batch (sparse, 23% speech)   | **0.89** | 37% | 29% | – | clears realtime |
