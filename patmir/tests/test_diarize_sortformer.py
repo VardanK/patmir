@@ -318,8 +318,8 @@ class MergeDuplicateSpeakersTest(unittest.TestCase):
 
     def test_two_slots_of_one_person_merge(self):
         turns = [
-            SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_02"),
-            SpeakerTurn(start=0.1, end=3.9, speaker_id="SPEAKER_03"),
+            SpeakerTurn(start=0.0, end=16.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.5, end=15.5, speaker_id="SPEAKER_03"),
         ]
         out, aliases = merge_duplicate_speakers(turns, 0.5)
         self.assertEqual(aliases, {"SPEAKER_03": "SPEAKER_02"})
@@ -376,32 +376,34 @@ class MergeDuplicateSpeakersTest(unittest.TestCase):
             SpeakerTurn(start=0.0, end=0.5, speaker_id="SPEAKER_03"),
         ]
         self.assertEqual(merge_duplicate_speakers(turns, 0.5)[1], {})
+        # Even with both floors relaxed the ratio still has to clear.
         self.assertEqual(
-            merge_duplicate_speakers(turns, 0.5, min_shared_seconds=0.25)[1],
+            merge_duplicate_speakers(turns, 0.5, min_shared_seconds=0.25,
+                                     min_speaker_seconds=0.1)[1],
             {"SPEAKER_03": "SPEAKER_02"},
         )
 
     def test_the_surviving_id_is_the_one_with_more_speech(self):
         turns = [
-            SpeakerTurn(start=0.0, end=2.0, speaker_id="SPEAKER_01"),
-            SpeakerTurn(start=0.0, end=9.0, speaker_id="SPEAKER_03"),
+            SpeakerTurn(start=0.0, end=12.0, speaker_id="SPEAKER_01"),
+            SpeakerTurn(start=0.0, end=30.0, speaker_id="SPEAKER_03"),
         ]
         _out, aliases = merge_duplicate_speakers(turns, 0.5)
         self.assertEqual(aliases, {"SPEAKER_01": "SPEAKER_03"})
 
     def test_an_exact_tie_on_speech_keeps_the_lower_id(self):
         turns = [
-            SpeakerTurn(start=0.0, end=5.0, speaker_id="SPEAKER_01"),
-            SpeakerTurn(start=0.0, end=5.0, speaker_id="SPEAKER_03"),
+            SpeakerTurn(start=0.0, end=15.0, speaker_id="SPEAKER_01"),
+            SpeakerTurn(start=0.0, end=15.0, speaker_id="SPEAKER_03"),
         ]
         self.assertEqual(merge_duplicate_speakers(turns, 0.5)[1],
                          {"SPEAKER_03": "SPEAKER_01"})
 
     def test_three_slots_of_one_person_collapse_transitively(self):
         turns = [
-            SpeakerTurn(start=0.0, end=9.0, speaker_id="SPEAKER_00"),
-            SpeakerTurn(start=0.1, end=8.9, speaker_id="SPEAKER_01"),
-            SpeakerTurn(start=0.2, end=8.8, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.0, end=20.0, speaker_id="SPEAKER_00"),
+            SpeakerTurn(start=0.5, end=19.5, speaker_id="SPEAKER_01"),
+            SpeakerTurn(start=1.0, end=19.0, speaker_id="SPEAKER_02"),
         ]
         out, aliases = merge_duplicate_speakers(turns, 0.5)
         self.assertEqual(aliases,
@@ -414,8 +416,8 @@ class MergeDuplicateSpeakersTest(unittest.TestCase):
         share a label, and an active count of 2 would then be read as two
         distinct speakers talking at once."""
         turns = [
-            SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_02"),
-            SpeakerTurn(start=0.1, end=3.9, speaker_id="SPEAKER_03"),
+            SpeakerTurn(start=0.0, end=16.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.5, end=15.5, speaker_id="SPEAKER_03"),
         ]
         out, _aliases = merge_duplicate_speakers(turns, 0.5)
         self.assertEqual(len(out), 1)
@@ -423,9 +425,9 @@ class MergeDuplicateSpeakersTest(unittest.TestCase):
 
     def test_phantom_overlaps_disappear_with_the_duplicate(self):
         turns = [
-            SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_02"),
-            SpeakerTurn(start=0.1, end=3.9, speaker_id="SPEAKER_03"),
-            SpeakerTurn(start=10.0, end=12.0, speaker_id="SPEAKER_00"),
+            SpeakerTurn(start=0.0, end=16.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.5, end=15.5, speaker_id="SPEAKER_03"),
+            SpeakerTurn(start=30.0, end=32.0, speaker_id="SPEAKER_00"),
         ]
         self.assertEqual(len(derive_overlaps(turns)), 1)
         out, _ = merge_duplicate_speakers(turns, 0.5)
@@ -433,12 +435,56 @@ class MergeDuplicateSpeakersTest(unittest.TestCase):
 
     def test_containment_above_one_disables_the_pass(self):
         turns = [
-            SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_02"),
-            SpeakerTurn(start=0.1, end=3.9, speaker_id="SPEAKER_03"),
+            SpeakerTurn(start=0.0, end=16.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.5, end=15.5, speaker_id="SPEAKER_03"),
         ]
         out, aliases = merge_duplicate_speakers(turns, 0.5, min_containment=1.01)
         self.assertEqual(aliases, {})
         self.assertEqual(len(out), 2)
+
+    def test_a_short_window_cannot_merge_however_high_the_ratio(self):
+        """Containment is a ratio, so it is only worth what backs it. Watch-along
+        diarizes ~35 s sections and a ~40 s prelude, where speakers hold 0.5-9.4 s
+        each and containments of 0.73-1.00 between genuinely DISTINCT speakers are
+        routine. With no floor, every streaming section collapsed 4 speakers to 2
+        and the prelude collapsed to 1, putting the mother and a male character on
+        one identity."""
+        turns = [
+            SpeakerTurn(start=0.0, end=6.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.0, end=6.0, speaker_id="SPEAKER_03"),
+        ]  # containment 1.0 on 6.0 s -- perfect ratio, not enough audio
+        self.assertEqual(merge_duplicate_speakers(turns, 0.5)[1], {})
+
+    def test_the_floor_brackets_the_two_observed_regimes(self):
+        """Real whole-clip merges start at 11.68 s of speech for the smaller
+        member; watch-along misfires top out at 9.36 s. Both bounds pinned so the
+        default cannot drift onto either."""
+        def pair(min_total: float) -> list[SpeakerTurn]:
+            # Fully coincident, so containment is 1.0 and only the floor decides.
+            return [
+                SpeakerTurn(start=0.0, end=min_total + 5.0, speaker_id="SPEAKER_02"),
+                SpeakerTurn(start=0.0, end=min_total, speaker_id="SPEAKER_03"),
+            ]
+        self.assertEqual(merge_duplicate_speakers(pair(11.68), 0.5)[1],
+                         {"SPEAKER_03": "SPEAKER_02"})
+        self.assertEqual(merge_duplicate_speakers(pair(9.36), 0.5)[1], {})
+
+    def test_the_floor_looks_at_the_smaller_speaker_not_the_pair(self):
+        """A long speaker cannot lend evidence to a brief one."""
+        turns = [
+            SpeakerTurn(start=0.0, end=120.0, speaker_id="SPEAKER_00"),
+            SpeakerTurn(start=0.0, end=5.0, speaker_id="SPEAKER_01"),
+        ]
+        self.assertEqual(merge_duplicate_speakers(turns, 0.5)[1], {})
+
+    def test_the_floor_is_configurable_for_a_deliberately_short_job(self):
+        turns = [
+            SpeakerTurn(start=0.0, end=6.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.0, end=6.0, speaker_id="SPEAKER_03"),
+        ]
+        self.assertEqual(
+            merge_duplicate_speakers(turns, 0.5, min_speaker_seconds=5.0)[1],
+            {"SPEAKER_03": "SPEAKER_02"})
 
     def test_a_single_speaker_and_an_empty_list_are_no_ops(self):
         one = [SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_00")]
