@@ -113,14 +113,40 @@ end flat or rising.**
   `2026-06-20-higgs-v3-tts-mlx-q8` finding that low temperature causes overflow
   was measured on a *long* line and is not contradicted for that case.)
 - The lever that works is **selection**, now that draws are reproducible and the
-  metric identifies a bad one: best-of-2 takes 38 % → 21 %, best-of-3 → 4 %. One
-  pass over the 37 short lines of a 5-minute clip measures 21.7–29.5 s, so
-  best-of-2 on lines of ≤ 4 words costs roughly +22 s on a 139 s TTS stage
-  (+16 % of the stage, +8 % end to end). Not implemented.
-- A caution for whoever implements it: best-of-3's selected median is −19.3 dB,
-  at the extreme end of the natural range (unflagged lines run −6.8 to −19.3), so
-  optimising this metric hard risks trading "final word stressed" for "final word
-  swallowed". A target **band** is likely better than a minimum.
+  metric identifies a bad one — see "Deferred option" below.
+
+## Deferred option: best-of-k selection (NOT taken, 2026-08-24)
+
+Generate a short line more than once and keep the draw whose ending falls away.
+Measured on the clip's 37 short lines (≤ 4 words):
+
+| | flat-or-rising endings | selected median | worst |
+| --- | --- | --- | --- |
+| best-of-1 (today) | 9/24 (38 %) | −7.9 dB | +3.5 |
+| best-of-2 | 5/24 (21 %) | −12.3 dB | −0.1 |
+| best-of-3 | 1/24 (4 %) | −19.3 dB | −1.5 |
+
+Cost, measured not estimated: one pass over those 37 lines takes **21.7–29.5 s**,
+so best-of-2 adds roughly **+22 s to a 139 s TTS stage — +16 % of the stage, +8 %
+end to end**. (A first estimate from the chunking rule said +7 %; it
+underestimated, because duplicated short lines form whole extra chunks.)
+
+**Declined by the author on cost**: the extra processing time is not accepted for
+a 38 % → 21 % improvement. Recorded here as a ready option rather than a plan.
+
+If it is ever taken up, three things are already known:
+
+1. The selector metric (final voiced chunk's peak level against the line's own
+   median chunk level) is validated as a **detector** — it separates the two
+   author-flagged lines from every unflagged one — but never as a **selector**.
+   That needs an ear test of its own before it drives synthesis.
+2. Use a target **band**, not a minimum. best-of-3 selects at −19.3 dB, the
+   extreme edge of the natural range (unflagged lines run −6.8 to −19.3), so
+   optimising hard risks trading "final word stressed" for "final word
+   swallowed".
+3. Restrict it to short lines. Applying it to every line costs +56 % of the TTS
+   stage at k=2 and +115 % at k=3, which is not worth it — long lines have room
+   for a natural decline and are not where the artifact was heard.
 
 ## Revisit
 

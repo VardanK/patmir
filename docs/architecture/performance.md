@@ -699,6 +699,17 @@ close to free, so the ceiling here is roughly the batch size — where prefix-KV
   length-sorted chunks the waste is bounded, but compacting the batch mid-flight would recover it.
 
 ### Not recommended now
+- **Best-of-k TTS selection for short lines** — the one fix that measurably
+  reduces the wrong-emphasis artifact (quality issue #19), and the only entry
+  here that would make the pipeline *slower* on purpose. Generating each short
+  line twice and keeping the draw whose ending falls away takes flat-or-rising
+  endings from **38% → 21%** (k=3 → 4%), at a measured **+22s on a 139s TTS
+  stage: +16% of the stage, +8% end to end**. **Declined by the author on cost**
+  2026-08-24 — the extra time is not accepted for that gain. Do NOT apply it to
+  every line: that costs +56% of the stage at k=2 and +115% at k=3, and long
+  lines have room for a natural decline and are not where the artifact is heard.
+  Full numbers and the two implementation cautions are in ADR
+  `2026-08-24-tts-sampling-reproducibility` ("Deferred option").
 - **Cold-start MLX kernel pre-warm** (~240s first-run) — only affects the first
   run per process; batch is one-shot so it's a real one-time cost, but persisting
   the MLX compile cache is fiddly for a once-per-session hit. Revisit only if
