@@ -13,18 +13,6 @@ from pathlib import Path
 from typing import Any
 
 
-_DEFAULT_EMOTION_GUIDANCE: dict[str, float] = {
-    # Anchored at OmniVoice's constructor default (2.0); pushes up for
-    # intense emotions to amplify ref-driven expression. See ADR
-    # 2026-05-26-emotion-routed-through-ref-clip-binning.
-    "neutral": 1.8,
-    "sad":     2.0,
-    "happy":   2.8,
-    "angry":   3.0,
-    "fearful": 2.6,
-}
-
-
 @dataclass
 class PipelineOptions:
     stretch_cap: float = 0.20
@@ -60,8 +48,9 @@ class PipelineOptions:
     # cloned voice audibly swap whenever the detected emotion changed — badly so
     # on chaotic cartoon audio where the per-emotion clips are short, noisy
     # snippets (screams/laughs). Pinning one ref keeps each character's voice
-    # consistent. Trades away per-line emotion routing (emotion still varies via
-    # guidance_scale). Set False to restore the Phase-2.x emotion-ref binning.
+    # consistent. Trades away per-line emotion routing (emotion instead comes
+    # from the TTS candidate's own control — an inline `<|emotion:..|>` tag on
+    # the Higgs candidates). Set False to restore the Phase-2.x ref binning.
     tts_pin_speaker_ref: bool = True
     # Duck the original vocals stem this many seconds BEFORE each line's source
     # start (and after its end via duck_tail_seconds). ASR word-onset timestamps
@@ -112,12 +101,18 @@ class PipelineOptions:
     # ~10 GB with the current models — so set False on a memory-constrained box
     # or when the server is started just to browse finished runs.
     prewarm_stages: bool = True
-    # OmniVoice guidance_scale per emotion bin. The TTS adapter looks this
-    # up per sentence and passes it to the inner candidate as a per-call
-    # override of the constructor default.
-    emotion_guidance: dict[str, float] = field(
-        default_factory=lambda: dict(_DEFAULT_EMOTION_GUIDANCE)
-    )
+    # NOTE (2026-08-24): `emotion_guidance` used to live here — a per-bin
+    # OmniVoice `guidance_scale` lookup. Removed because it had been INERT
+    # since 2026-06-20: the adapter only forwards it to candidates whose
+    # `synthesize` accepts `guidance_scale`, and the active Higgs candidates
+    # do not (they take an inline `<|emotion:..|>` tag instead). So quality
+    # issue #11's "lowered guidance to 1.3-1.7 to stop over-emoting" stopped
+    # applying the moment TTS moved to Higgs, and nothing said so for two
+    # months. Registered OmniVoice fallbacks now use their own constructor
+    # default (2.0) rather than a per-emotion override; if per-bin guidance is
+    # ever wanted back, restore it WITH a warning when the active candidate
+    # cannot accept it. ADR
+    # 2026-08-24-asr-sentence-segmentation-and-cuda-baseline.
 
 
 @dataclass

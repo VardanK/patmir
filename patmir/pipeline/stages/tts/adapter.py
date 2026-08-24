@@ -43,7 +43,6 @@ class SentenceTTS:
             sig = inspect.signature(inner.synthesize)
             params = sig.parameters
             self._supports_ref = "ref_audio" in params and "ref_text" in params
-            self._supports_guidance = "guidance_scale" in params
             self._supports_emotion = "emotion" in params
             # Pool-voice candidates (ElevenLabs no-clone mode) map a stable
             # voice per character; they need the speaker_id directly rather
@@ -58,7 +57,6 @@ class SentenceTTS:
             self._supports_voice_id = "voice_id" in params
         except (TypeError, ValueError):
             self._supports_ref = False
-            self._supports_guidance = False
             self._supports_emotion = False
             self._supports_speaker = False
             self._supports_voice_id = False
@@ -129,7 +127,8 @@ class SentenceTTS:
         ]
         # Pin one ref per speaker: ignore emotion entirely, always use the
         # longest/cleanest same-speaker clip so the cloned voice never swaps
-        # mid-character. (Emotion still varies via guidance_scale.)
+        # mid-character. (Emotion varies via the TTS candidate's own emotion
+        # control — an inline `<|emotion:..|>` tag on the Higgs candidates.)
         if pin_speaker_ref:
             if same_speaker:
                 return max(same_speaker, key=lambda r: r.source_end - r.source_start)
@@ -263,10 +262,6 @@ class SentenceTTS:
             if self._supports_ref:
                 kwargs["ref_audio"] = ref_audio
                 kwargs["ref_text"] = ref_text
-            if self._supports_guidance and s.emotion:
-                gs = ctx.options.emotion_guidance.get(s.emotion)
-                if gs is not None:
-                    kwargs["guidance_scale"] = gs
             if self._supports_emotion:
                 # ElevenLabs (and any other candidate that accepts an
                 # explicit `emotion` kwarg) drives its own per-emotion knobs
