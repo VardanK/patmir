@@ -21,6 +21,7 @@ import unittest
 from patmir.pipeline.stage import SpeakerTurn
 from patmir.pipeline.stages.diarize._postprocess import (
     derive_overlaps,
+    merge_duplicate_speakers,
     merge_same_speaker,
     norm_speaker,
     passes_vad,
@@ -302,3 +303,151 @@ class RuntimeParityTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class MergeDuplicateSpeakersTest(unittest.TestCase):
+    """Sortformer sometimes emits ONE person on TWO of its output slots.
+
+    That is not cosmetic: the actor's lines split across two ref cells (so the
+    cloned voice changes mid-scene), the twin pair is reported as overlapping
+    speech (so `pick_refs` rejects every turn that touches it and the speaker can
+    end up with no ref at all), and `apply_speaker_tags` sees a speaker change a
+    few hundred ms into a sentence. All three were observed together on
+    `runs/20260824-163841-sample_1`.
+    """
+
+    def test_two_slots_of_one_person_merge(self):
+        turns = [
+            SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.1, end=3.9, speaker_id="SPEAKER_03"),
+        ]
+        out, aliases = merge_duplicate_speakers(turns, 0.5)
+        self.assertEqual(aliases, {"SPEAKER_03": "SPEAKER_02"})
+        self.assertEqual({t.speaker_id for t in out}, {"SPEAKER_02"})
+
+    def test_genuinely_distinct_speakers_are_left_alone(self):
+        """Real simultaneous speech is partial and ragged. The measured pair of
+        distinct speakers on that clip sat at 8-10% mutual concurrency; the
+        duplicated pair sat at 52% / 71%."""
+        turns = [
+            SpeakerTurn(start=0.0, end=10.0, speaker_id="SPEAKER_00"),
+            SpeakerTurn(start=9.5, end=20.0, speaker_id="SPEAKER_01"),
+        ]
+        out, aliases = merge_duplicate_speakers(turns, 0.5)
+        self.assertEqual(aliases, {})
+        self.assertEqual(len(out), 2)
+
+    def test_the_default_threshold_brackets_every_observed_ratio(self):
+        """The model is NOT deterministic: four runs of the identical file put the
+        duplicated pair at 0.705, 0.594 and twice above 0.6, while the highest a
+        genuinely-distinct pair reached on those same runs was 0.259. A first cut
+        at 0.6 was calibrated on one run and silently stopped firing on the next
+        — the 0.594 run came back with four speakers and one again borrowing
+        another character's reference clip. Both bounds are pinned here so the
+        default cannot drift back onto the edge of either."""
+        def pair(containment: float) -> list[SpeakerTurn]:
+            """Two 10 s speakers overlapping for exactly `containment` of one."""
+            shift = 10.0 * (1.0 - containment)
+            return [
+                SpeakerTurn(start=0.0, end=10.0, speaker_id="SPEAKER_02"),
+                SpeakerTurn(start=shift, end=shift + 10.0, speaker_id="SPEAKER_03"),
+            ]
+
+        # Lowest duplicated-pair containment seen across four runs.
+        self.assertEqual(merge_duplicate_speakers(pair(0.594), 0.5)[1],
+                         {"SPEAKER_03": "SPEAKER_02"})
+        # Highest genuinely-distinct containment seen across the same four runs.
+        self.assertEqual(merge_duplicate_speakers(pair(0.259), 0.5)[1], {})
+
+    def test_a_long_ragged_partial_overlap_is_not_a_duplicate(self):
+        """The shape real simultaneous speech takes: one speaker holds long solo
+        turns and the concurrency is a small fraction of them."""
+        distinct = [
+            SpeakerTurn(start=0.0, end=64.0, speaker_id="SPEAKER_00"),
+            SpeakerTurn(start=57.5, end=64.0, speaker_id="SPEAKER_01"),
+            SpeakerTurn(start=64.0, end=147.0, speaker_id="SPEAKER_01"),
+        ]  # shared 6.5 / min(64.0, 89.5) = 0.10
+        self.assertEqual(merge_duplicate_speakers(distinct, 0.5)[1], {})
+
+    def test_a_short_pair_needs_min_shared_seconds(self):
+        """Two brief turns can hit the ratio on noise alone."""
+        turns = [
+            SpeakerTurn(start=0.0, end=0.5, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.0, end=0.5, speaker_id="SPEAKER_03"),
+        ]
+        self.assertEqual(merge_duplicate_speakers(turns, 0.5)[1], {})
+        self.assertEqual(
+            merge_duplicate_speakers(turns, 0.5, min_shared_seconds=0.25)[1],
+            {"SPEAKER_03": "SPEAKER_02"},
+        )
+
+    def test_the_surviving_id_is_the_one_with_more_speech(self):
+        turns = [
+            SpeakerTurn(start=0.0, end=2.0, speaker_id="SPEAKER_01"),
+            SpeakerTurn(start=0.0, end=9.0, speaker_id="SPEAKER_03"),
+        ]
+        _out, aliases = merge_duplicate_speakers(turns, 0.5)
+        self.assertEqual(aliases, {"SPEAKER_01": "SPEAKER_03"})
+
+    def test_an_exact_tie_on_speech_keeps_the_lower_id(self):
+        turns = [
+            SpeakerTurn(start=0.0, end=5.0, speaker_id="SPEAKER_01"),
+            SpeakerTurn(start=0.0, end=5.0, speaker_id="SPEAKER_03"),
+        ]
+        self.assertEqual(merge_duplicate_speakers(turns, 0.5)[1],
+                         {"SPEAKER_03": "SPEAKER_01"})
+
+    def test_three_slots_of_one_person_collapse_transitively(self):
+        turns = [
+            SpeakerTurn(start=0.0, end=9.0, speaker_id="SPEAKER_00"),
+            SpeakerTurn(start=0.1, end=8.9, speaker_id="SPEAKER_01"),
+            SpeakerTurn(start=0.2, end=8.8, speaker_id="SPEAKER_02"),
+        ]
+        out, aliases = merge_duplicate_speakers(turns, 0.5)
+        self.assertEqual(aliases,
+                         {"SPEAKER_01": "SPEAKER_00", "SPEAKER_02": "SPEAKER_00"})
+        self.assertEqual({t.speaker_id for t in out}, {"SPEAKER_00"})
+
+    def test_relabelled_turns_are_re_merged_so_no_speaker_overlaps_itself(self):
+        """`derive_overlaps` documents the invariant that one speaker's merged
+        turns never overlap — two slots of one person violate it the moment they
+        share a label, and an active count of 2 would then be read as two
+        distinct speakers talking at once."""
+        turns = [
+            SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.1, end=3.9, speaker_id="SPEAKER_03"),
+        ]
+        out, _aliases = merge_duplicate_speakers(turns, 0.5)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(derive_overlaps(out), [])
+
+    def test_phantom_overlaps_disappear_with_the_duplicate(self):
+        turns = [
+            SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.1, end=3.9, speaker_id="SPEAKER_03"),
+            SpeakerTurn(start=10.0, end=12.0, speaker_id="SPEAKER_00"),
+        ]
+        self.assertEqual(len(derive_overlaps(turns)), 1)
+        out, _ = merge_duplicate_speakers(turns, 0.5)
+        self.assertEqual(derive_overlaps(out), [])
+
+    def test_containment_above_one_disables_the_pass(self):
+        turns = [
+            SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_02"),
+            SpeakerTurn(start=0.1, end=3.9, speaker_id="SPEAKER_03"),
+        ]
+        out, aliases = merge_duplicate_speakers(turns, 0.5, min_containment=1.01)
+        self.assertEqual(aliases, {})
+        self.assertEqual(len(out), 2)
+
+    def test_a_single_speaker_and_an_empty_list_are_no_ops(self):
+        one = [SpeakerTurn(start=0.0, end=4.0, speaker_id="SPEAKER_00")]
+        self.assertEqual(merge_duplicate_speakers(one, 0.5), (one, {}))
+        self.assertEqual(merge_duplicate_speakers([], 0.5), ([], {}))
+
+    def test_speakers_that_never_coincide_never_merge(self):
+        turns = [
+            SpeakerTurn(start=0.0, end=5.0, speaker_id="SPEAKER_00"),
+            SpeakerTurn(start=5.0, end=10.0, speaker_id="SPEAKER_01"),
+        ]
+        self.assertEqual(merge_duplicate_speakers(turns, 0.5)[1], {})

@@ -9,6 +9,8 @@ model and then need identical clean-up before the result can satisfy the
   * normalize the speaker label to the `SPEAKER_NN` convention that
     `apply_speaker_tags` and the ref-picker expect;
   * merge the fragmented same-speaker pieces the model emits into turns;
+  * fold together two output slots that are really one person (see
+    `merge_duplicate_speakers`);
   * re-derive overlap intervals, which the model supports (it is end-to-end and
     emits concurrent speakers) but does not report directly;
   * drop turns with no intersection with the separate stage's Silero VAD windows.
@@ -19,9 +21,14 @@ point of having both is that they are the same diarizer.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any
 
 from patmir.pipeline.stage import OverlapInterval, SpeakerTurn
+
+
+def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
 
 
 def passes_vad(
@@ -101,3 +108,113 @@ def derive_overlaps(turns: list[SpeakerTurn]) -> list[OverlapInterval]:
                 overlaps.append(OverlapInterval(start=ov_start, end=time))
             ov_start = None
     return overlaps
+
+
+def merge_duplicate_speakers(
+    turns: list[SpeakerTurn],
+    gap: float,
+    *,
+    min_containment: float = 0.4,
+    min_shared_seconds: float = 1.0,
+) -> tuple[list[SpeakerTurn], dict[str, str]]:
+    """Fold together speaker slots that are really one person.
+
+    Sortformer sometimes emits ONE speaker on TWO of its output slots, so the
+    same actor comes back as two ids whose turns are near-simultaneous. That is
+    not a harmless labelling quirk — it costs three things downstream:
+
+      * the actor's lines split across two `(speaker, emotion)` ref cells, so
+        the character's cloned voice changes mid-scene;
+      * `derive_overlaps` reports the twin pair as overlapping speech, and
+        `pick_refs` rejects any turn touching an overlap — so a heavily
+        duplicated speaker can end up with NO eligible ref window and fall
+        through to another character's clip;
+      * `apply_speaker_tags` sees a speaker change a few hundred ms into a
+        sentence and cannot split it cleanly.
+
+    Measured on `runs/20260824-163841-sample_1` (Reacher S02E01, 5 min):
+    SPEAKER_03 was 71% concurrent with SPEAKER_02 and 7 of its turn pairs
+    coincided at 90-100% of the shorter turn (5 at total containment), while the
+    two genuinely-distinct speakers on that clip sat at 8-10% ragged, partial
+    overlap. One 7.16 s "turn" carried a four-way question-and-answer exchange.
+
+    The test is aggregate containment: `shared / min(total_a, total_b)`. Real
+    simultaneous speech cannot come near the threshold there — a person would
+    have to spend most of their speaking time talking over exactly one other
+    person and never hold a solo turn.
+
+    **The threshold is 0.4 because the model is not deterministic.** Four runs of
+    the identical file put the duplicated pair at 0.705, 0.594 and twice above
+    0.6, while the highest a genuinely-distinct pair reached across those same
+    runs was 0.259. A first cut at 0.6 was calibrated on one run and silently
+    stopped firing on the next — the 0.594 run came back with four speakers and
+    one of them again borrowing another character's reference clip. 0.4 sits in
+    the middle of the observed gap rather than at the edge of one side of it.
+    Both bounds are pinned by test.
+
+    `min_shared_seconds` keeps a pair of very short turns from tripping the ratio
+    on noise.
+
+    Returns `(turns, aliases)` where `aliases` maps each absorbed id to the id
+    that survived (the group member with the most speech, ties by lowest id).
+    Relabelled turns are re-merged with `gap`, since two slots of one speaker
+    become self-overlapping turns that every downstream consumer — including
+    `derive_overlaps` — assumes cannot happen.
+
+    `min_containment > 1.0` disables the pass.
+    """
+    if min_containment > 1.0:
+        return list(turns), {}
+
+    by_spk: dict[str, list[SpeakerTurn]] = defaultdict(list)
+    for t in turns:
+        by_spk[t.speaker_id].append(t)
+    if len(by_spk) < 2:
+        return list(turns), {}
+
+    total = {spk: sum(t.end - t.start for t in ts) for spk, ts in by_spk.items()}
+    ids = sorted(by_spk)
+
+    parent = {spk: spk for spk in ids}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            floor = min(total[a], total[b])
+            if floor <= 0:
+                continue
+            shared = sum(
+                _overlap(x.start, x.end, y.start, y.end)
+                for x in by_spk[a] for y in by_spk[b]
+            )
+            if shared >= min_shared_seconds and shared / floor >= min_containment:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+
+    groups: dict[str, list[str]] = defaultdict(list)
+    for spk in ids:
+        groups[find(spk)].append(spk)
+
+    aliases: dict[str, str] = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        canonical = min(members, key=lambda s: (-total[s], s))
+        for m in members:
+            if m != canonical:
+                aliases[m] = canonical
+    if not aliases:
+        return list(turns), {}
+
+    relabeled = [
+        SpeakerTurn(start=t.start, end=t.end,
+                    speaker_id=aliases.get(t.speaker_id, t.speaker_id))
+        for t in turns
+    ]
+    return merge_same_speaker(relabeled, gap), aliases
