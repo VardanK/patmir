@@ -432,3 +432,75 @@ class RuntimeParityTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class EmotionTagPolicyTest(unittest.TestCase):
+    """Pins the 2026-08-24 ear-test outcome (quality issue #15) so a future
+    "let's map every bin to a tag" tidy-up cannot silently undo it.
+
+    Verdict on `runs/emotion-ab/`: across three angry lines the author never
+    preferred `<|emotion:anger|>` — no-tag won two and the mildest tagged
+    variant the third — and on the happy line nothing read as happy
+    (`elation` did not register, `contentment` added a flirtatious tone).
+    Those two bins were ~43% of the clip's sentences.
+    """
+
+    def test_angry_and_happy_are_untagged(self):
+        from patmir.eval.candidates.tts import higgs_v3_mlx, higgs_v3_torch
+
+        for mod in (higgs_v3_mlx, higgs_v3_torch):
+            with self.subTest(module=mod.__name__):
+                self.assertIsNone(mod.EMOTION_TAGS["angry"])
+                self.assertIsNone(mod.EMOTION_TAGS["happy"])
+
+    def test_sad_and_fearful_use_the_ear_tested_alternates(self):
+        """Round 2 (`runs/emotion-ab2/`) moved both bins off their original
+        tags: `sadness` -> `helplessness` (won all three sad lines) and
+        `fear` -> `shame` (won the fearful line). The shipped mapping was never
+        preferred on any line in either round."""
+        from patmir.eval.candidates.tts import higgs_v3_mlx, higgs_v3_torch
+
+        for mod in (higgs_v3_mlx, higgs_v3_torch):
+            with self.subTest(module=mod.__name__):
+                self.assertEqual(mod.EMOTION_TAGS["sad"], "helplessness")
+                self.assertEqual(mod.EMOTION_TAGS["fearful"], "shame")
+
+    def test_no_bin_uses_the_original_unlistened_guesses(self):
+        """`elation`/`sadness`/`anger`/`fear` were name-match guesses that lost
+        every ear-test they were entered in. A regression to any of them means
+        someone re-derived the table from the bin names again."""
+        from patmir.eval.candidates.tts import higgs_v3_torch
+
+        rejected = {"elation", "sadness", "anger", "fear"}
+        for bin_, tag in higgs_v3_torch.EMOTION_TAGS.items():
+            with self.subTest(bin=bin_):
+                self.assertNotIn(tag, rejected)
+
+    def test_every_bin_is_still_present(self):
+        """A dropped tag must be an explicit None, not a missing key — the
+        candidates do `EMOTION_TAGS.get(emotion)`, so a missing bin and an
+        untagged bin behave identically and only one of them is intentional."""
+        from patmir.eval.candidates.tts import higgs_v3_torch
+
+        self.assertEqual(
+            set(higgs_v3_torch.EMOTION_TAGS),
+            {"happy", "sad", "angry", "fearful", "neutral"},
+        )
+
+    def test_tags_are_real_checkpoint_tokens(self):
+        """Every non-None tag must be one the checkpoint actually declares; a
+        typo would emit literal text into the prompt rather than a token."""
+        from patmir.eval.candidates.tts import higgs_v3_torch
+
+        # From the checkpoint's tokenizer_config extra_special_tokens
+        # (21 emotion tags; surveyed 2026-08-24).
+        known = {
+            "elation", "amusement", "enthusiasm", "determination", "pride",
+            "contentment", "affection", "relief", "contemplation", "confusion",
+            "surprise", "awe", "longing", "arousal", "anger", "fear", "disgust",
+            "bitterness", "sadness", "shame", "helplessness",
+        }
+        for bin_, tag in higgs_v3_torch.EMOTION_TAGS.items():
+            if tag is not None:
+                with self.subTest(bin=bin_):
+                    self.assertIn(tag, known)

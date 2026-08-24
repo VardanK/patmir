@@ -1,6 +1,9 @@
 # 2026-08-23 — CUDA port, slice 1: machine profiles + the torch candidate set
 
-Status: **accepted** (mechanism), **unverified** (the CUDA candidates have not been executed)
+Status: **accepted** (mechanism), **verified 2026-08-24** — all four CUDA candidates executed
+end to end. Measured results and the two defects the first runs exposed are in
+`2026-08-24-asr-sentence-segmentation-and-cuda-baseline.md`; this file's *own* claims are
+amended in "First end-to-end attempt" below.
 
 ## Context
 
@@ -250,7 +253,9 @@ guessed:
   was load-bearing on call one, not a hypothetical.
 
 `pyannote_3_1` stays registered as the fallback, because NeMo is the heaviest dependency in the stack
-(built from git, wants Cython first) and is the most likely thing to refuse to install.
+and was expected to be the most likely thing to refuse to install. (**Corrected 2026-08-24:** it was
+not. `nemo_toolkit 3.0.0` installed cleanly from **PyPI** — no git checkout, no Cython prerequisite,
+which this ADR and the candidate's docstring both wrongly required. The fallback was never needed.)
 
 ## Decision 4 — ASR yields to TTS in a hard dependency conflict
 
@@ -393,7 +398,36 @@ candidate asserts the tie at build time precisely so that noise cannot be mistak
 
 The underlying dlopen failure is untouched and remains an environment landmine: anything else in the
 stack that reaches for torchcodec will hit it. Most likely an FFmpeg major version torchcodec has no
-build for. Not chased, because nothing we run needs it now.
+build for. Not chased, because nothing we run needs it now. Confirmed and written up in
+`docs/setup/windows-wsl2-cuda.md`.
+
+### Completed later the same day
+
+With the ffmpeg ref-clip decode in place, `patmir dub` ran **all nine stages** on
+`samples/sample_1.mkv` (301.1 s): 81 sentences, 0 TTS overflows, `out.mkv` / `dub.wav` /
+`out.hy.srt` written, peak **11.07 GiB VRAM with 13.25 GiB still free**. So the profile's whole
+candidate set is executed and the "unverified" status above is retired.
+
+Three things the runs settled that this ADR had left open or got wrong:
+
+- **Diarization is at parity, not just installed.** `sortformer_nemo` produced 4 speakers, 128
+  turns and 33 derived overlap intervals; the defensive return-shape parser never raised. Quality
+  issue #13 is `addressed`, and `pyannote_3_1` was never needed.
+- **`max_batch = 8` behaved**, 11 batches over 81 sentences with 0 overflows — but it is still
+  unswept, and the headroom measurement above (13 GiB free at peak) says the guess was
+  conservative, as suspected.
+- **The ASR chunking claim in Decision 3 was wrong.** It said the VAD-snapped chunker "should give
+  finer sentences than the MLX path". It gave 23 sentences per 5 min against MLX's 25 — because
+  chunking was never the mechanism. Both Qwen3 candidates emitted one `Sentence` *per chunk* and
+  never grouped words into sentences at all, so "sentence" meant "up to 28 s of audio" however the
+  chunks were cut. That is a quality bug, not a tail-shape nicety, and it is the subject of the
+  follow-up ADR. Fixing it took the same clip to 81 sentences.
+
+One environment finding worth carrying forward, because it cost two failed runs and looked exactly
+like a model-size problem: **a concurrent Windows-side GPU consumer (Chrome playing video) makes
+PyTorch refuse allocations on this box** while reporting 14 GiB free and a nonsense
+`17179869184.00 GiB` of "non-PyTorch memory". Benchmarks need the Windows desktop quiet. Details and
+the run-by-run evidence are in `docs/setup/windows-wsl2-cuda.md`.
 
 ## Revisit
 

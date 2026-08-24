@@ -8,7 +8,7 @@ The runs root defaults to `runs/` next to `patmir.toml` and is set by `[storage]
 
 | File                  | Stage    | Purpose                                                                                  |
 | --------------------- | -------- | ---------------------------------------------------------------------------------------- |
-| `manifest.json`       | runner   | Per-stage status (`pending` / `running` / `done` / `failed`), timestamps, artifacts paths, error tracebacks. The first thing to read when something failed. |
+| `manifest.json`       | runner   | Per-stage status (`pending` / `running` / `done` / `failed`), timestamps, `build_s`, artifact paths, error tracebacks. The first thing to read when something failed. Note `stages` is a **dict keyed by stage name**, not a list. |
 | `progress.jsonl`      | runner   | One row per `ctx.progress(...)` call — `{stage, pct, msg, ts}`. The FastAPI UI tails this for live progress. |
 | `audio.wav`           | ingest   | 16 kHz mono PCM extracted from the source video.                                         |
 | `audio.meta.json`     | ingest   | Sample rate, duration, source video path (also in manifest).                             |
@@ -25,6 +25,7 @@ The runs root defaults to `runs/` next to `patmir.toml` and is set by `[storage]
 | `tts/voice_cloning_summary.json` | tts | Per-speaker voice-cloning decisions for IVC candidates (ElevenLabs): `cloned` / `fallback_default` / `no_ref_provided`, with the voice_id, ref audio path, and line count. Written only when the candidate exposes `summarize()`. Open this file first when investigating "wrong character" reports. |
 | `dub.wav`             | mux      | Single concatenated Armenian voice track (resampled to source's SR; per-sentence afade in/out applied). |
 | `dub.meta.json`       | mux      | Duration, sample rate, options used (stretch_cap, music_bed_gain, voice_gain_db).        |
+| `mux_placements.json` | mux      | Where each synthesized line was actually placed — the record to read when a line sounds early, late, rippled by `voice_no_overlap`, or compressed by `voice_max_compress`. |
 | `out.mkv`             | output   | Final MKV — Armenian default audio, original retained as secondary, Armenian SRT as default subtitle track. |
 | `out.hy.srt`          | output   | Standalone subtitle file (also muxed into `out.mkv`).                                    |
 
@@ -49,6 +50,7 @@ Copy, not move — everything above stays in the job dir, so `--resume-from` and
 runs/<job>/
 ├── diarize/
 │   ├── turns.json            # Speaker turns + overlap intervals
+│   ├── vocals_16k_mono.wav   # CUDA profile only: the mono 16 kHz stem sortformer_nemo requires
 │   ├── refs.json             # SpeakerRef per (speaker[, emotion]) — paths + source windows + ref_text
 │   └── refs/
 │       └── <speaker>/        # Phase 2.x: one subdir per speaker

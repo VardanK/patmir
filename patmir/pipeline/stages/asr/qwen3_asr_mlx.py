@@ -18,12 +18,14 @@ Install once: `uv pip install mlx-qwen3-asr`
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 from typing import Any
 
 from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import AudioTrack, Sentence, Transcript, Word
 from patmir.pipeline.stages.asr._sentence import (
     filter_words_by_vad,
+    group_into_sentences,
     word_in_target_script,
     write_transcript,
 )
@@ -68,11 +70,15 @@ class Qwen3ASRMLX:
         forced_aligner: str | None,
         aligner_dtype: str,
         max_new_tokens: int | None,
+        sentence_gap_s: float = 0.35,
+        max_sentence_s: float = 8.0,
     ) -> None:
         from mlx_qwen3_asr import ForcedAligner, load_model  # lazy
 
         self.dtype_name = dtype
         self.max_new_tokens = max_new_tokens
+        self.sentence_gap_s = sentence_gap_s
+        self.max_sentence_s = max_sentence_s
         self.model, _ = load_model(model_id, dtype=_mx_dtype(dtype))
         self.aligner = (
             ForcedAligner(forced_aligner, dtype=_mx_dtype(aligner_dtype))
@@ -145,25 +151,37 @@ class Qwen3ASRMLX:
             cstart = float(c.get("start", 0.0))
             cend = float(c.get("end", cstart))
             matching = [w for w in words if cstart <= w.start <= cend]
-            # Qwen3-ASR chunks often span tens of seconds of leading/trailing
-            # silence around the actual utterance. Narrow [start, end] to the
-            # aligned word range so the mux places TTS where the speaker
-            # actually talks, not at the chunk pre-roll.
-            if matching:
-                s_start = min(w.start for w in matching)
-                s_end = max(w.end for w in matching)
-            else:
-                s_start, s_end = cstart, cend
             for w in matching:
                 covered_word_ids.add(id(w))
-            sentences.append(Sentence(
-                idx=idx,
-                text=txt,
-                start=s_start,
-                end=s_end,
-                words=matching,
-            ))
-            idx += 1
+            if matching:
+                # A chunk is not a sentence. Qwen3-ASR chunks span tens of
+                # seconds, and emitting one Sentence per chunk (which this did
+                # until 2026-08-24) handed the whole span a single DOMINANT
+                # speaker in `apply_speaker_tags` — so a chunk covering several
+                # diarization turns was synthesized in ONE character's voice,
+                # and the TTS decoded the whole span as one unit. Group on
+                # punctuation / word gaps like the other candidates; the gap
+                # branch is what carries this one, since Qwen3-ASR emits no
+                # terminal punctuation. Narrowing to the aligned word range
+                # (what s_start/s_end did) falls out of grouping for free.
+                for sent in group_into_sentences(
+                    matching,
+                    max_gap_s=self.sentence_gap_s,
+                    max_sentence_s=self.max_sentence_s,
+                ):
+                    sentences.append(replace(sent, idx=idx))
+                    idx += 1
+            else:
+                # No aligned words in this chunk's window: keep the model's own
+                # text at chunk-level timings rather than dropping the line.
+                sentences.append(Sentence(
+                    idx=idx,
+                    text=txt,
+                    start=cstart,
+                    end=cend,
+                    words=[],
+                ))
+                idx += 1
 
         # Orphan-word recovery: any aligned word that wasn't covered by an
         # accepted chunk gets folded into a synthetic sentence, grouped by
@@ -216,4 +234,6 @@ def build(config: dict[str, Any]) -> Qwen3ASRMLX:
         forced_aligner=config.get("forced_aligner", "Qwen/Qwen3-ForcedAligner-0.6B"),
         aligner_dtype=config.get("aligner_dtype", "bfloat16"),
         max_new_tokens=config.get("max_new_tokens"),
+        sentence_gap_s=float(config.get("sentence_gap_s", 0.35)),
+        max_sentence_s=float(config.get("max_sentence_s", 8.0)),
     )

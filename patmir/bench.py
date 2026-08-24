@@ -7,10 +7,25 @@ streaming) mode and reports where the wall-clock goes:
     (`StageStatus.started_at/finished_at/build_s`)
   - RTF per stage and aggregate, against the source duration
     (RTF = wall_seconds / source_seconds; >1.0 = slower than realtime)
-  - per-sentence TTS + translate latency traces (the adapters emit
-    `tts/timings.jsonl` / `translate/timings.jsonl` when `ctx.extra["bench"]`
-    is set, which only `patmir bench` does) + Higgs overflow counts from
+  - TTS + translate latency traces (the adapters emit `tts/timings.jsonl` /
+    `translate/timings.jsonl` when `ctx.extra["bench"]` is set, which only
+    `patmir bench` does) + Higgs overflow counts from
     `tts/voice_cloning_summary.json`
+
+**`--repeat N` shares one warm model cache** (since 2026-08-24): repeat 0
+builds every stage model, repeats 1..N-1 reuse them and report
+`build_s == 0.0`. The warm repeats are the baseline — `performance.md` has
+always said so, but batch was passing no `stage_cache` at all, so on torch it
+was timing nine model loads three times over (~110 s of a 242 s run, 45 % of
+wall, where MLX's mmap loads cost 0-3 s and hid the problem). `--no-warm-cache`
+restores the old rebuild-every-repeat behaviour, which is also how to collect N
+independent cold samples or to stay inside memory on a smaller box.
+
+**TTS percentiles are per row, and a row is not always a sentence.** Under
+batched decode the adapter emits one row per *chunk* (`"kind": "chunk"`),
+because a per-sentence wall does not exist when the chunk's cost is shared.
+`tts["unit"]` says which, and the report labels it; `total_s`, `audio_s` and
+`tts_rtf` are correct either way.
 
 This is the canonical, reusable replacement for the throwaway
 `spike/d3_throughput/*` scripts. Output is a stdout table + an optional
@@ -25,15 +40,19 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from patmir.pipeline.config import PipelineConfig, load_pipeline_config
+from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.manifest import Manifest
-from patmir.pipeline.runner import run_job
+from patmir.pipeline.runner import _free_accelerator_cache, run_job
 from patmir.pipeline.stage import STAGE_ORDER
 
 # The two run_job halves the watch-along section path runs (see
 # streaming/section.py): analysis (ingest→asr) then dub (translate→mux).
 ANALYSIS_STAGES = ["ingest", "separate", "diarize", "emotion", "asr"]
 DUB_STAGES = ["translate", "tts", "mux", "output"]
+
+# A stage_cache hit sets build_s to exactly 0.0 (runner.py), so this only has to
+# absorb per-stage rounding in the report.
+WARM_BUILD_EPSILON_S = 0.05
 
 
 # --------------------------------------------------------------------------- #
@@ -66,6 +85,13 @@ class BenchResult:
     models: dict[str, str]
     sections: list[dict[str, Any]] | None = None
     notes: dict[str, Any] = field(default_factory=dict)
+    # Added 2026-08-24. Defaulted so the reports stored under
+    # agent-os/specs/2026-06-20-1656-pipeline-benchmark-perf/results/ still
+    # deserialize into this dataclass.
+    profile: str | None = None      # PATMIR_PROFILE that produced this run
+    warm_cache: bool = False        # a shared stage_cache was threaded through
+    warm: bool = False              # ...and this repeat paid no model builds
+    build_total_s: float | None = None  # sum of per-stage build_s
 
 
 # --------------------------------------------------------------------------- #
@@ -120,13 +146,72 @@ def _pctile(values: list[float], q: float) -> float:
     return s[k]
 
 
+def _build_total(stages: list[StageTiming]) -> float:
+    return sum((st.build_s or 0.0) for st in stages)
+
+
+def _gpu_peak_reset() -> None:
+    """Reset CUDA's peak counters so `_resource_peaks` describes one repeat."""
+    try:
+        import torch  # type: ignore[import-not-found]
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def _resource_peaks() -> dict[str, Any]:
+    """Best-effort memory telemetry. Never raises: a four-minute benchmark must
+    not die on an instrumentation call.
+
+    Why this is in the report at all: warm-model residency keeps every stage
+    model alive for the whole run, and on a 24 GB discrete GPU with 23 GB of
+    host RAM the margin is real (~14.5 GB resident, peaks ~18-21 GB). Whoever
+    raises `max_batch` needs to read the headroom rather than re-derive it.
+
+    `peak_rss_gb` is process-lifetime, so across `--repeat` it is monotonic and
+    describes the whole invocation, not the last repeat. It is here because
+    host swap — not VRAM — is what produced the 1.71 -> 3.02 RTF regression
+    documented in performance.md.
+    """
+    out: dict[str, Any] = {}
+    try:
+        import torch  # type: ignore[import-not-found]
+        if torch.cuda.is_available():
+            out["peak_vram_gb"] = round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
+            out["peak_vram_reserved_gb"] = round(torch.cuda.max_memory_reserved() / 1024 ** 3, 2)
+            free_b, _total_b = torch.cuda.mem_get_info()
+            out["vram_free_gb"] = round(free_b / 1024 ** 3, 2)
+    except Exception:
+        pass
+    try:
+        import resource
+        import sys
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is KiB on Linux, bytes on Darwin.
+        unit = 1024 ** 3 if sys.platform == "darwin" else 1024 ** 2
+        out["peak_rss_gb"] = round(maxrss / unit, 2)
+    except Exception:
+        pass
+    return out
+
+
 def _tts_stats(job_dir: Path) -> dict[str, Any] | None:
     rows = _read_jsonl(job_dir / "tts" / "timings.jsonl")
     out: dict[str, Any] = {}
     if rows:
         el = [r["elapsed_s"] for r in rows if r.get("elapsed_s") is not None]
         audio = sum(r.get("audio_s", 0.0) for r in rows)
+        # Under batched decode the adapter emits one row per CHUNK, not per
+        # sentence — a per-sentence wall does not exist once the chunk's cost is
+        # shared (see stages/tts/adapter.py). So `count` and the percentiles
+        # describe whatever a row is, and `unit` has to say which: the CUDA
+        # report read `count: 3` beside `sentences: 24` with `p90_s: 51.2`, and
+        # those chunk numbers are trivially misread as the per-sentence p90 the
+        # Apple-Silicon rows quote.
+        chunk_rows = [r for r in rows if r.get("kind") == "chunk"]
         out.update({
+            "unit": "chunk" if chunk_rows else "sentence",
             "count": len(el),
             "total_s": round(sum(el), 2),
             "mean_s": round(statistics.mean(el), 3) if el else 0.0,
@@ -134,8 +219,17 @@ def _tts_stats(job_dir: Path) -> dict[str, Any] | None:
             "p90_s": round(_pctile(el, 0.9), 3),
             "max_s": round(max(el), 3) if el else 0.0,
             "audio_s": round(audio, 2),
+            # Correct under batching by construction: total compute over total
+            # audio does not care how the rows were bucketed.
             "tts_rtf": round(sum(el) / audio, 3) if audio else None,
         })
+        if chunk_rows:
+            covered = sum(int(r.get("sentences") or 0) for r in chunk_rows)
+            out["chunks"] = len(chunk_rows)
+            # NOT named `sentences` — that key belongs to the per-job total from
+            # voice_cloning_summary.json, merged below, and must keep winning.
+            out["chunk_sentences"] = covered
+            out["sentences_per_chunk"] = round(covered / len(chunk_rows), 2)
     summ = job_dir / "tts" / "voice_cloning_summary.json"
     if summ.exists():
         try:
@@ -193,28 +287,78 @@ def _stage_timings(manifest: Manifest, source_s: float | None,
 # batch (D1)
 # --------------------------------------------------------------------------- #
 def bench_batch(clip: Path, cfg: PipelineConfig, *, runs_root: Path,
-                repeat: int = 1, label: str | None = None) -> list[BenchResult]:
+                repeat: int = 1, label: str | None = None,
+                warm_cache: bool = True) -> list[BenchResult]:
+    """Run `clip` through the batch pipeline `repeat` times.
+
+    With `warm_cache` (the default) all repeats share ONE `stage_cache`, so
+    repeat 0 builds every stage model and repeats 1..N-1 reuse them — the same
+    warm path `bench_watch_along`, the stream loop and the UI server all take.
+    The warm repeats are the baseline; repeat 0 is the cold datapoint.
+
+    Before 2026-08-24 no cache was passed at all, so every repeat rebuilt
+    everything. That was invisible on MLX (mmap loads, `build_s` 0-3 s) and
+    dominant on torch (~110 s of a 242 s run) — `--repeat 3` was timing nine
+    model loads three times rather than steady state.
+
+    `warm_cache=False` restores that behaviour. Two reasons to want it: N
+    independent cold samples, and memory — every stage model staying resident
+    is ~14.5 GB on the cuda profile, which is fine on 24 GB but not free.
+
+    `prewarm_stage_cache` is deliberately NOT used here. It would zero repeat
+    0's `build_s` too, destroying the cold number, and it swallows build
+    failures by contract — a benchmark has to fail loudly instead of quietly
+    reporting a run with a stage missing.
+    """
     results: list[BenchResult] = []
-    for r in range(repeat):
-        manifest = run_job(clip, cfg, runs_root=runs_root, extra={"bench": True})
-        job_dir = runs_root / manifest.job_id
-        source_s = _source_seconds(job_dir)
-        stages, total = _stage_timings(manifest, source_s)
-        results.append(BenchResult(
-            clip=str(clip),
-            mode="batch",
-            label=label,
-            repeat_index=r,
-            job_id=manifest.job_id,
-            source_s=round(source_s, 2) if source_s else None,
-            total_wall_s=round(total, 2),
-            agg_rtf=round(total / source_s, 3) if source_s else None,
-            stages=stages,
-            sentence_count=_sentence_count(job_dir),
-            tts=_tts_stats(job_dir),
-            translate=_translate_stats(job_dir),
-            models=_models(cfg),
-        ))
+    # One dict for every repeat, or None to rebuild each time.
+    stage_cache: dict[str, Any] | None = {} if warm_cache else None
+    profile = cfg.profile
+    try:
+        for r in range(repeat):
+            _gpu_peak_reset()
+            manifest = run_job(
+                clip, cfg,
+                runs_root=runs_root,
+                extra={"bench": True},
+                stage_cache=stage_cache,
+            )
+            job_dir = runs_root / manifest.job_id
+            source_s = _source_seconds(job_dir)
+            stages, total = _stage_timings(manifest, source_s)
+            build_total = _build_total(stages)
+            notes: dict[str, Any] = {
+                "build_pct_of_wall": round(100 * build_total / total, 1) if total else None,
+            }
+            notes.update(_resource_peaks())
+            results.append(BenchResult(
+                clip=str(clip),
+                mode="batch",
+                label=label,
+                repeat_index=r,
+                job_id=manifest.job_id,
+                source_s=round(source_s, 2) if source_s else None,
+                total_wall_s=round(total, 2),
+                agg_rtf=round(total / source_s, 3) if source_s else None,
+                stages=stages,
+                sentence_count=_sentence_count(job_dir),
+                tts=_tts_stats(job_dir),
+                translate=_translate_stats(job_dir),
+                models=_models(cfg),
+                notes=notes,
+                profile=profile,
+                warm_cache=warm_cache,
+                # Measured, not declared: the JSON should say what actually
+                # happened, not what was requested.
+                warm=bool(warm_cache and build_total <= WARM_BUILD_EPSILON_S),
+                build_total_s=round(build_total, 2),
+            ))
+    finally:
+        # Don't leave ~15 GB of models pinned while the report is written, or
+        # while a second mode runs in the same process.
+        if stage_cache is not None:
+            stage_cache.clear()
+            _free_accelerator_cache()
     return results
 
 
@@ -246,7 +390,19 @@ def _section_record(index: int, sec, wall_s: float, runs_root: Path) -> dict[str
 
 def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                       repeat: int = 1, max_sections: int | None = None,
-                      label: str | None = None) -> list[BenchResult]:
+                      label: str | None = None,
+                      warm_cache: bool = True) -> list[BenchResult]:
+    """Run `clip` through the watch-along section loop `repeat` times.
+
+    Unlike `bench_batch`, the cache is created INSIDE the repeat loop and stays
+    there. Watch-along's warmness is per-section — section 0 builds, later
+    sections reuse — so each repeat has to pay its own section-0 builds to stay
+    comparable with the stored baselines (agg RTF 1.71 / 1.611 / 1.47). Hoisting
+    it would make repeats 1+ skip work a real stream cannot skip.
+
+    `warm_cache=False` reproduces the pre-2026-07-14 rebuild-every-section path,
+    which is how the historical 1.94-2.31 rows were measured.
+    """
     from patmir.pipeline.streaming.prelude import run_prelude
     from patmir.pipeline.streaming.runner import streaming_config, source_duration
     from patmir.pipeline.streaming.section import (
@@ -263,7 +419,8 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
         sections: list[dict[str, Any]] = []
         # Same warm-model cache the production stream loop uses (ui/stream.py)
         # — bench must measure the warm path, not the legacy rebuild path.
-        stage_cache: dict[str, Any] = {}
+        stage_cache: dict[str, Any] | None = {} if warm_cache else None
+        _gpu_peak_reset()
         t0 = time.perf_counter()
         prelude = run_prelude(
             clip, cfg,
@@ -339,7 +496,25 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                 "n_sections": len(sections),
                 "total_build_s": round(total_build, 2),
                 "build_pct_of_wall": round(100 * total_build / total_wall, 1) if total_wall else None,
+                # `agg_rtf` above divides by DUBBED AUDIO, not source seconds —
+                # unlike batch and unlike the convention performance.md states.
+                # Keeping it that way is deliberate: every historical
+                # watch-along number (1.71, 1.611, 1.47, 1.94-2.31) was computed
+                # this way, and silently reflooring the field would leave a
+                # reader unable to tell which convention a given row used. So
+                # name the denominator and publish the source-second figure
+                # beside it. They are within 0.03% today (dubbed 301.0 vs source
+                # 301.1); they were 4.9% apart before the pad-dubbing fix.
+                "rtf_denominator": "dubbed_audio_s",
+                "agg_rtf_source": round(total_wall / duration, 3) if duration else None,
+                **_resource_peaks(),
             },
+            profile=cfg.profile,
+            warm_cache=warm_cache,
+            # Never "warm" as a whole: section 0 builds by construction. Warmness
+            # here is per-section and lives in notes.build_pct_of_wall.
+            warm=False,
+            build_total_s=round(total_build, 2),
         ))
     return results
 
@@ -355,17 +530,75 @@ def _fmt(v: Any, suffix: str = "") -> str:
     return f"{v}{suffix}" if v is not None else "-"
 
 
+def _cache_tag(res: BenchResult) -> str:
+    """Say, in the header, whether this repeat paid for model builds. Cold and
+    warm numbers are not interchangeable and must never read as one series."""
+    if not res.warm_cache:
+        return " (no warm cache)"
+    if res.mode != "batch":
+        return ""
+    return " (warm)" if res.warm else " (cold: builds models)"
+
+
+def _summary_line(results: list[BenchResult]) -> list[str]:
+    """Cold and warm summarized separately — averaging them is the mistake this
+    whole change exists to prevent."""
+    batch = [r for r in results if r.mode == "batch"]
+    if len(batch) < 2:
+        return []
+    cold = [r for r in batch if not r.warm]
+    warm = [r for r in batch if r.warm]
+    parts: list[str] = []
+    for name, group in (("cold", cold), ("warm", warm)):
+        if not group:
+            continue
+        walls = [r.total_wall_s for r in group]
+        rtfs = [r.agg_rtf for r in group if r.agg_rtf is not None]
+        builds = [r.build_total_s or 0.0 for r in group]
+        which = f"repeat {group[0].repeat_index}" if len(group) == 1 else f"mean of {len(group)}"
+        parts.append(
+            f"{name} {which}: wall {statistics.mean(walls):.2f}s "
+            f"RTF {statistics.mean(rtfs):.3f} (build {statistics.mean(builds):.2f}s)"
+            if rtfs else
+            f"{name} {which}: wall {statistics.mean(walls):.2f}s (build {statistics.mean(builds):.2f}s)"
+        )
+    out = [""] + [f"--- {' | '.join(parts)}"] if parts else []
+    peaks = batch[-1].notes
+    mem = []
+    if peaks.get("peak_vram_gb") is not None:
+        mem.append(f"peak VRAM {peaks['peak_vram_gb']} GB alloc / "
+                   f"{peaks.get('peak_vram_reserved_gb')} GB reserved "
+                   f"(free {peaks.get('vram_free_gb')} GB)")
+    if peaks.get("peak_rss_gb") is not None:
+        mem.append(f"peak RSS {peaks['peak_rss_gb']} GB (process lifetime)")
+    if mem:
+        out.append(f"--- {' · '.join(mem)}")
+    return out
+
+
 def format_report(results: list[BenchResult]) -> str:
     lines: list[str] = []
     for res in results:
-        rep = f" repeat={res.repeat_index}" if any(r.repeat_index for r in results) else ""
+        # `any(r.repeat_index ...)` hid repeat=0, which is exactly the repeat a
+        # reader most needs labelled now that it is the cold one.
+        rep = f" repeat={res.repeat_index}" if len(results) > 1 else ""
         lines.append("")
-        lines.append(f"=== {res.mode} | {Path(res.clip).name}{rep} "
+        lines.append(f"=== {res.mode} | {Path(res.clip).name}{rep}{_cache_tag(res)} "
                      f"| {res.job_id} ===")
+        rtf_extra = ""
+        if res.mode == "watch-along" and res.notes.get("agg_rtf_source") is not None:
+            rtf_extra = (f" [per {res.notes.get('rtf_denominator', 'dubbed_audio_s')} "
+                         f"{res.notes.get('dubbed_audio_s')}s; "
+                         f"per source {res.notes['agg_rtf_source']}]")
         lines.append(f"source {_fmt(res.source_s, 's')}  "
                      f"wall {_fmt(res.total_wall_s, 's')}  "
                      f"agg RTF {_fmt(res.agg_rtf)}  "
-                     f"({'slower' if (res.agg_rtf or 0) > 1 else 'faster'} than realtime)")
+                     f"({'slower' if (res.agg_rtf or 0) > 1 else 'faster'} than realtime)"
+                     f"{rtf_extra}")
+        if res.mode == "batch" and res.build_total_s is not None:
+            lines.append(f"build {res.build_total_s}s "
+                         f"({_fmt(res.notes.get('build_pct_of_wall'), '%')} of wall)"
+                         + (f"  profile {res.profile}" if res.profile else ""))
         if res.sentence_count is not None:
             lines.append(f"sentences: {res.sentence_count}")
         lines.append("")
@@ -376,10 +609,23 @@ def format_report(results: list[BenchResult]) -> str:
                          f"{_fmt(s.rtf):>7} {_fmt(s.pct):>6}")
         if res.tts:
             t = res.tts
+            unit = t.get("unit", "sentence")
             lines.append("")
-            lines.append(f"  tts: {t.get('count', '?')} sent, mean {_fmt(t.get('mean_s'), 's')}, "
-                         f"p90 {_fmt(t.get('p90_s'), 's')}, max {_fmt(t.get('max_s'), 's')}, "
-                         f"tts_rtf {_fmt(t.get('tts_rtf'))}, overflows {t.get('overflows', '?')}")
+            if unit == "chunk":
+                # Spell out the batching so a chunk p90 is never read as the
+                # per-sentence p90 the Apple-Silicon rows quote.
+                head = (f"  tts: {t.get('chunks', '?')} chunks over "
+                        f"{t.get('sentences', t.get('chunk_sentences', '?'))} sentences "
+                        f"(~{t.get('sentences_per_chunk', '?')} sent/chunk)")
+                per = "/chunk"
+            else:
+                head = f"  tts: {t.get('count', '?')} sentences"
+                per = ""
+            lines.append(f"{head}, mean {_fmt(t.get('mean_s'), 's')}{per}, "
+                         f"p90 {_fmt(t.get('p90_s'), 's')}{per}, "
+                         f"max {_fmt(t.get('max_s'), 's')}{per}, "
+                         f"tts_rtf {_fmt(t.get('tts_rtf'))}, "
+                         f"overflows {t.get('overflows', '?')}")
         if res.translate:
             tr = res.translate
             lines.append(f"  translate: {tr['count']} sent, mean {_fmt(tr['mean_ms'], 'ms')}, "
@@ -397,4 +643,5 @@ def format_report(results: list[BenchResult]) -> str:
                 lines.append(f"  {s['index']:>3} {s['start']:>7} {s['section_s']:>6} "
                              f"{s['wall_s']:>7} {s['analysis_wall_s']:>7} {s['dub_wall_s']:>7} "
                              f"{s['build_s']:>7} {_fmt(s['rtf']):>6}")
+    lines.extend(_summary_line(results))
     return "\n".join(lines)

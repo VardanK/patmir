@@ -43,8 +43,11 @@ Two things this handles that the MLX path does not have to:
     valid 3-element segment.
 
 Install (Linux + CUDA):
-    uv pip install Cython
-    uv pip install "git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]"
+    uv pip install -e ".[cuda]"      # nemo_toolkit[asr]>=2.0 from PyPI
+
+Verified 2026-08-24: `nemo_toolkit 3.0.0` installs cleanly from **PyPI**, no git
+checkout and no Cython prerequisite. This docstring previously said to build from
+git with Cython first; that was written before the dep was declared and is wrong.
 """
 from __future__ import annotations
 

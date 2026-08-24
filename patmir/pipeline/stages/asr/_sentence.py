@@ -2,7 +2,9 @@
 
 Word-level timestamps come out of every ASR backend at different fidelity;
 this groups them into sentences for downstream stages. Splits on terminal
-punctuation OR a gap > `max_gap_s` between consecutive words.
+punctuation OR a gap > `max_gap_s` between consecutive words, and optionally
+caps sentence duration via `max_sentence_s` (splitting at the widest interior
+gap) for backends that emit no punctuation.
 
 `filter_words_by_vad` drops words whose times don't overlap any speech
 interval from Silero VAD — the post-filter alternative to hard-masking the
@@ -205,31 +207,76 @@ def filter_words_by_vad(
     return kept
 
 
-def group_into_sentences(words: list[Word], max_gap_s: float = 0.6) -> list[Sentence]:
-    sentences: list[Sentence] = []
-    bucket: list[Word] = []
-    idx = 0
+def _split_longest_gap(run: list[Word], max_sentence_s: float) -> list[list[Word]]:
+    """Recursively halve `run` at its widest interior word gap until every piece
+    is at most `max_sentence_s` long (or cannot be split further).
 
-    def flush() -> None:
-        nonlocal idx, bucket
-        if not bucket:
-            return
-        text = " ".join(w.text for w in bucket).strip()
-        sentences.append(Sentence(
-            idx=idx,
-            text=text,
-            start=bucket[0].start,
-            end=bucket[-1].end,
-            words=list(bucket),
-        ))
-        idx += 1
-        bucket = []
+    Needed because `max_gap_s` alone has a floor: some stretches of dialogue
+    genuinely contain no pause above the threshold. Measured case — a 22.9 s
+    run of 56 words whose widest interior gap was 0.32 s, spanning 11
+    diarization turns. It was assigned to one speaker (86% dominance, just over
+    the 0.85 threshold) and so synthesized in one voice, swallowing another
+    character's 1.5 s line, and handed the TTS a 22.9 s decode chunk.
+
+    Splitting at the widest gap rather than the midpoint keeps the cut on the
+    most plausible utterance boundary available.
+    """
+    if len(run) < 2 or (run[-1].end - run[0].start) <= max_sentence_s:
+        return [run]
+    # Widest gap between consecutive words; ties take the earliest.
+    best_i, best_gap = None, -1.0
+    for i in range(len(run) - 1):
+        gap = run[i + 1].start - run[i].end
+        if gap > best_gap:
+            best_i, best_gap = i, gap
+    if best_i is None:
+        return [run]
+    left, right = run[: best_i + 1], run[best_i + 1 :]
+    if not left or not right:
+        return [run]
+    return _split_longest_gap(left, max_sentence_s) + _split_longest_gap(right, max_sentence_s)
+
+
+def group_into_sentences(
+    words: list[Word],
+    max_gap_s: float = 0.6,
+    max_sentence_s: float | None = None,
+) -> list[Sentence]:
+    """Group `words` into sentences on terminal punctuation or a gap over
+    `max_gap_s`.
+
+    `max_sentence_s`, when set, additionally caps how long any one sentence may
+    be — see `_split_longest_gap`. It defaults to None so the backends that were
+    already producing short sentences (whisper, faster-whisper, scribe,
+    openrouter) keep their exact previous behaviour; the Qwen3 candidates pass a
+    value because their ASR emits no terminal punctuation at all, leaving
+    `max_gap_s` as the only other signal.
+    """
+    runs: list[list[Word]] = []
+    bucket: list[Word] = []
 
     for i, w in enumerate(words):
         bucket.append(w)
         ends_sentence = w.text.endswith((".", "!", "?", "。", "！", "？"))
         gap_next = words[i + 1].start - w.end if i + 1 < len(words) else 0.0
         if ends_sentence or gap_next > max_gap_s:
-            flush()
-    flush()
+            runs.append(bucket)
+            bucket = []
+    if bucket:
+        runs.append(bucket)
+
+    if max_sentence_s is not None and max_sentence_s > 0:
+        runs = [piece for run in runs for piece in _split_longest_gap(run, max_sentence_s)]
+
+    sentences: list[Sentence] = []
+    for run in runs:
+        if not run:
+            continue
+        sentences.append(Sentence(
+            idx=len(sentences),
+            text=" ".join(w.text for w in run).strip(),
+            start=run[0].start,
+            end=run[-1].end,
+            words=list(run),
+        ))
     return sentences

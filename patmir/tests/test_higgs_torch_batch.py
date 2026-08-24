@@ -30,6 +30,7 @@ import unittest
 import wave
 from pathlib import Path
 
+from patmir.eval.candidates.tts import higgs_v3_torch
 from patmir.eval.candidates.tts.higgs_v3_torch import (
     SR,
     HiggsV3Torch,
@@ -279,22 +280,49 @@ class OrchestrationTest(unittest.TestCase):
         self.assertEqual(self._run(_bare(), [], decode), [])
 
     def test_emotion_tag_is_prefixed_onto_the_prompt(self):
+        """Tests the prefixing MECHANISM, deliberately via a bin that still
+        carries a tag. Which bins are tagged is policy set by ear-test and is
+        pinned in `test_config_profiles.EmotionTagPolicyTest` — this test used
+        to hardcode `angry -> anger` and broke when that bin was untagged on
+        2026-08-24, which is the wrong reason for this test to fail.
+        """
         seen: list[str] = []
 
         def decode(reqs):
             seen.extend(r.prompt_text for r in reqs)
             return [(None, False) for _ in reqs]
 
+        tagged_bin = next(
+            b for b, t in higgs_v3_torch.EMOTION_TAGS.items() if t is not None
+        )
+        tag = higgs_v3_torch.EMOTION_TAGS[tagged_bin]
+
         cand = _bare()
         cand._decode_chunk = decode  # type: ignore[method-assign]
         cand.synthesize_batch([
-            {"text": "hello", "emotion": "angry"},
+            {"text": "hello", "emotion": tagged_bin},
             {"text": "hello", "emotion": "neutral"},
             {"text": "hello"},
         ])
-        self.assertIn("<|emotion:anger|>hello", seen)
-        # neutral maps to no tag, same as an absent emotion.
-        self.assertEqual(sum(1 for s in seen if s == "hello"), 2)
+        self.assertIn(f"<|emotion:{tag}|>hello", seen)
+
+    def test_untagged_bins_reach_the_prompt_unprefixed(self):
+        """An untagged bin must pass the text through verbatim — no empty tag,
+        no stray marker. `angry` and `happy` are untagged as of 2026-08-24."""
+        seen: list[str] = []
+
+        def decode(reqs):
+            seen.extend(r.prompt_text for r in reqs)
+            return [(None, False) for _ in reqs]
+
+        untagged = [b for b, t in higgs_v3_torch.EMOTION_TAGS.items() if t is None]
+        self.assertTrue(untagged, "expected at least one untagged bin")
+
+        cand = _bare()
+        cand._decode_chunk = decode  # type: ignore[method-assign]
+        cand.synthesize_batch([{"text": "hello", "emotion": b} for b in untagged])
+        self.assertEqual(seen, ["hello"] * len(untagged))
+        self.assertFalse(any("<|emotion:" in p for p in seen))
 
 
 @unittest.skipIf(

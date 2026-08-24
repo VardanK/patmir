@@ -45,10 +45,46 @@ _REQUIRED_SPECIALS = ("<|tts|>", "<|ref_audio|>", "<|text|>", "<|audio|>")
 # emits no tag. Tunable by ear — Higgs exposes 21 emotions; these are the
 # closest fit for cartoon/drama dialogue.
 EMOTION_TAGS = {
-    "happy": "elation",
-    "sad": "sadness",
-    "angry": "anger",
-    "fearful": "fear",
+    # Ear-test 2026-08-24 (`runs/emotion-ab/`, 5 policies x 5 real lines on the
+    # real pinned refs) — angry and happy are deliberately UNTAGGED.
+    #
+    # On three angry lines the author never once preferred `<|emotion:anger|>`:
+    # no-tag was the top pick on two and the mildest tagged variant
+    # (`bitterness` + `expressive_low`) on the third. On the happy line nothing
+    # read as happy at all — `elation` did not register, and `contentment` added
+    # an unwanted flirtatious tone. Since 35% of that clip's sentences were
+    # tagged angry and 9% happy, dropping these two covers ~43% of all lines
+    # and is most of the fix for quality issue #15.
+    #
+    # Emotion for these bins now comes from the cloned reference clip alone,
+    # which is the character actually being tense — the bound described in ADR
+    # 2026-05-26-emotion-routed-through-ref-clip-binning, reached from the other
+    # direction.
+    #
+    # `sad` and `fearful` were ear-tested separately (`runs/emotion-ab2/`,
+    # 5 policies x 4 lines) and BOTH moved off their original tags too:
+    #   sad     sadness -> helplessness   (won 2 of 3 lines outright; the third
+    #                                      preferred helplessness + expressive_low,
+    #                                      so helplessness won all three)
+    #   fearful fear    -> shame          (won the fearful line; fear + low second)
+    #
+    # Across both rounds the shipped mapping was never preferred on ANY line, in
+    # ANY bin — so this table is a full replacement of the original
+    # happy/sad/angry/fearful -> elation/sadness/anger/fear guesses, which were
+    # chosen as the obvious name matches and never listened to.
+    #
+    # `<|prosody:expressive_low|>` is NOT used. It measurably changes delivery
+    # (identical prompt +/- that token yields different audio, verified by md5),
+    # but it only won one line of nine, and on another the author judged it
+    # "too emotional" — i.e. it made the line MORE intense, the opposite of the
+    # name. Treat every tag name here as a label, not a description: nothing
+    # upstream documents what any of them do acoustically (model card lists
+    # names; there is no paper). 21 emotion tags exist in the checkpoint --
+    # see stages/tts/higgs-audio-v3.md before changing any of this.
+    "happy": None,
+    "sad": "helplessness",
+    "angry": None,
+    "fearful": "shame",
     "neutral": None,
 }
 

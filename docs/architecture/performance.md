@@ -1,26 +1,45 @@
 # Pipeline performance — baseline + roadmap
 
-Last updated: 2026-08-23 (Reacher re-baseline on the current active set)
+Last updated: 2026-08-24 (first RTX 3090 / CUDA baselines, both modes)
 
-> **Status: re-baselined.** The **Reacher** rows are the live numbers — measured
-> on the current active set (`qwen3_asr_1_7b_mlx_8bit` + `higgs_v3_mlx_q8`) on
-> 32 GB Apple Silicon (M1 Pro), models warm + `HF_HUB_OFFLINE=1`. The masha and
-> Fallout rows are **historical**: they were measured on
-> `whisper_large_v3_mlx_fp16`, so their ASR/TTS split no longer reflects reality.
+> **Status: two machines, and the Apple-Silicon rows need a caveat.** The
+> **sample_1 (Reacher)** rows are the Apple-Silicon numbers — current active set
+> (`qwen3_asr_1_7b_mlx_8bit` + `higgs_v3_mlx_q8`) on 32 GB M1 Pro, models warm +
+> `HF_HUB_OFFLINE=1`. The **masha and Fallout rows are historical twice over**:
+> measured on `whisper_large_v3_mlx_fp16`, and both clips have since been removed
+> from disk, so they cannot be re-measured at all (`eval-clips.md`).
+>
+> Two things were found on 2026-08-24 that affect how every pre-2026-08-24 row
+> reads. **Sentence counts before that date are artefacts:** both Qwen3 ASR
+> candidates emitted one `Sentence` per ASR chunk, so "25 sentences per 5 min"
+> meant 25 chunks; the fix took the same clip from 23 to 85 sentences with no
+> change in word count, which moves every per-sentence TTS percentile. And
+> **`patmir bench --mode batch` was not measuring the warm path** it claimed to —
+> it passed no `stage_cache`, so each `--repeat` rebuilt every model. Invisible on
+> MLX (`build_s` 0-3 s); 45 % of wall on torch.
+>
 > Stored reports:
-> `agent-os/specs/2026-06-20-1656-pipeline-benchmark-perf/results/reacher-{batch,watch}.json`.
+> `agent-os/specs/2026-06-20-1656-pipeline-benchmark-perf/results/reacher-{batch,watch}.json`
+> (Apple Silicon), `runs/bench/*.json` (CUDA, gitignored).
 
 ## How these numbers are produced
 
-`patmir bench <clip> --mode batch|watch-along [--repeat N] [--report bench.json]`
-(`patmir/bench.py`). Stage wall + model-build come from each run's
-`manifest.json` (`StageStatus.started_at/finished_at/build_s`); per-sentence TTS
-and translate latencies come from `tts/timings.jsonl` / `translate/timings.jsonl`
-(emitted only under `--bench`); Higgs overflow counts from
+`patmir bench <clip> --mode batch|watch-along [--repeat N] [--no-warm-cache]
+[--report bench.json]` (`patmir/bench.py`). Stage wall + model-build come from
+each run's `manifest.json` (`StageStatus.started_at/finished_at/build_s`); TTS
+and translate latencies come from `tts/timings.jsonl` /
+`translate/timings.jsonl`, emitted when the run sets `ctx.extra["bench"]` —
+which `patmir bench` does and `patmir dub` does not (there is no `--bench`
+flag; this doc claimed one until 2026-08-24). Higgs overflow counts come from
 `tts/voice_cloning_summary.json`.
 
 **RTF convention:** `wall_seconds / source_seconds`. **>1.0 = slower than
 realtime.** Per-stage `rtf` is that stage's share against the full source.
+One exception, deliberate: watch-along's `agg_rtf` divides by **dubbed audio
+seconds**, because every historical watch-along number was computed that way and
+reflooring the field would leave a reader unable to tell which convention a row
+used. Since 2026-08-24 the report also prints the source-second figure and names
+the denominator (`notes.rtf_denominator`, `notes.agg_rtf_source`).
 
 Hardware: 32 GB Apple Silicon, MLX/MPS. Active models per
 `current-models.md` / `patmir.toml [pipeline]`.
@@ -28,6 +47,52 @@ Hardware: 32 GB Apple Silicon, MLX/MPS. Active models per
 ---
 
 ## Batch (D1, quality mode)
+
+### sample_1.mkv (Reacher) on CUDA / RTX 3090 — 2026-08-24 (FIRST CUDA BASELINE)
+
+`source 301.11s · warm wall 138.86s · agg RTF 0.461 (warm, mean of 2) · 76-77 sentences`
+(cold first repeat: wall 288.43s · RTF 0.958 · 153.97s of model builds = 53.4% of wall)
+
+Hardware: RTX 3090 24 GB on WSL2, `PATMIR_PROFILE=cuda` (`htdemucs_vocals`,
+`sortformer_nemo`, `qwen3_asr_1_7b`, `higgs_v3_torch_bf16`). `HF_HOME` on a **9p**
+Windows mount (~360 MB/s warm, ~176 MB/s cold) — that is most of why cold builds cost
+154s; see `docs/setup/windows-wsl2-cuda.md`. Report:
+`runs/bench/sample_1-cuda-batch.json`.
+
+| stage     | warm wall (s) | rtf   | % of wall | M1 Pro warm (s) |
+| --------- | ------------: | ----: | --------: | --------------: |
+| ingest    |          0.40 | 0.001 |      0.3% |            0.30 |
+| separate  |          8.84 | 0.029 |      6.4% |           37.70 |
+| diarize   |          1.53 | 0.005 |      1.1% |            7.50 |
+| emotion   |          2.31 | 0.008 |      1.7% |            7.70 |
+| asr       |         20.53 | 0.068 |     14.8% |           38.01 |
+| translate |         18.82 | 0.062 |     13.6% |            6.80 |
+| **tts**   |     **76.78** | 0.255 | **55.3%** |          244.45 |
+| mux       |          4.59 | 0.015 |      3.3% |            3.80 |
+| output    |          5.07 | 0.017 |      3.7% |            5.90 |
+
+- **Warm RTF 0.461 vs the M1 Pro's 1.17 — 2.5x faster**, and within ~30% of the ~0.35
+  projection in `windows-wsl2-cuda.md`. The projection scaled decode by memory bandwidth
+  and held cloud translate fixed; translate is now 13.6% of a much smaller wall, which
+  is most of the gap. So the bottleneck model was roughly right, not wrong.
+- **`tts_rtf` is 0.309-0.347, down from 1.136 on MLX.** This is the important one: synth
+  is now *faster* than realtime per spoken second, so the hard floor that kept batch
+  above realtime on Apple Silicon is gone. **0 overflows across all three repeats.**
+- **TTS is still the largest stage (55%)** but no longer the whole story — at 76.8s it is
+  3.2x faster than MLX q8's 244.5s, from bf16 + batched decode (10 chunks over 77
+  sentences, ~7.7 sentences/chunk).
+- **Cold vs warm is 0.958 vs 0.461** — model builds alone are 53.4% of a cold run
+  (asr 67.4s, tts 59.0s, diarize 15.6s). Most of that is 9p read latency, not compute.
+  A one-shot `patmir dub` pays it; `--repeat` amortizes it.
+- **Translate is now #2 at 13.6%** purely because everything local got faster. It is
+  cloud round-trip latency (77 calls, mean ~1.2-1.5s, concurrent), and the only stage the
+  GPU cannot help.
+- **Sentence count 76-77**, after the 2026-08-24 segmentation fix. Pre-fix this clip read
+  23 "sentences" and TTS chunk p90 was 44-55s; it is now 11.6-15.7s.
+- Peak **16.42 GB VRAM** allocated (16.98 reserved), peak RSS 10.64 GB. Note this box
+  needed its Windows pagefile raised before the warm path fit at all — CUDA under WSL2
+  charges host *commit* ~1:1 per GB of VRAM. See the setup doc.
+
 
 > **Cold vs warm — read this first.** The first-ever batch run on a fresh
 > process pays a large **one-time TTS warmup** (~240s on masha): Higgs' first use
@@ -37,7 +102,7 @@ Hardware: 32 GB Apple Silicon, MLX/MPS. Active models per
 > *identical* per-sentence rate (`tts_rtf ~1.37`). **Warm steady-state is the
 > real baseline; batch already clears realtime.** Numbers below are warm.
 
-### Reacher-S02E01-5min.mkv — English, dialogue-dense live action (canonical clip, 2026-08-23)
+### sample_1.mkv (Reacher) — dialogue-dense live action (canonical clip, 2026-08-23)
 
 `source 301.1s · wall 352.2s · agg RTF 1.17 (warm) · 25 sentences`
 (cold first run: wall 390.7s · RTF 1.298)
@@ -45,6 +110,17 @@ Hardware: 32 GB Apple Silicon, MLX/MPS. Active models per
 First Reacher baseline. Measured on the current active set — `qwen3_asr_1_7b_mlx_8bit` +
 `higgs_v3_mlx_q8` — so it supersedes the masha/Fallout rows below, which were measured on
 `whisper_large_v3_mlx_fp16`.
+
+> **Two caveats added 2026-08-24, before comparing this row to the CUDA rows.**
+> (1) This section was headed "English"; the file now on disk (`samples/sample_1.mkv`,
+> same 301.1 s) has a single **Russian** audio track. Either the Mac had a different
+> copy or the label was wrong — resolve it before reading anything into a
+> stage-by-stage comparison, since ASR and TTS cost scale with what is spoken.
+> (2) The 25-sentence figure below is an artefact, not a property of the content:
+> the Qwen3 candidates emitted one `Sentence` per ASR chunk until 2026-08-24. On
+> the same clip, correcting that took 23 sentences to 85 without changing the word
+> count. The per-sentence TTS percentiles here therefore describe chunks-sized
+> units and are not comparable to post-fix numbers.
 
 | stage     | wall (s) | build (s) | rtf   | % of wall |
 | --------- | -------: | --------: | ----: | --------: |
@@ -76,7 +152,66 @@ First Reacher baseline. Measured on the current active set — `qwen3_asr_1_7b_m
 - **translate concurrency confirmed working:** 25 calls totalling 37.0s of serial latency
   complete in 6.8s of stage wall (5.4×). Roadmap #1 is delivering; translate is now 1.9%.
 
-### masha-2-5min.mkv — Russian, fast cartoon dialogue (canonical clip)
+### sample_1.mkv (Reacher) — RTX 3090 / WSL2, `cuda` profile (2026-08-24)
+
+`source 301.1s · wall 296.7s · agg RTF 0.985 (COLD, mean of 2) · 74-75 sentences`
+Reports: `runs/bench/sample_1-cuda-batch-cold.json`. Hardware: RTX 3090 24 GB,
+WSL2 on a 31.8 GB host, `HF_HOME` on a **9p** Windows mount.
+
+> **These are COLD numbers and that is not a choice.** Every repeat rebuilds every
+> stage model, so **44-46 % of the wall is model loading**. The warm path — which is
+> what the Apple-Silicon rows measure and what `performance.md` has always called the
+> baseline — could not be measured on this box: warm-caching all five stage models
+> (6.48 GB) and then building Higgs (~8.5 GB) needs ~15 GB, and the machine's CUDA
+> ceiling was ~16 GB of *Windows commit headroom*, not VRAM. See
+> `docs/setup/windows-wsl2-cuda.md`. Subtracting the build tax puts the warm figure
+> near **0.54 RTF**, but that is arithmetic, not a measurement.
+
+| stage     | wall (s) | build (s) | rtf   | % of wall |
+| --------- | -------: | --------: | ----: | --------: |
+| ingest    |     0.39 |      0.00 | 0.001 |      0.1% |
+| separate  |    10.92 |      1.87 | 0.036 |      3.7% |
+| diarize   |    11.43 |      9.68 | 0.038 |      3.9% |
+| emotion   |    11.11 |      8.89 | 0.037 |      3.7% |
+| **asr**   |    77.77 |     58.09 | 0.258 |  **26.2%**|
+| translate |    22.41 |      0.00 | 0.074 |      7.6% |
+| **tts**   |   152.98 |     54.32 | 0.508 |  **51.6%**|
+| mux       |     4.53 |      0.00 | 0.015 |      1.5% |
+| output    |     5.15 |      0.00 | 0.017 |      1.7% |
+
+- **Batch clears realtime on the 3090 even cold: 0.985 vs the M1 Pro's 1.17 warm.**
+  Like-for-like the gap is much larger than that, since the M1 figure excludes model
+  loading and this one does not.
+- **TTS is 51.6 % and ASR 26.2 %** — the same two bottlenecks as every other run in
+  this document, but note **`build_s` is over a third of each**: asr 58.1 s of 77.8 s,
+  tts 54.3 s of 153.0 s. Model *loading*, not compute. The 9p `HF_HOME` contributes
+  roughly half of that (~360 MB/s warm, ~176 MB/s cold, vs 3.4-4.0 GB/s on the ext4
+  vhdx); the rest is safetensors parsing and host→device copy.
+- **`tts_rtf` 0.386-0.426** — synth is ~2.5× faster than realtime *per spoken second*,
+  against **1.136 on the M1 Pro at q8**. This is the clearest hardware win: bf16 on a
+  3090 beats q8 on an M1 Pro by a wide margin, and TTS is no longer bandwidth-starved.
+- **Sentence count 74-75, and that is the post-fix number.** Before the segmentation
+  fix the same clip yielded 23. Per-sentence TTS percentiles here are **per chunk**
+  (10 chunks, ~7.4 sentences each, batched decode): mean 8.6-9.6 s, p90 15.2-15.9 s.
+  Not comparable to the Apple-Silicon per-sentence figures.
+- **translate 7.6 % and rising with sentence count** — 74 round-trips at ~1.35-1.64 s
+  each, 100-123 s of serial latency compressed into 17-28 s of wall. Concurrency is
+  working, but finer sentences mean more calls, so this share grows as segmentation
+  improves.
+- **1 overflow in repeat 0, 0 in repeat 1** (of 74/75). First overflows seen on the
+  torch candidate; `max_batch=8`, 10 batches.
+- Peak **10.03 GB VRAM** allocated, peak **10.67 GB host RSS**.
+
+**Not measured yet on this box:** watch-along, and the `max_batch` sweep. Both were
+blocked on the commit ceiling above.
+
+### masha-2-5min.mkv — Russian, fast cartoon dialogue (HISTORICAL — clip removed)
+
+> **Not reproducible.** `samples/masha-2-5min.mkv` was retired 2026-08-24 (not a
+> good translation candidate) and is no longer on disk. Measured on
+> `whisper_large_v3_mlx_fp16`, which is also no longer the active ASR. Kept for
+> the speech-density comparison only — masha is the ~23 %-speech end of the
+> range. See `eval-clips.md`.
 
 `source 300.0s · wall 267.0s · agg RTF 0.89 (warm) · 37 sentences`
 (cold first run: wall 521.8s · RTF 1.74 — TTS stage inflated by ~242s warmup)
@@ -114,7 +249,11 @@ Cross-language path works (English source → EA). RTF is dominated by **fixed
 model-load + tiny sentence count** — 2 sentences can't amortize ~25s of per-stage
 model builds. Confirms the fixed-cost floor; not a throughput data point.
 
-### Fallout-S02E01-5min.mkv — Russian, dialogue-dense live action
+### Fallout-S02E01-5min.mkv — Russian, dialogue-dense live action (HISTORICAL — clip removed)
+
+> **Not reproducible.** No longer on disk, and measured on
+> `whisper_large_v3_mlx_fp16`. Kept for the density comparison (~55 % speech).
+> See `eval-clips.md`.
 
 `source 300.0s · wall 408–499s · agg RTF 1.36–1.66 (warm) · 48–60 sentences`
 (two repeats found 48 vs 60 sentences — ASR segmentation variance; the 60-sentence
@@ -148,6 +287,56 @@ content, no for dense. TTS + ASR are the two levers; both scale with speech.
 
 ## Watch-along (D3, streaming mode)
 
+### sample_1.mkv (Reacher) on CUDA / RTX 3090 — 2026-08-24 (FIRST CUDA BASELINE)
+
+`source 301.11s · dubbed audio 300.97s · wall 427.37s · agg RTF 1.42 · 10 sections`
+(M1 Pro on the same clip: 1.611. Report: `runs/bench/sample_1-cuda-watch.json`.)
+
+| stage     | wall (s) | rtf   | % of wall |
+| --------- | -------: | ----: | --------: |
+| ingest    |     1.15 | 0.004 |      0.3% |
+| separate  |    39.15 | 0.130 |      9.9% |
+| diarize   |    14.00 | 0.047 |      3.6% |
+| emotion   |    14.65 | 0.049 |      3.7% |
+| **asr**   |   123.53 | 0.410 |  **31.4%**|
+| translate |    28.58 | 0.095 |      7.3% |
+| **tts**   |   168.74 | 0.561 |  **42.9%**|
+| mux       |     3.82 | 0.013 |      1.0% |
+
+**The aggregate badly understates this. Read the per-section rows.**
+
+| sec | span (s) | wall (s) | build (s) | rtf |
+| --: | -------: | -------: | --------: | --: |
+| 0 | 33.6 | 74.91 | **158.53** | 2.230 |
+| 1 | 35.8 | 17.63 | 0.0 | 0.492 |
+| 2 | 35.7 | 26.22 | 0.0 | 0.734 |
+| 3 | 35.1 | 15.29 | 0.0 | 0.436 |
+| 4 | 31.1 | 32.72 | 0.0 | 1.052 |
+| 5 | 36.5 | 20.72 | 0.0 | 0.568 |
+| 6 | 30.4 | 30.40 | 0.0 | 1.000 |
+| 7 | 21.8 | 34.46 | 0.0 | 1.581 |
+| 8 | 33.6 | 38.38 | 0.0 | 1.142 |
+| 9 | 7.4 | 6.33 | 0.0 | 0.859 |
+
+- **Steady state clears realtime: sections 1-9 are 222.15s of wall for 267.37s of audio =
+  RTF 0.831.** This is the first time watch-along has cleared realtime on any machine —
+  Apple Silicon measured 1.47-2.31 and always depended on the pre-buffer to survive.
+  The stream can now keep ahead of playback rather than racing it.
+- **The whole 158.53s build tax is in section 0**; sections 1-9 read `build 0.0`. The
+  warm `stage_cache` works in the streaming path, and unlike the Mac's flat 2-13% spread
+  the cost is entirely front-loaded. What the 1.42 aggregate measures is therefore mostly
+  *startup*: a 130.31s prelude plus section 0.
+- **Per-section variance is wide (0.436-1.581)** and tracks speech density in the span,
+  not section length — section 7 is the shortest span (21.8s) and the slowest (1.581),
+  because a dense span carries more sentences to synthesize.
+- **ASR is 31.4% here vs 14.8% in batch** — each section re-runs ASR on its own padded
+  slice, and the ForcedAligner is a second 0.6B forward per chunk. Dropping the aligner
+  in watch-along remains the obvious lever, worth ~5-6% of wall.
+- Both RTF denominators are now reported (`notes.rtf_denominator`,
+  `notes.agg_rtf_source`): 1.42 per dubbed audio, 1.419 per source. They agree here
+  because the pad double-analysis fix landed in 2026-07; they were 4.9% apart before it.
+
+
 Overrides vs batch (`streaming_config`): `separate=htdemucs_mlx_fast`,
 `tts=higgs_v3_mlx_q8_fast` (max_retries=1), `translate=openrouter_gemini_flash_batch`.
 Each section runs `run_job` **twice** (analysis ingest→asr, then dub
@@ -155,7 +344,7 @@ translate→mux) — **since 2026-07-14 with a shared warm-model `stage_cache`**
 (models built once per stream; see the re-measure below). The pre-2026-07-14
 baselines below rebuilt every stage model on both calls.
 
-### Reacher-S02E01-5min.mkv — 2026-08-23 (current active set)
+### sample_1.mkv (Reacher) — 2026-08-23 (current active set)
 
 `source 301.1s · dubbed audio 301.0s · wall 514.6s · agg RTF 1.71 · 10 sections`
 
@@ -190,7 +379,7 @@ baselines below rebuilt every stage model on both calls.
   padded slice. The ForcedAligner (a second 0.6B encode+forward per chunk) is the
   droppable part — worth ~5–6% of wall, not the ~29% it would have been under Whisper.
 
-### masha-2-5min.mkv — re-measure 2026-07-14 (warm-model loop + pad-dubbing + P0 fixes)
+### masha-2-5min.mkv — re-measure 2026-07-14 (HISTORICAL — clip removed)
 
 `source 300.0s · 12 sections · wall 471.9s · agg RTF 1.47` — **−0.5 to −0.8 vs
 the 1.94–2.31 baseline below**, and this was a *cold* run (first in process;
@@ -214,9 +403,7 @@ the baseline numbers were warm). ADR
 - Remaining gap to realtime ≈ 0.5 RTF, almost entirely ASR (0.40 RTF) + TTS
   (0.44 RTF) → the P2 levers (streaming ASR candidate; Higgs runtime work).
 
-### masha-2-5min.mkv — pre-2026-07-14 baseline (historical)
-
-### masha-2-5min.mkv
+### masha-2-5min.mkv — pre-2026-07-14 baseline (HISTORICAL — clip removed)
 
 `source 300.0s · 13 sections · dubbed audio 314.7s · wall 610.8s · agg RTF 1.94`
 (rep1 read 2.31, the difference is prelude variance: 22.6s vs 43.1s)
@@ -249,7 +436,7 @@ Aggregated stage wall across all 13 sections:
   analysis cost doesn't amortize when a VAD cut lands early. Section 0 (reuses
   prelude analysis) is fastest at 0.69.
 
-### Fallout-S02E01-5min.mkv — dialogue-dense
+### Fallout-S02E01-5min.mkv — dialogue-dense (HISTORICAL — clip removed)
 
 `source 300.0s · 11 sections · dubbed audio 300.0s · wall 618.1s · agg RTF 2.06`
 (repeat 1)
@@ -278,7 +465,9 @@ Full matrix (all warm except the noted cold first-run):
 
 | run | RTF | TTS | ASR | rebuild | note |
 | --- | --: | --: | --: | ------: | ---- |
-| **Reacher batch** (dense, ~70% speech, qwen3+higgs) | **1.17** | **69%** | **11%** | – | current active set |
+| **sample_1 batch, CUDA/3090** (warm) | **0.461** | **55%** | **15%** | 0% | first CUDA baseline 2026-08-24; cold 0.958 with builds 53% of wall |
+| **sample_1 watch-along, CUDA/3090** | **1.42** | 43% | 31% | 37% | **steady-state sections 1-9 = 0.831, clears realtime**; all build cost in section 0 |
+| **Reacher batch, M1 Pro** (dense, ~70% speech, qwen3+higgs) | **1.17** | **69%** | **11%** | – | Apple Silicon reference |
 | **Reacher watch-along** (qwen3+higgs) | **1.71** | 57% | 17% | 2.1% | current active set |
 | masha batch (sparse, 23% speech)   | **0.89** | 37% | 29% | – | clears realtime |
 | Fallout batch (dense, 55% speech)  | **1.36–1.66** | 42% | 29% | – | dense → >realtime |
@@ -348,7 +537,7 @@ Two notes for whoever revisits this:
   activity alone is not a red flag. It was the gate's extra footprint on top that tipped
   the machine into pathological swapping.
 
-**Realtime gaps to close (2026-08-23, Reacher):** batch **0.17 RTF**; watch-along **0.71 RTF**. No remaining MLX-side software lever closes either: section pipelining is 5–8% here (MLX serializes on one GPU stream), dropping the watch-along ForcedAligner is ~5–6%, and splitting ASR chunks flattens the TTS p90 tail without cutting total TTS time. The MLX optimization well is essentially dry — Neither gap closes on this machine while `tts_rtf > 1` — the Higgs q8 decode runs at ~154 GB/s effective, 77% of the M1 Pro's 200 GB/s peak, so it is bandwidth-saturated rather than inefficient.
+**Realtime gaps, 2026-08-24.** On the **RTX 3090 both modes are through it**: batch warm **0.461** (gap closed, 2.2x margin) and watch-along steady-state **0.831** (gap closed; the 1.42 aggregate is startup — a 130s prelude plus section 0's builds). `tts_rtf` fell from 1.136 on MLX to **0.309-0.347**, so synthesis is faster than realtime per spoken second and the floor that made this impossible on Apple Silicon is gone. What is left is not a throughput problem: **startup latency** (prelude + first-section builds, 37% of watch-along wall) and **cloud translate** (13.6% of batch wall, the one stage the GPU cannot touch). On the **M1 Pro** the 2026-08-23 gaps stand unchanged: batch 0.17, watch-along 0.71. No remaining MLX-side software lever closes either: section pipelining is 5–8% here (MLX serializes on one GPU stream), dropping the watch-along ForcedAligner is ~5–6%, and splitting ASR chunks flattens the TTS p90 tail without cutting total TTS time. The MLX optimization well is essentially dry — Neither gap closes on this machine while `tts_rtf > 1` — the Higgs q8 decode runs at ~154 GB/s effective, 77% of the M1 Pro's 200 GB/s peak, so it is bandwidth-saturated rather than inefficient.
 
 ---
 
@@ -389,7 +578,26 @@ OpenRouter candidate — byte-identical output, no ear-test needed)
 
 **2026-08-23 update:** the Reacher baseline shows ASR at **10.8% of batch wall (38.0s)**, down from Whisper's 29%. The standalone A/B predicted only ~3% in-pipeline; the real win was much larger. Cost: chunking is ~3.5× coarser (25 sentences per 5 min vs ~104), which pushes TTS per-sentence p90 to 21.4s and max to 30.4s. Splitting chunks at word gaps would flatten that tail — a watch-along buffer concern, not a total-throughput one.
 
-**2026-08-23, later:** that follow-up is implemented on the **CUDA profile only**, as a side effect of rewriting the torch Qwen3-ASR candidate against transformers' native `qwen3_asr` (the `qwen-asr` package's exact `transformers==4.57.6` pin is unusable alongside Higgs). The package hid long-form segmentation inside `transcribe()`; the transformers API is single-shot, so `qwen3_asr.build_chunks()` now cuts on the separate stage's Silero VAD silences capped at `chunk_seconds=28` and runs the chunks batched through both the ASR and the aligner. That should give finer sentences than the MLX path's coarse internal chunking and so a flatter TTS tail — **UNMEASURED**, and it does not touch the Mac. Measure sentence count per 5 min and TTS p90 on the first CUDA baseline; if the tail does flatten, the same chunking is the argument for wrapping the MLX runtime the same way.
+**2026-08-23, later:** VAD-snapped chunking implemented on the **CUDA profile only**, as a side effect of rewriting the torch Qwen3-ASR candidate against transformers' native `qwen3_asr` (the `qwen-asr` package's exact `transformers==4.57.6` pin is unusable alongside Higgs). `qwen3_asr.build_chunks()` cuts on the separate stage's Silero VAD silences capped at `chunk_seconds=28` and runs the chunks batched through both the ASR and the aligner. It was expected to give finer sentences and so a flatter TTS tail.
+
+**2026-08-24 — MEASURED, and the hypothesis was wrong in an instructive way.** VAD-snapped chunking gave **23 sentences per 5 min**, no better than the MLX path's 25. The reason is that chunking was never the mechanism: **both Qwen3 candidates emitted one `Sentence` per chunk** and never called `group_into_sentences`, which is what every other ASR candidate uses to split words on punctuation or word gaps. So "sentence" meant "up to 28 s of audio" no matter how the chunks were cut, and finer chunks would only ever have produced *slightly* finer 28-second buckets.
+
+This was **not a TTS-tail nicety. It was a quality bug**, and it is why this entry was mis-filed as a performance follow-up for a month:
+
+- 23 sentences against diarization's **108 turns** on the same clip. `apply_speaker_tags` assigns one *dominant* speaker per sentence, so a multi-turn span was synthesized in **one character's voice** — one measured 22.9 s "sentence" spanned 11 turns at 86 % dominance, just over the 0.85 threshold, swallowing another character's 1.5 s line.
+- Ref clips inherited it: `ref_text` for a speaker read like several people talking.
+- The 44–55 s TTS decode chunks were a symptom, not the disease.
+
+Fixed in both candidates by calling the shared grouper, plus a `max_sentence_s` cap that splits at the widest interior gap (needed because `max_gap_s` has a floor — that 22.9 s run's widest gap was 0.32 s). Measured on `samples/sample_1.mkv`, identical 398 words:
+
+| | before | after |
+| --- | --: | --: |
+| sentences | 23 | **85** |
+| span mean / median | 9.67 s / 8.56 s | **1.94 s / 1.20 s** |
+| spans > 8 s | 12 | **0** |
+| spans > 15 s | 7 | **0** |
+
+**Consequence for this document: every per-sentence TTS percentile measured before 2026-08-24 describes chunk-sized units**, on both machines, and is not comparable to anything measured after.
 
 #### Original entry
 **Update 2026-07-15:** author revised 2026-07-14 — "both Whisper and Qwen
@@ -462,7 +670,7 @@ decoding — research-grade).
   carefully or cache the boundary analysis instead of recomputing.
 - **Becomes:** folds into the warm-model-loop spec (#2) or a small standalone.
 
-### 6. TTS batched decode across sentences  ·  ✅ LANDED 2026-08-23 (CUDA only, UNMEASURED)
+### 6. TTS batched decode across sentences  ·  ✅ LANDED 2026-08-23, MEASURED 2026-08-24 (CUDA only)
 
 The successor to #4, and a much larger lever on paper. The prefill/decode split measured under #4
 is what makes the case: **decode is 73% of TTS time and is memory-bandwidth-bound**. At batch 1
@@ -500,17 +708,22 @@ close to free, so the ceiling here is roughly the batch size — where prefix-KV
 
 ## Reproducing
 
-**Default clip is Reacher (2026-07-14, author decision):** masha is a
-cartoonish edge case (fast squeaky voices, singing, SFX) — bench and ear-test
-on `samples/Reacher-S02E01-5min.mkv` (live-action RU dub, representative
-content) first; keep masha as the cartoon stress test.
+**Default clip is `samples/sample_1.mkv`** — the Reacher S02E01 5-minute clip
+(live-action RU dub, representative content), renamed from
+`Reacher-S02E01-5min.mkv`. It is the only 5-minute clip still on disk: masha was
+retired 2026-08-24 (not a good translation candidate) and Fallout is gone. See
+`eval-clips.md` for provenance and for why a measurement citing a removed clip
+cannot be reproduced.
 
 ```
-patmir bench samples/Reacher-S02E01-5min.mkv --mode batch       --repeat 2
-patmir bench samples/Reacher-S02E01-5min.mkv --mode watch-along --repeat 2
-patmir bench samples/masha-2-5min.mkv        --mode watch-along --repeat 1   # cartoon stress test
-patmir bench samples/Fallout-S02E01-5min.mkv --mode watch-along --repeat 1
+patmir bench samples/sample_1.mkv --mode batch       --repeat 3
+patmir bench samples/sample_1.mkv --mode watch-along --repeat 2
 ```
+
+`--repeat 3` in batch gives the cold number (repeat 0) and the warm baseline
+(repeats 1-2) from one command — all repeats share one model cache. Add
+`--no-warm-cache` for N independent cold samples, or if keeping every stage model
+resident (~14.5 GB on the cuda profile) is tight on the box.
 
 Run with `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` once models are cached — it
 removes transient HF-metadata failures and network variance from timings.
