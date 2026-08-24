@@ -239,3 +239,33 @@ never becomes its own sentence for translate and TTS.
 - Diarization gaining more than four identities, which would make most of the
   remaining voice confusion on this clip go away and change what these
   heuristics are compensating for.
+
+## Addendum 2026-08-24: watch-along caught the merge over-firing
+
+Running watch-along after this landed exposed a scale bug in
+`merge_duplicate_speakers`. The 0.4 containment threshold was calibrated on
+5-minute totals; watch-along diarizes ~35 s sections and a ~40 s prelude, where
+containments of **0.73-1.00 between genuinely distinct speakers are routine**
+because each speaker only holds a few seconds. Unguarded it collapsed 4 speakers
+to 2 in **every** section and the prelude to **1** — the mother and a male
+character on one identity, three lines with no speaker at all. The prelude
+establishes the cast for the entire stream, so that is the worst possible place.
+
+Fixed with a third guard, `min_speaker_seconds` (default 10.0): a pair is only
+considered when the *smaller* speaker holds that much speech, because below it a
+single overlapping utterance can reach 0.4 by chance. On the observed data the
+two regimes separate with margin — real merges start at 11.68 s, misfires top
+out at 9.36 s — and the pass is thereby confined to whole-clip diarization, where
+it was validated, without the candidate needing to know which execution mode it
+is running under. The failure direction is deliberate: a duplicated bit-part with
+under 10 s of speech is now missed, which costs one character a shared voice,
+where a false merge costs two characters their separate voices.
+
+The lesson generalises beyond this knob: **a ratio calibrated on whole-clip
+totals cannot be assumed valid per section.** Watch-along runs the same stage
+code over ~35 s windows, so any diarize threshold tuned on batch needs checking
+there before it ships. That check is now part of what running watch-along is for.
+
+Cost of the whole speaker-identity change on watch-along throughput: steady-state
+RTF 0.831 → 0.877 (+5.5 %), from more sentences per section. Still under
+realtime. Numbers in `performance.md`.

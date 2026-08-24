@@ -116,6 +116,7 @@ def merge_duplicate_speakers(
     *,
     min_containment: float = 0.4,
     min_shared_seconds: float = 1.0,
+    min_speaker_seconds: float = 10.0,
 ) -> tuple[list[SpeakerTurn], dict[str, str]]:
     """Fold together speaker slots that are really one person.
 
@@ -155,6 +156,28 @@ def merge_duplicate_speakers(
     `min_shared_seconds` keeps a pair of very short turns from tripping the ratio
     on noise.
 
+    **`min_speaker_seconds` is what keeps the ratio honest**, and watch-along is
+    why it exists. Containment is a *ratio*, so how much it is worth depends on
+    how much audio is behind it: a speaker with a few seconds of speech can reach
+    0.4 because one utterance happened to be talked over. On whole-clip
+    diarization the smaller member of a duplicated pair had 11.7-26.6 s, but
+    watch-along diarizes ~35 s sections and a ~40 s prelude, where speakers have
+    0.5-9.4 s each — and there containments of 0.73-1.00 between genuinely
+    DISTINCT speakers are routine. Measured: with no floor, every streaming
+    section collapsed 4 speakers to 2, and the prelude collapsed to **1**, which
+    put the mother and a male character on one identity and left three lines with
+    no speaker at all. Since the prelude is what establishes the cast for the
+    whole stream, that is as bad as this pass gets.
+
+    Requiring the smaller speaker to hold at least `min_speaker_seconds` of
+    speech separates the two regimes on the observed data with margin: real
+    merges start at 11.68 s, misfires top out at 9.36 s. It also confines the
+    pass to whole-clip diarization — where it was validated — without the
+    candidate having to know which execution mode it is running under. The
+    failure direction is deliberate: a duplicated bit-part with under 10 s of
+    speech is now missed, which costs one character a shared voice, where a false
+    merge costs two characters their separate voices.
+
     Returns `(turns, aliases)` where `aliases` maps each absorbed id to the id
     that survived (the group member with the most speech, ties by lowest id).
     Relabelled turns are re-merged with `gap`, since two slots of one speaker
@@ -186,7 +209,8 @@ def merge_duplicate_speakers(
     for i, a in enumerate(ids):
         for b in ids[i + 1:]:
             floor = min(total[a], total[b])
-            if floor <= 0:
+            if floor < min_speaker_seconds:
+                # Too little audio behind the ratio to mean anything.
                 continue
             shared = sum(
                 _overlap(x.start, x.end, y.start, y.end)
