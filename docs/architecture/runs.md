@@ -49,7 +49,7 @@ Copy, not move — everything above stays in the job dir, so `--resume-from` and
 ```
 runs/<job>/
 ├── diarize/
-│   ├── turns.json            # Speaker turns + overlap intervals
+│   ├── turns.json            # Speaker turns + overlap intervals + `merged_speakers` (duplicate-slot aliases, or null)
 │   ├── vocals_16k_mono.wav   # CUDA profile only: the mono 16 kHz stem sortformer_nemo requires
 │   ├── refs.json             # SpeakerRef per (speaker[, emotion]) — paths + source windows + ref_text
 │   └── refs/
@@ -77,7 +77,11 @@ Open `diarize/refs.json`. Each entry has `source_start` / `source_end` — open 
 
 If a character sounds wrong in `dub.wav`, the most likely cause is:
 
-- Wrong speaker bucketed (diarizer error) — check `diarize/turns.json`.
+- Wrong speaker bucketed (diarizer error) — check `diarize/turns.json`. Read `merged_speakers` first: a non-null value means two of the
+  diarizer's output slots were folded into one actor (quality issue #16), so the `speakers` list is shorter than the raw model output.
+- A character speaking someone else's line — check `sentences.json` against `turns.json`. Each sentence is one same-speaker run of words
+  (`apply_speaker_tags`, ADR `2026-08-24-speaker-identity-word-level-attribution`), so a sentence spanning two turns means the attribution
+  deferred those words and inherited a neighbour's label.
 - Right speaker, wrong emotion bin (so a calm-voice ref was used for an angry line) — check `emotion/segments.json` against `transcript.json`.
 - Ref clip itself is poor (background bleed, non-lexical vocalization) — open the WAV and listen.
 
