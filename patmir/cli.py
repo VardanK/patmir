@@ -105,7 +105,15 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("--mode", choices=["batch", "watch-along"], default="batch")
     p_bench.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     p_bench.add_argument("--repeat", type=int, default=1,
-                         help="Run N times; first run is cold, rest are warm.")
+                         help="Run N times in one process sharing a warm model cache: "
+                              "repeat 0 is cold (builds every stage model), 1..N-1 are warm. "
+                              "The warm repeats are the baseline.")
+    p_bench.add_argument("--no-warm-cache", dest="warm_cache",
+                         action="store_false", default=True,
+                         help="Rebuild every stage model on every repeat (the behaviour "
+                              "before 2026-08-24). Use it to collect N independent COLD "
+                              "samples, or on a box where keeping all stage models "
+                              "resident risks OOM; every reported repeat is then cold.")
     p_bench.add_argument("--max-sections", type=int, default=None,
                          help="watch-along only: cap the number of sections processed.")
     p_bench.add_argument("--report", type=Path, default=None,
@@ -273,17 +281,21 @@ def cmd_bench(args: argparse.Namespace) -> int:
     cfg = load_pipeline_config(args.config)
     runs_root = cfg.storage.runs_root
     runs_root.mkdir(parents=True, exist_ok=True)
-    print(f"patmir bench {args.clip} (mode={args.mode}, repeat={args.repeat})",
+    cache_mode = "warm cache shared across repeats" if args.warm_cache else "no warm cache (every repeat cold)"
+    print(f"patmir bench {args.clip} (mode={args.mode}, repeat={args.repeat}, "
+          f"profile={cfg.profile or '-'}, {cache_mode})",
           file=sys.stderr)
     if args.mode == "batch":
         results = benchmod.bench_batch(
             args.clip, cfg, runs_root=runs_root,
             repeat=args.repeat, label=args.label,
+            warm_cache=args.warm_cache,
         )
     else:
         results = benchmod.bench_watch_along(
             args.clip, args.config, runs_root=runs_root,
             repeat=args.repeat, max_sections=args.max_sections, label=args.label,
+            warm_cache=args.warm_cache,
         )
 
     print(benchmod.format_report(results))
