@@ -21,6 +21,10 @@ candidate:
 - normalizes `speaker` ints → `SPEAKER_NN`,
 - merges adjacent same-speaker segments (gap ≤ `merge_gap_seconds`) into
   `SpeakerTurn`s,
+- folds together two output slots that are really one actor
+  (`merge_duplicate_speakers`, 2026-08-24 — aggregate containment ≥
+  `duplicate_containment`; the alias map is written to `turns.json` as
+  `merged_speakers`),
 - VAD-post-filters against `separated.vad_intervals`,
 - re-derives `OverlapInterval`s (≥2 distinct speakers active),
 - returns `Diarization(turns, overlaps, refs={}, sample_rate)` and writes

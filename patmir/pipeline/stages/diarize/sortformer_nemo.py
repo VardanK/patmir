@@ -60,6 +60,7 @@ from patmir.pipeline.context import JobContext
 from patmir.pipeline.stage import Diarization, SeparatedAudio, SpeakerTurn
 from patmir.pipeline.stages.diarize._postprocess import (
     derive_overlaps,
+    merge_duplicate_speakers,
     merge_same_speaker,
     norm_speaker,
     passes_vad,
@@ -183,6 +184,8 @@ class SortformerNeMo:
         model_id: str = "nvidia/diar_streaming_sortformer_4spk-v2.1",
         device: str = "auto",
         merge_gap_seconds: float = 0.5,
+        duplicate_containment: float = 0.4,
+        duplicate_min_seconds: float = 1.0,
         batch_size: int = 1,
         streaming: dict[str, Any] | None = None,
     ) -> None:
@@ -192,6 +195,8 @@ class SortformerNeMo:
         self.model_id = model_id
         self.device = _resolve_device(device)
         self.merge_gap_seconds = float(merge_gap_seconds)
+        self.duplicate_containment = float(duplicate_containment)
+        self.duplicate_min_seconds = float(duplicate_min_seconds)
         self.batch_size = int(batch_size)
 
         # A local `.nemo` checkpoint is supported so a box can run fully offline
@@ -252,6 +257,14 @@ class SortformerNeMo:
         ctx.progress("diarize", 0.8, f"{len(raw)} raw segments")
 
         merged = merge_same_speaker(raw, self.merge_gap_seconds)
+        merged, aliases = merge_duplicate_speakers(
+            merged, self.merge_gap_seconds,
+            min_containment=self.duplicate_containment,
+            min_shared_seconds=self.duplicate_min_seconds,
+        )
+        if aliases:
+            ctx.progress("diarize", 0.85, "one speaker on two slots: " + ", ".join(
+                f"{k}->{v}" for k, v in sorted(aliases.items())))
         kept = [t for t in merged if passes_vad(t.start, t.end, separated.vad_intervals)]
         overlaps = derive_overlaps(kept)
         speakers = sorted({t.speaker_id for t in kept})
@@ -261,6 +274,7 @@ class SortformerNeMo:
             "device": self.device,
             "streaming": self.streaming or None,
             "speakers": speakers,
+            "merged_speakers": aliases or None,
             "turns": [{"start": t.start, "end": t.end, "speaker_id": t.speaker_id} for t in kept],
             "overlaps": [{"start": ov.start, "end": ov.end} for ov in overlaps],
         }, indent=2))
@@ -284,6 +298,8 @@ def build(config: dict[str, Any]) -> SortformerNeMo:
         model_id=str(config.get("model_id", "nvidia/diar_streaming_sortformer_4spk-v2.1")),
         device=str(config.get("device", "auto")),
         merge_gap_seconds=float(config.get("merge_gap_seconds", 0.5)),
+        duplicate_containment=float(config.get("duplicate_containment", 0.4)),
+        duplicate_min_seconds=float(config.get("duplicate_min_seconds", 1.0)),
         batch_size=int(config.get("batch_size", 1)),
         streaming=streaming or None,
     )

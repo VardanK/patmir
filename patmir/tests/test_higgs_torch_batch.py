@@ -36,6 +36,8 @@ from patmir.eval.candidates.tts.higgs_v3_torch import (
     HiggsV3Torch,
     _chunks,
     _Request,
+    _request_seed,
+    _sample_codes,
     token_cap,
 )
 
@@ -159,7 +161,7 @@ class OrchestrationTest(unittest.TestCase):
         texts = ["x" * 300, "x" * 10, "x" * 200, "x" * 50]
         # Encode each request's identity in its waveform via the cap, which is a
         # function of its text length.
-        def decode(reqs):
+        def decode(reqs, attempt=0):
             return [(np.full(8, r.cap / 10_000.0, dtype=np.float32), False) for r in reqs]
 
         out = self._run(_bare(max_batch=2), texts, decode)
@@ -182,7 +184,7 @@ class OrchestrationTest(unittest.TestCase):
 
         seen: list[list[int]] = []
 
-        def decode(reqs):
+        def decode(reqs, attempt=0):
             seen.append([r.cap for r in reqs])
             return [(np.zeros(8, dtype=np.float32), False) for _ in reqs]
 
@@ -205,7 +207,7 @@ class OrchestrationTest(unittest.TestCase):
 
         sizes: list[int] = []
 
-        def decode(reqs):
+        def decode(reqs, attempt=0):
             sizes.append(len(reqs))
             return [(np.zeros(8, dtype=np.float32), False) for _ in reqs]
 
@@ -217,7 +219,7 @@ class OrchestrationTest(unittest.TestCase):
 
         calls = {"n": 0}
 
-        def decode(reqs):
+        def decode(reqs, attempt=0):
             calls["n"] += 1
             if calls["n"] == 1:
                 return [(np.zeros(8, dtype=np.float32), True)]      # overflowed
@@ -236,7 +238,7 @@ class OrchestrationTest(unittest.TestCase):
 
         seen: list[int] = []
 
-        def decode(reqs):
+        def decode(reqs, attempt=0):
             seen.append(len(reqs))
             # First pass: middle row overflows. Retry pass: it succeeds.
             if len(reqs) == 3:
@@ -254,7 +256,7 @@ class OrchestrationTest(unittest.TestCase):
     def test_persistent_overflow_falls_back_to_silence(self):
         import numpy as np
 
-        def decode(reqs):
+        def decode(reqs, attempt=0):
             return [(np.ones(8, dtype=np.float32), True) for _ in reqs]
 
         cand = _bare(max_batch=4, max_retries=1)
@@ -265,7 +267,7 @@ class OrchestrationTest(unittest.TestCase):
 
     def test_collapsed_generation_falls_back_to_silence(self):
         """`None` waveform (fewer rows than codebooks) with no overflow flag."""
-        def decode(reqs):
+        def decode(reqs, attempt=0):
             return [(None, False) for _ in reqs]
 
         cand = _bare(max_batch=4, max_retries=0)
@@ -274,7 +276,7 @@ class OrchestrationTest(unittest.TestCase):
         self.assertAlmostEqual(_wav_duration(out[0]), 0.2, places=3)
 
     def test_empty_request_list(self):
-        def decode(reqs):  # pragma: no cover - must never be called
+        def decode(reqs, attempt=0):  # pragma: no cover - must never be called
             raise AssertionError("no chunks expected")
 
         self.assertEqual(self._run(_bare(), [], decode), [])
@@ -288,7 +290,7 @@ class OrchestrationTest(unittest.TestCase):
         """
         seen: list[str] = []
 
-        def decode(reqs):
+        def decode(reqs, attempt=0):
             seen.extend(r.prompt_text for r in reqs)
             return [(None, False) for _ in reqs]
 
@@ -311,7 +313,7 @@ class OrchestrationTest(unittest.TestCase):
         no stray marker. `angry` and `happy` are untagged as of 2026-08-24."""
         seen: list[str] = []
 
-        def decode(reqs):
+        def decode(reqs, attempt=0):
             seen.extend(r.prompt_text for r in reqs)
             return [(None, False) for _ in reqs]
 
@@ -333,11 +335,17 @@ class OrchestrationTest(unittest.TestCase):
 class BatchEquivalenceTest(unittest.TestCase):
     """A row decoded in a batch must equal the same row decoded alone.
 
-    Runs a tiny randomly-initialized model on CPU at temperature 0 (greedy, so
-    the comparison is deterministic — with sampling, rows share one RNG stream
-    and output legitimately depends on batch composition). Random weights never
-    learn to emit a stop token, so rows terminate on their own cap; the EOC path
-    is forced separately below.
+    Runs a tiny randomly-initialized model on CPU at temperature 0 (greedy).
+    Temperature 0 is deliberate and is NOT because rows share an RNG stream —
+    since 2026-08-24 each row draws from its own generator. It is because
+    batching is not bitwise-invariant *numerically*: batched matmuls and the
+    left-padded prefill do not give identical logits at different batch shapes,
+    and sampling amplifies a 1-bit logit difference into a different draw, while
+    argmax absorbs it. `SamplingReproducibilityTest` covers what sampling does
+    guarantee.
+
+    Random weights never learn to emit a stop token, so rows terminate on their
+    own cap; the EOC path is forced separately below.
     """
 
     @classmethod
@@ -784,3 +792,111 @@ class AdapterBatchDispatchTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class RequestSeedTest(unittest.TestCase):
+    """The per-row RNG seed is derived from the request's own content.
+
+    This is what makes a run reproducible: the seed must not depend on batch
+    position, call order, or process identity.
+    """
+
+    def test_the_same_request_always_gets_the_same_seed(self):
+        a = _request_seed("Վրան արյուն կա", "reference text")
+        b = _request_seed("Վրան արյուն կա", "reference text")
+        self.assertEqual(a, b)
+
+    def test_the_seed_is_stable_across_processes(self):
+        """Pinned literal. `hash()` is salted per process, so using it here would
+        make every run irreproducible in exactly the way this exists to prevent —
+        a regression to it would change this number."""
+        self.assertEqual(_request_seed("Վրան արյուն կա", "ref"), 1437796720965076717)
+
+    def test_text_and_reference_both_move_the_seed(self):
+        base = _request_seed("Վրան արյուն կա", "ref")
+        self.assertNotEqual(base, _request_seed("Վրան արյուն կա։", "ref"))
+        self.assertNotEqual(base, _request_seed("Վրան արյուն կա", "other ref"))
+        self.assertNotEqual(base, _request_seed("Վրան արյուն կա", None))
+
+    def test_the_text_reference_boundary_cannot_be_smeared(self):
+        """Without a separator these two would hash identically."""
+        self.assertNotEqual(_request_seed("ab", "c"), _request_seed("a", "bc"))
+
+    def test_the_seed_fits_a_generator(self):
+        for text in ("", "a", "Վրան արյուն կա" * 50):
+            seed = _request_seed(text, None)
+            self.assertGreaterEqual(seed, 0)
+            self.assertLess(seed, 1 << 62)
+
+    def test_prepare_stamps_the_content_seed_onto_the_request(self):
+        cand = HiggsV3Torch.__new__(HiggsV3Torch)
+        cand._ref_cache = {}
+        req = cand._prepare("Վրան արյուն կա", None, "ref", None)
+        self.assertEqual(req.seed, _request_seed("Վրան արյուն կա", "ref"))
+
+
+class SampleCodesTest(unittest.TestCase):
+    """Our copy of the checkpoint's sampler, which adds the generator it lacks."""
+
+    def _logits(self, rows=3, vocab=16):
+        import torch
+        torch.manual_seed(0)
+        return torch.randn(rows, vocab)
+
+    def test_zero_temperature_is_argmax(self):
+        import torch
+        logits = self._logits()
+        out = _sample_codes(logits, temperature=0.0, top_p=None, top_k=None,
+                            generator=None)
+        self.assertTrue(torch.equal(out, logits.argmax(dim=-1)))
+
+    def test_the_same_seed_draws_the_same_codes(self):
+        import torch
+        logits = self._logits()
+        g1 = torch.Generator(); g1.manual_seed(1234)
+        g2 = torch.Generator(); g2.manual_seed(1234)
+        a = _sample_codes(logits, temperature=0.8, top_p=0.95, top_k=None, generator=g1)
+        b = _sample_codes(logits, temperature=0.8, top_p=0.95, top_k=None, generator=g2)
+        self.assertTrue(torch.equal(a, b))
+
+    def test_different_seeds_draw_differently(self):
+        import torch
+        logits = self._logits(rows=8, vocab=256)
+        draws = []
+        for seed in (1, 2, 3, 4):
+            g = torch.Generator(); g.manual_seed(seed)
+            draws.append(tuple(_sample_codes(
+                logits, temperature=1.0, top_p=None, top_k=None,
+                generator=g).tolist()))
+        self.assertGreater(len(set(draws)), 1)
+
+    def test_the_draw_does_not_touch_the_global_rng(self):
+        """A row's draw must not advance the stream any other row reads."""
+        import torch
+        logits = self._logits()
+        torch.manual_seed(99)
+        before = torch.rand(4)
+        torch.manual_seed(99)
+        g = torch.Generator(); g.manual_seed(7)
+        _sample_codes(logits, temperature=0.8, top_p=0.95, top_k=None, generator=g)
+        after = torch.rand(4)
+        self.assertTrue(torch.equal(before, after))
+
+    def test_top_k_restricts_the_support(self):
+        import torch
+        logits = torch.tensor([[0.0, 10.0, 0.0, 0.0]])
+        for seed in range(8):
+            g = torch.Generator(); g.manual_seed(seed)
+            out = _sample_codes(logits, temperature=1.0, top_p=None, top_k=1,
+                                generator=g)
+            self.assertEqual(out.tolist(), [1])
+
+    def test_top_p_keeps_at_least_the_top_token(self):
+        """A nucleus small enough to exclude everything must still leave one."""
+        import torch
+        logits = torch.tensor([[0.0, 5.0, 1.0, 2.0]])
+        for seed in range(8):
+            g = torch.Generator(); g.manual_seed(seed)
+            out = _sample_codes(logits, temperature=1.0, top_p=0.01, top_k=None,
+                                generator=g)
+            self.assertEqual(out.tolist(), [1])

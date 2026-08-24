@@ -37,9 +37,26 @@ Notes on the batching:
 * **Exact overflow.** Owning the loop means row counts are known, so the
   non-termination guardrail no longer has to infer overflow from output length
   the way the `generate_speech` version did.
-* **Sampling is not batch-invariant.** Rows share one global RNG stream, so a
-  sentence's output depends on the batch it landed in. Expected for sampled
-  decoding, and the reason the equivalence test pins temperature to 0.
+* **Sampling is reproducible** (since 2026-08-24), which it was not. Each row
+  draws from its own `torch.Generator`, seeded from a content hash of the
+  request, so the same sentence set yields byte-identical audio on every run
+  regardless of call order, and two identical requests in one chunk now produce
+  identical audio. Before this, rows shared one global RNG stream seeded once per
+  chunk, so a row's draw depended on its slot index and on how many draws its
+  chunk-mates had made — repeated runs of one clip put the same sentence's
+  utterance-final level anywhere across a 26 dB range, heard by the author as
+  wrong emphasis on some lines on some runs. The module used to call that
+  "expected for sampled decoding"; it was measured instead. See `_sample_codes`.
+* **It is still not batch-INVARIANT, and that is not an RNG problem.** Changing
+  which sentences share a chunk still changes a line's audio, because batched
+  matmuls and the left-padded prefill (`seq = max` over the chunk) do not produce
+  bitwise-identical logits at different batch shapes, and at temperature 0.8 a
+  1-bit logit difference can flip a multinomial draw. Fixing that would mean
+  bitwise-stable kernels across shapes, not a seeding change. This is why
+  `test_batched_rows_match_standalone_rows` pins temperature to 0 — argmax
+  tolerates the numerical drift that sampling amplifies. Practical consequence:
+  re-running a clip reproduces exactly, but adding or removing one sentence can
+  redraw unrelated lines.
 
 Both Higgs candidates stay registered; `[pipeline].tts` (or a machine profile)
 picks one. ADRs: `2026-06-20-higgs-v3-tts-mlx-q8` for the model,
@@ -47,6 +64,7 @@ picks one. ADRs: `2026-06-20-higgs-v3-tts-mlx-q8` for the model,
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import sys
@@ -140,6 +158,61 @@ class _Request:
     ref_codes: Any | None
     ref_text: str | None
     cap: int
+    # Per-row RNG seed; `_prepare` derives it from the request's content. The
+    # default keeps hand-built requests (tests) constructible.
+    seed: int = 0
+
+
+def _request_seed(prompt_text: str, ref_text: str | None) -> int:
+    """Stable per-request RNG seed derived from the request's own content.
+
+    Content-addressed, so the same sentence with the same reference draws the
+    same sampling stream in any job, in any batch position, on any run. blake2b
+    rather than `hash()`, which is salted per process and would make runs
+    irreproducible in exactly the way this exists to prevent.
+    """
+    h = hashlib.blake2b(digest_size=8)
+    h.update(prompt_text.encode("utf-8"))
+    h.update(b"\x00")
+    h.update((ref_text or "").encode("utf-8"))
+    return int.from_bytes(h.digest(), "big") & ((1 << 62) - 1)
+
+
+def _sample_codes(logits_NV: Any, *, temperature: float, top_p: float | None,
+                  top_k: int | None, generator: Any) -> Any:
+    """The checkpoint's `_sample`, plus a `generator` it does not accept.
+
+    A faithful copy — top-k mask, top-p nucleus mask, multinomial — kept in step
+    with the upstream function, whose only difference is that its `multinomial`
+    draws from the GLOBAL RNG. That is what made a sentence's audio depend on its
+    batch-mates, so the draw has to come from a per-row generator instead.
+
+    Only the draw is reimplemented. The delay ramp-up and end-of-codebook state
+    machine stay upstream's: the caller hands the sampled codes back to
+    `_sampler_step` as a one-hot with `temperature=0`, which takes its argmax
+    path and returns them unchanged, then runs its own bookkeeping. Copying the
+    12 lines of a sampler is cheap; forking a state machine is not.
+    """
+    import torch
+
+    if temperature <= 1e-5:
+        return logits_NV.argmax(dim=-1)
+    logits = logits_NV / temperature
+    if top_k is not None and top_k > 0:
+        k = min(top_k, logits.size(-1))
+        kth = logits.topk(k, dim=-1).values[:, -1:]
+        logits = torch.where(logits < kth, float("-inf"), logits)
+    if top_p is not None and top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        cum = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        remove = cum > top_p
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        scatter = torch.zeros_like(remove)
+        scatter.scatter_(-1, sorted_idx, remove)
+        logits = torch.where(scatter, float("-inf"), logits)
+    return logits.softmax(dim=-1).multinomial(
+        num_samples=1, generator=generator).squeeze(-1)
 
 
 def _chunks(items: list[int], size: int) -> list[list[int]]:
@@ -375,15 +448,20 @@ class HiggsV3Torch:
             ref_codes=self._encode_ref(str(ref_audio)) if ref_audio else None,
             ref_text=ref_text or None,
             cap=token_cap(prompt_text),
+            seed=_request_seed(prompt_text, ref_text),
         )
 
     # ---- batched autoregressive decode ---- #
-    def _decode_chunk(self, requests: list[_Request]) -> list[tuple[Any, bool]]:
+    def _decode_chunk(self, requests: list[_Request],
+                      attempt: int = 0) -> list[tuple[Any, bool]]:
         """Decode a chunk of requests together.
 
         Returns one `(waveform | None, overflowed)` per request, in order.
         `None` means the run produced fewer than `num_codebooks` rows, i.e. it
         collapsed before emitting anything de-deloadable.
+
+        `attempt` shifts every row's RNG seed, so an overflow retry redraws
+        instead of reproducing the run that just failed to terminate.
         """
         import torch
 
@@ -433,6 +511,17 @@ class HiggsV3Torch:
             hidden = out.last_hidden_state[:, -1, :]          # [B, D]
             next_pos = position_ids[:, -1] + 1                 # [B]
 
+            # One RNG stream per row, seeded from that request's own content, so
+            # a sentence's audio cannot depend on its batch-mates or its slot.
+            gens = []
+            for req in requests:
+                g = torch.Generator(device=device)
+                g.manual_seed((self.base_seed + attempt + req.seed) & ((1 << 62) - 1))
+                gens.append(g)
+            # Reused across rows and steps: `_sampler_step` takes an argmax of it
+            # and returns a fresh tensor, so nothing retains a reference.
+            onehot = None
+
             states = [up._SamplerState(num_codebooks=N) for _ in range(B)]
             rows: list[list[Any]] = [[] for _ in range(B)]
             done = [False] * B
@@ -447,9 +536,23 @@ class HiggsV3Torch:
                         # holds; its outputs are no longer read. Attention is
                         # per-sequence, so this cannot affect the other rows.
                         continue
+                    # Draw from this row's own stream, then let upstream's state
+                    # machine run on the result: a one-hot at temperature 0 sends
+                    # `_sampler_step` down its argmax path, so it returns exactly
+                    # these codes and then applies its delay ramp-up / EOC
+                    # bookkeeping unchanged. See `_sample_codes`.
+                    drawn_N = _sample_codes(
+                        logits[b],
+                        temperature=self.temperature, top_p=self.top_p,
+                        top_k=self.top_k, generator=gens[b],
+                    )
+                    if onehot is None:
+                        onehot = torch.zeros_like(logits[b])
+                    onehot.zero_()
+                    onehot.scatter_(-1, drawn_N.unsqueeze(-1).to(torch.long), 1.0)
                     codes_N = up._sampler_step(
-                        logits[b], states[b],
-                        temperature=self.temperature, top_p=self.top_p, top_k=self.top_k,
+                        onehot, states[b],
+                        temperature=0.0, top_p=None, top_k=None,
                     )
                     if states[b].generation_done:
                         done[b] = True
@@ -527,9 +630,8 @@ class HiggsV3Torch:
             for attempt in range(self.max_retries + 1):
                 if not pending:
                     break
-                torch.manual_seed(self.base_seed + attempt)
                 self._summary["batches"] += 1
-                outs = self._decode_chunk([prepared[i] for i in pending])
+                outs = self._decode_chunk([prepared[i] for i in pending], attempt)
                 retry: list[int] = []
                 for slot, (wav, over) in zip(pending, outs):
                     if wav is not None and not over:
