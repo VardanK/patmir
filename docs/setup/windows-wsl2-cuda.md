@@ -241,9 +241,14 @@ Every id should be the profile's, and none should contain `mlx`.
 ### First run
 
 ```bash
-patmir bench samples/Reacher-S02E01-5min.mkv --mode batch \
-  --report runs/bench/reacher-cuda-baseline.json --label cuda-first-run
+patmir bench samples/sample_1.mkv --mode batch --repeat 3 \
+  --report runs/bench/sample_1-cuda-batch.json --label cuda-baseline
 ```
+
+`samples/sample_1.mkv` is the Reacher 5-minute clip (301.1 s), renamed from
+`Reacher-S02E01-5min.mkv` — see `docs/architecture/eval-clips.md`. `--repeat 3`
+yields the cold number (repeat 0) and the warm baseline (repeats 1-2) in one
+command; the warm one is what the M1 figures below are comparable to.
 
 Baselines to beat, measured warm on the M1 Pro against the same clip (301.1 s of source):
 
@@ -279,8 +284,8 @@ Two things to watch on the first run, both consequences of the profile rather th
   ```bash
   for b in 4 8 16; do
     # edit max_batch in patmir.toml, then:
-    patmir bench samples/Reacher-S02E01-5min.mkv --mode batch \
-      --report runs/bench/reacher-cuda-b$b.json --label "max_batch=$b"
+    patmir bench samples/sample_1.mkv --mode batch --repeat 2 \
+      --report runs/bench/sample_1-cuda-b$b.json --label "max_batch=$b"
   done
   ```
 
@@ -291,6 +296,163 @@ Two things to watch on the first run, both consequences of the profile rather th
 Then, in order: fix whatever the first run surfaces, capture the baseline, and only then look at
 optimizations (batched TTS decode across sentences, section pipelining — which pays here in a way
 it cannot on MLX, where everything serializes on one GPU stream).
+
+### The real VRAM ceiling here is the Windows COMMIT LIMIT, not the card
+
+**Measured 2026-08-24. Read this before diagnosing any CUDA OOM on this box.**
+
+A WSL2 CUDA process cannot allocate the 3090's 24 GB. It gets whatever Windows'
+*commit charge* headroom allows, because **every GB of VRAM allocated consumes ~1 GB
+of Windows commit**. Measured directly:
+
+| GPU allocated | Windows commit used | delta | VRAM still free |
+| --: | --: | --: | --: |
+| 1 GB | 21.02 GB | +1.28 GB | 21.76 GB |
+| 3 GB | 22.94 GB | +3.21 GB | 19.76 GB |
+| 6 GB | 26.09 GB | +6.36 GB | 16.76 GB |
+
+**1.06 GB of commit per GB of VRAM.** Under the Windows display driver model a GPU
+allocation must have a system-memory *backing store* (so the driver can evict it off
+the card if another app needs the GPU), and Windows commits that backing up front —
+even though the data lives on the card and the backing is typically never touched.
+
+Commit is a *promise*, not usage: `commit limit = physical RAM + pagefile size`. So
+the pagefile's size caps GPU allocation whether or not anything is ever paged.
+
+On this box as first configured:
+
+```
+physical RAM               31.84 GB
+pagefile (fixed, manual)    4.00 GB   -> commit limit 35.84 GB
+idle commit baseline       ~19.70 GB
+=> headroom for CUDA       ~16.00 GB   on a 24 GB card
+```
+
+That ~16 GB is *just under* the ~15 GB that the warm stage cache plus Higgs wants,
+which is why the failure looked intermittent rather than systematic.
+
+**How the failure presents, and why it misleads:**
+
+```
+CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of
+24.00 GiB of which 14.46 GiB is free. Including non-PyTorch memory, this process
+has 17179869184.00 GiB memory in use. Of the allocated memory 8.23 GiB is
+allocated by PyTorch
+```
+
+Every part of that is a red herring:
+
+- **A tiny request fails** (20-48 MiB) — so it is never a capacity problem in the
+  usual sense. The refusal comes from commit, and it lands on whatever allocation
+  happens to be next, pointing the traceback at innocent code (for us, the audio
+  codec moving to device inside `_encode_ref`).
+- **"14.46 GiB is free" is true** and irrelevant — that is VRAM, and VRAM was not the
+  constraint.
+- **`17179869184.00 GiB` is 2^34 GiB**, i.e. garbage. PyTorch infers "non-PyTorch
+  memory" by subtraction and the arithmetic goes negative, because the refusal did
+  not come from VRAM accounting at all.
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which the message suggests,
+  **does not help** — verified. Reserved-but-unallocated was 15 MiB, so there was no
+  fragmented pool to compact.
+
+**Observed ceilings, all consistent with commit headroom at the time:**
+
+| scenario | allocated at failure | commit baseline |
+| --- | --: | --- |
+| bare torch process, quiet machine | 20.75 GB | lowest |
+| four non-TTS stage models resident | 15.23 GB | ~19.7 GB |
+| `patmir bench` warm cache, loading Higgs | 13.06 GB | higher |
+| `patmir dub`, Chrome playing video | 8.23 GB | Chrome holding several GB |
+
+**The fix is a Windows setting, not code.** Raise the pagefile — it lifts the commit
+limit without causing paging, because nothing is written to it while physical RAM is
+free (measured: 4 GB pagefile holding **0.24 GB**, lifetime peak 2.2 GB, with 21.85 GB
+of RAM free). Sizing:
+
+| goal | VRAM | commit limit needed | pagefile |
+| --- | --: | --: | --: |
+| warm cache + Higgs, comfortably | ~15 GB | ~40 GB | ~10 GB |
+| use the whole card (e.g. a `max_batch` sweep) | 24 GB | ~48-50 GB | ~16-20 GB |
+
+Put it on **E:** rather than C: — C: had 51 GB free, E: had 152 GB. The only cost is
+disk space.
+
+**Confirmed on this box 2026-08-24.** Pagefile moved to `E:` and grown to 20 GB:
+
+```
+commit limit   35.84 GB -> 51.84 GB     (exactly the +16 GB from 4 GB -> 20 GB)
+```
+
+The warm-cache batch bench then ran with **VRAM peaking at ~17.1 GB** and commit topping
+out around 38 GB of the 51.84 available — comfortably past the 13.06 GB where every
+previous attempt died, and past the 15.23 GB ceiling measured under the old limit.
+
+Two practical notes from doing it:
+
+- **Set `initial` equal to `maximum`.** Configured as initial 4 GB / max 20 GB, Windows
+  grows the file on demand and the commit limit only rises as it grows — so a single
+  large burst (Higgs moves ~8.5 GB in one `.to(device)`) can outrun the expansion. It
+  did grow in time here, but initial = maximum = 20480 MB removes the race.
+- **A reboot helps independently of the pagefile**, by dropping the commit baseline.
+  Before: baseline ~19.7 GB. After: ~11 GB, i.e. ~8 GB more headroom for free. If a run
+  fails near the limit, a restart is a legitimate first move.
+
+**Corollary, and it still stands on its own:** keep the Windows desktop quiet during a
+benchmark. Chrome playing video holds *commit*, which directly shrinks CUDA's ceiling.
+Two runs failed at 14:02 and 14:07 with a video playing and the identical run
+succeeded at 14:15 with Chrome closed. This is the WSL2 analogue of the `caffeinate`
+warning in `performance.md`: a number that looks like a measurement but reflects what
+else the machine was doing.
+
+**What this is NOT:**
+
+- **Not faulty VRAM.** Tested 19 GiB with four patterns (zeros, all-ones, 0xAA55
+  coupling, address-in-address) = 76 GiB written and verified: **0 pattern errors, 0
+  disturb errors on re-read**. No Xid entries; `Channel Repair Pending: No`,
+  `TPC Repair Pending: No`. Note the 3090 is a consumer card with no ECC, so the
+  ECC counters read `N/A` and cannot themselves clear it — hence the pattern test.
+- **Not the shared GPU memory pool.** Windows reports 39.9 GB of "GPU memory"
+  (24 dedicated + 15.9 shared). CUDA under WSL2 does not use the shared pool:
+  per-process shared usage stayed at **0.21 GB, flat**, throughout a model load. That
+  pool is for graphics APIs. Its presence is also not costing anything — like the
+  commit limit, it is a ceiling, not a reservation.
+- **Not `.wslconfig memory=`.** That is a cap, not a reservation; `vmmemWSL` was
+  holding 3.98 GB against a 24 GB cap, with 21.85 GB of physical RAM free. Lowering it
+  frees nothing and does not change the commit arithmetic.
+
+### `.wslconfig`: a cap, not a reservation
+
+Worth understanding so it is not mistaken for the problem above.
+
+```bash
+cat /mnt/c/Users/$USER/.wslconfig
+free -m                       # what the VM actually sees
+```
+
+This box is configured `memory=24GB` on a 31.84 GB host. That is a **ceiling on what
+the VM may take**, not memory removed from Windows: measured with the VM idle,
+`vmmemWSL` held 3.98 GB and Windows had 21.85 GB of physical RAM free. So it is not
+what caused the CUDA OOMs (the config was identical across the failures *and* the
+successes), and lowering it would not have freed anything.
+
+Two things it does affect, neither of them the ceiling above:
+
+- WSL2 does not return freed memory — page cache included — to Windows by default, so
+  the VM's footprint ratchets upward within its cap over a long session. Reading 27 GB
+  of models off a 9p mount parks several GB of page cache in the VM.
+  `[experimental] autoMemoryReclaim=gradual` hands it back.
+- The VM's own memory is charged against the same host commit limit as everything
+  else, so a VM that has ratcheted up does reduce CUDA headroom indirectly.
+
+### torchcodec is broken on this box (does not block the pipeline)
+
+`torchaudio.load` raises `OSError: Could not load this library: .../libtorchcodec_image.so` —
+ffmpeg 8.0.1 against torchcodec 0.16, which has no build for that ffmpeg major. Nothing on the CUDA
+path hits it: the Higgs candidates read reference clips through
+`patmir/eval/candidates/tts/_audio_io.py` (an ffmpeg subprocess) and `htdemucs.py` reads through
+soundfile. The one remaining `torchaudio` call, `functional.resample` in `qwen3_asr.py`, is pure
+torch DSP with no codec involved. But **any new code reaching for `torchaudio.load` will hit it**,
+so decode audio through `_audio_io` or soundfile.
 
 ## Phase 10 — Server reachability
 

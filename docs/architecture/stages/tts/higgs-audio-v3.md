@@ -76,6 +76,68 @@ on overflow). Overflow count logged to `tts/voice_cloning_summary.json` via
 The `SentenceTTS` adapter probes the signature and passes `ref_audio`, `ref_text`
 (optional — `ref_text_optional=True`), and **`emotion`** (→ inline tag via
 `EMOTION_TAGS`: happy→elation, sad→sadness, angry→anger, fearful→fear, neutral→none).
+
+### The tag vocabulary we are barely using (surveyed 2026-08-24)
+
+The checkpoint's `tokenizer_config.json` declares **62 control tokens**; the model card documents
+them. We map five emotion bins onto five tags and use nothing else. What is actually available:
+
+| category | count | tokens |
+| --- | --: | --- |
+| emotion | **21** | elation, amusement, enthusiasm, determination, pride, contentment, affection, relief, contemplation, confusion, surprise, awe, longing, arousal, anger, fear, disgust, bitterness, sadness, shame, helplessness |
+| prosody | 10 | `speed_very_slow/slow/fast/very_fast`, `pitch_low/high`, `pause`, `long_pause`, **`expressive_high`**, **`expressive_low`** |
+| style | 3 | singing, shouting, whispering |
+| sfx | 9 | cough, laughter, crying, screaming, burping, humming, sigh, sniff, sneeze |
+| env | 2 | music, noise |
+
+Three things follow, all relevant to the over-emoting the author reported on 2026-08-24:
+
+1. **`expressive_low` is the only intensity control that exists.** The card documents no per-tag
+   strength parameter, so emotion is otherwise binary — the tag fires at whatever intensity the
+   model associates with it. `expressive_low` is therefore the dial, and we have never used it.
+2. **Our bin→tag map picked the most intense variants.** `happy → elation` is the strongest positive
+   available when `contentment`, `amusement`, `affection` and `relief` all exist; `angry → anger`
+   where `bitterness` is the milder register. That was never a considered choice — the five tags were
+   simply the five obvious name matches for the five bins.
+3. **`disgust` is a real tag and we throw it away.** `patmir.toml [emotion_bins]` folds emotion2vec's
+   `disgusted` into `angry` (and `surprised` into `happy`), a collapse designed when the target was
+   five *ref-clip* bins. With 21 tags available the collapse is now lossy for no reason — though
+   widening it is not a one-liner, because `Emotion` is a 5-value `Literal` that the ref-picker,
+   the runs UI and `[emotion_bins]` all share.
+
+**Placement is correct and should stay that way.** The card: *"Delivery tokens first. Emotion,
+style, and the prosody speed / pitch / expressive tokens shape the whole turn — put them at the
+start of input."* `_prepare` builds `f"<|emotion:{tag}|>{text}"`, so the tag leads.
+
+### The map, chosen by ear 2026-08-24 (supersedes the name-match guesses)
+
+Two A/B rounds on real lines with the real pinned refs (`runs/emotion-ab/`,
+`runs/emotion-ab2/`). **The original mapping lost every line it was entered in**, in
+every bin — it had been five obvious name matches that nobody had listened to.
+
+| bin | original | chosen | why |
+| --- | --- | --- | --- |
+| `angry` | `anger` | **(none)** | no-tag won 2 of 3 lines; the third preferred `bitterness` + `expressive_low`. 35% of sentences on the test clip. |
+| `happy` | `elation` | **(none)** | nothing read as happy; `contentment` introduced a flirtatious tone. 9% of sentences. |
+| `sad` | `sadness` | **`helplessness`** | won all three sad lines |
+| `fearful` | `fear` | **`shame`** | won the fearful line; `fear` + low second |
+| `neutral` | (none) | (none) | unchanged |
+
+`<|prosody:expressive_low|>` is **available and real but not adopted**: an identical
+prompt with and without it produces different audio (confirmed by md5), so the dial
+works — but it won only one line of nine, and on another the author judged the
+lower-intensity variant *more* emotional than the plain tag.
+
+**Treat every tag name as a label, not a description.** `expressive_low` increasing
+perceived intensity, `elation` not reading as happy, and `contentment` reading as
+flirtation are all cases where the name predicted the wrong thing. There is nothing
+upstream to check against — see below.
+
+**Documentation status, since it gets asked:** the tag list is documented in the model card only.
+There is **no paper or technical report** linked, so nothing upstream defines what any tag means
+acoustically, how strong it is, or whether an emotion tag and `expressive_low` compose. Any mapping
+we choose is an ear-test result, not a citation.
+
 It does **not** pass `guidance_scale` (Higgs has no such knob). Ref selection still
 honors `tts_pin_speaker_ref` (one clean ref per speaker → stable voice).
 

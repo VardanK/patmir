@@ -88,6 +88,30 @@ Costs and caveats:
 - `bench.py` batch still passes no cache deliberately, so `--repeat` continues to
   measure the cold-build path.
 
+**Addendum 2026-08-24 — that last bullet is superseded.** `bench_batch` now shares one
+`stage_cache` across repeats (repeat 0 cold, 1..N-1 warm; `--no-warm-cache` restores the
+old path). The choice was defensible when a build cost 2 s on MLX and is not when it
+costs 154 s on torch: on the RTX 3090, model builds were **53.4 % of a cold batch run**,
+so `--repeat 3` was timing nine model loads three times over rather than steady state.
+Measured effect of the fix on `samples/sample_1.mkv`: cold RTF **0.958** → warm **0.461**,
+with `build_s == 0.0` on every stage of the warm repeats.
+
+Two things this ADR anticipated correctly, worth recording as confirmed:
+
+- **The resident-set cost is real and bites on a discrete GPU.** The four non-TTS models
+  hold 6.48 GB and Higgs ~8.5 GB; at ~15 GB the warm path did not fit until the box's
+  Windows pagefile was enlarged, because CUDA under WSL2 charges host *commit* ~1:1 per
+  GB of VRAM. The "memory pressure on a smaller box" revisit trigger fired exactly as
+  written — just for a reason (commit, not VRAM) nobody had in mind. See
+  `docs/setup/windows-wsl2-cuda.md`.
+- **The TTS unification is what makes it fit.** Two Higgs instances would have been
+  ~17 GB of TTS alone, which does not fit on this card under any pagefile.
+
+One caveat inherited by the batch path: `TTSAdapter._standin` is keyed by `speaker_id`,
+which repeats across runs, so a ref-less speaker on a warm repeat can be handed a
+stand-in clip from the previous repeat's job dir. Timing-neutral; if it ever matters the
+fix belongs in the adapter, not in bench.
+
 *Revisit:* memory pressure from all-stages-resident on a smaller box, watch-along
 peak memory regressing from the skipped cache-free, or a second candidate being
 reintroduced for a stage that both modes use.
