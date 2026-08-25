@@ -220,6 +220,7 @@ def process_section(
     cancel: threading.Event | None = None,
     bench: bool = False,
     source_lang: str | None = None,
+    max_end: float | None = None,
 ) -> SectionResult:
     runs_root = runs_root or cfg.storage.runs_root
     t0 = perf_counter()
@@ -243,7 +244,23 @@ def process_section(
     # analyzed either way, so dubbing it too means fewer sections per video
     # and proportionally less pad re-analysis. Never snap into the last
     # END_GUARD_SECONDS, where a mid-speech slice cut masquerades as silence.
-    end_rel = _snap_window_end(job_dir, slice_len - END_GUARD_SECONDS)
+    #
+    # `max_end` (global seconds) is where the next already-dubbed region begins.
+    # Snapping past it would dub those seconds a second time, putting two
+    # renderings of the same dialogue in the manifest for the client to choose
+    # between. Snap to the last VAD silence at or before it instead. Forward
+    # streaming passes None here; only a post-seek window is ever clamped.
+    #
+    # Interaction with `_snap_window_end`'s own anti-collapse rule: that rule's
+    # floor is a fraction of the target it is GIVEN, so handing it the clamped
+    # target scales the floor with the clamp rather than measuring the window
+    # against the full slice. A clamped window that finds no qualifying silence
+    # falls back to the clamp itself, which abuts the covered run exactly — the
+    # one boundary we must not cross.
+    snap_target = slice_len - END_GUARD_SECONDS
+    if max_end is not None:
+        snap_target = min(snap_target, max(0.0, max_end - start))
+    end_rel = _snap_window_end(job_dir, snap_target)
 
     mapping, new_speakers = _resolve_identities(registry, job_dir)
     _remap_and_trim_transcript(job_dir, mapping, end_rel)

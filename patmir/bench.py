@@ -507,7 +507,7 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
         counter = {"n": 0}
         stalls: list[dict[str, Any]] = []
 
-        def _one(start: float):
+        def _one(start: float, max_end: float | None = None):
             counter["n"] += 1
             s0 = time.perf_counter()
             sec = process_section(
@@ -515,6 +515,9 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                 index=counter["n"], start=start, runs_root=runs_root,
                 stage_cache=stage_cache, bench=traces,
                 source_lang=prelude.source_lang,
+                # Only the scheduler branch supplies this; the straight-line
+                # loop below never revisits covered ground, so it has no clamp.
+                max_end=max_end,
             )
             sections.append(_section_record(counter["n"], sec,
                                             time.perf_counter() - s0, runs_root))
@@ -526,11 +529,11 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
             # being replaced by a straight-line loop that cannot stall.
             ph = BenchPlayhead(playhead)
 
-            def _process(start: float):
+            def _process(start: float, max_end: float | None = None):
                 if max_sections is not None and counter["n"] >= max_sections:
                     sched.stop()
                     return None
-                return _one(start)
+                return _one(start, max_end)
 
             sched = StreamScheduler(
                 duration=duration,

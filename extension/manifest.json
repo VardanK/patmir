@@ -21,7 +21,7 @@
         "https://*.youtube.com/*",
         "https://youtu.be/*"
       ],
-      "js": ["content.js"],
+      "js": ["lib/sync.js", "content.js"],
       "run_at": "document_idle"
     }
   ]

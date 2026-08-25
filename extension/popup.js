@@ -54,6 +54,20 @@ async function sw(msg) {
   return resp.data || resp;
 }
 
+/** The content-script files, in manifest order.
+ *
+ * Read from the manifest rather than hardcoded, because there are TWO paths
+ * that inject them — the declarative `content_scripts` entry and the fallback
+ * below — and a hardcoded list silently disagreed with the manifest the moment
+ * `lib/sync.js` was added. The fallback then injected `content.js` alone, whose
+ * first act is to check for `PatmirSync` and bail, so the retry hit the very
+ * "Receiving end does not exist" it was trying to repair. One source of truth.
+ */
+function contentScriptFiles() {
+  const cs = (chrome.runtime.getManifest().content_scripts || [])[0];
+  return (cs && cs.js) || ["lib/sync.js", "content.js"];
+}
+
 async function tabMessage(tabId, msg) {
   try {
     return await chrome.tabs.sendMessage(tabId, msg);
@@ -62,8 +76,12 @@ async function tabMessage(tabId, msg) {
     if (!/Could not establish connection|Receiving end does not exist/i.test(m)) {
       throw e;
     }
+    // No listener in the tab. Normal after the extension is reloaded: content
+    // scripts are injected at page load, so already-open tabs are left with an
+    // orphaned script and no receiver. Inject and retry rather than making the
+    // viewer reload the page.
     try {
-      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+      await chrome.scripting.executeScript({ target: { tabId }, files: contentScriptFiles() });
     } catch (inj) {
       throw new Error("Content script could not be injected: " + String(inj.message || inj));
     }
