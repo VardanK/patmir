@@ -12,12 +12,15 @@ The loop, each tick:
 
   1. Read the latest playhead (a float seconds + paused flag) via `playhead_fn`.
   2. Ask `Coverage.first_uncovered(after=playhead)` for the nearest undubbed
-     point ahead of the viewer — that's the highest-priority section. If the
-     viewer is sitting in already-dubbed audio (or the whole tail ahead is
-     done), fall back to the earliest remaining gap anywhere (`after=0`) so we
-     still finish the video (and fully populate the rewatch cache).
-  3. `process_fn(start)` → a `SectionResult`; record its `[start, end)` in
-     coverage and emit it via `on_section`.
+     point ahead of the viewer — that's the highest-priority section. There is
+     deliberately NO fall back to the earliest gap anywhere: backfilling every
+     hole was the first build's behaviour and was removed on 2026-06-15 because
+     it dubbed the whole video regardless of what the viewer watched. (This step
+     used to claim otherwise; it never did it.)
+  3. `process_fn(start, max_end)` → a `SectionResult`; record its `[start, end)`
+     in coverage and emit it via `on_section`. `max_end` is where the next
+     already-dubbed run begins, so a window opened at a seek target cannot be
+     dubbed straight through work already done.
   4. Stop when coverage spans the whole duration or `stop()` is called.
 
 Everything heavy is injected (`process_fn`, `playhead_fn`), so the priority
@@ -67,7 +70,7 @@ class StreamScheduler:
         *,
         duration: float,
         prelude_end: float,
-        process_fn: Callable[[float], SectionResult | None],
+        process_fn: Callable[[float, float | None], SectionResult | None],
         playhead_fn: Callable[[], Playhead],
         on_section: Callable[[SectionResult], None] | None = None,
         section_seconds: float = 30.0,
@@ -109,10 +112,18 @@ class StreamScheduler:
     def stopped(self) -> bool:
         return self._stop.is_set()
 
-    def _next_start(self) -> float | None:
-        """Start time of the highest-priority section to dub now, or None if the
-        buffer is already full to `lookahead_seconds` past the playhead (so we
-        should idle rather than race ahead dubbing the whole video)."""
+    def _next_start(self) -> tuple[float, float | None] | None:
+        """`(start, max_end)` for the highest-priority section to dub now, or
+        None if the buffer is already full to `lookahead_seconds` past the
+        playhead (so we should idle rather than race ahead dubbing the whole
+        video).
+
+        `max_end` is where the next already-dubbed region begins, or None if
+        there is none ahead. Forward streaming never hits it — the next section
+        starts where the last one ended, so there is nothing in front. It bites
+        after a seek, which opens a window in a gap that can run straight
+        through work already done.
+        """
         ph = self.playhead_fn()
         target = self.coverage.first_uncovered(after=ph.t, until=self.duration - 1.0)
         if target is None:
@@ -120,7 +131,7 @@ class StreamScheduler:
         # Buffered far enough ahead of the viewer → don't dub further yet.
         if target > ph.t + self.lookahead_seconds:
             return None
-        return target
+        return target, self.coverage.next_covered_start(target)
 
     def _default_idle(self) -> bool:
         """Idle while caught up. End the stream if stopped or the viewer left.
@@ -142,20 +153,22 @@ class StreamScheduler:
         """Track the playhead, dubbing a bounded window ahead. Ends on stop(),
         viewer-abandonment, or when the rest of the video within range is done."""
         while not self._stop.is_set():
-            start = self._next_start()
-            if start is None:
+            nxt = self._next_start()
+            if nxt is None:
                 if not self._idle_fn():
                     break          # stopped or abandoned
                 continue           # caught up; wait for the playhead to advance
-            result = self.process_fn(start)
+            start, max_end = nxt
+            result = self.process_fn(start, max_end)
+            ceiling = self.duration if max_end is None else min(self.duration, max_end)
             if result is None:
                 # Processing failed for this window; force progress so we don't
                 # retry the same start forever.
-                self.coverage.add(start, start + _MIN_STEP)
+                self.coverage.add(start, min(start + _MIN_STEP, ceiling))
                 continue
             end = result.end
             if end <= start + 0.5:
-                end = min(start + self.section_seconds, self.duration)
+                end = min(start + self.section_seconds, ceiling)
             self.coverage.add(start, end)
             if self.on_section is not None and result.dub_wav is not None:
                 self.on_section(result)

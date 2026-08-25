@@ -42,9 +42,26 @@ two modes cache independently.
 - Quality: in-page Web Audio overlay with play / pause / seek / playbackRate following
 - Watch-along: chunked, offset-addressed Web Audio feed (`GET /stream/<key>/sections`,
   `/section/<i>.wav`), buffer-gated playback, playhead/seek/pause reporting
-  (`POST /stream/<key>/playhead`), and ±80 ms drift re-anchoring per section
+  (`POST /stream/<key>/playhead`)
+- Both modes: the page volume slider drives the dub and the page mute button mutes
+  it, while the original stays silenced no matter what the player does to `muted`
+- Both modes: continuous A/V drift correction on a shared 250 ms tick — audio only
+  starts once the picture is confirmed moving, small errors are walked out by an
+  inaudible resampling nudge, and a hard re-anchor needs three agreeing samples
 - Loopback-only server with bearer-token auth
 - Local files via `patmir submit <file>` CLI
+
+## Tests
+
+Pure decision logic (volume/mute arbitration, drift policy, section selection) lives
+in `lib/sync.js` so it can be tested without a browser:
+
+```
+node --test extension/tests/
+```
+
+No dependencies beyond Node itself. `lib/sync.js` is listed **before** `content.js` in
+the manifest's `content_scripts` and must stay that way.
 
 ## Not yet
 
@@ -57,5 +74,6 @@ two modes cache independently.
 ## Known gotchas
 
 - **Mixed content**: YouTube is HTTPS; `http://127.0.0.1` fetches are routed through the service worker (`sw.js`) because the page context blocks them. Audio bytes come back as `Uint8Array` via `chrome.runtime.sendMessage`.
-- **Drift**: slice 1 has no active correction. If `<video>.playbackRate` changes mid-clip the dub will drift; toggle Stop / Play to resync. Slice 2 adds an automatic correction loop.
-- **YouTube SPA navigation**: clicking from one video to the next does not re-trigger the content script. Reload the page to attach Patmir to the new video. Slice 2 will add a `yt-navigate-finish` listener.
+- **Drift**: corrected automatically (2026-08-25). `lib/sync.js` owns the policy — a dead band below 40 ms, a ±0.5 % resampling nudge up to 250 ms, and a hard re-anchor above that only after three agreeing samples. The thresholds are wider than the ±80 ms the original spec asked for on purpose: `video.currentTime` is coarsely quantized, and a hard re-anchor is an audible cut, so a tight threshold re-anchors on noise. Toggling Stop / Play is no longer needed.
+- **Volume**: while a dub is playing the `<video>` element is held muted and the page's slider drives a GainNode on the dub instead. The player's UI will therefore show the video as muted — that is deliberate, and the mute button still works (it mutes the dub).
+- **YouTube SPA navigation**: handled — `yt-navigate-finish` plus a 400 ms URL/element poll as a backstop for Shorts, which uses a recycler and swaps `<video>` elements without always firing the event.

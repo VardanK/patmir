@@ -7,6 +7,32 @@
 
 (function () {
   if (window.__patmirInjected) return;
+
+  // Pure decision logic, from lib/sync.js — which manifest.json lists BEFORE
+  // this file, since content scripts share one isolated world and load in
+  // order. This check has to happen HERE, before anything below is registered.
+  //
+  // It used to sit further down, after the message listener and the auto-play
+  // timers. Returning from there left a half-initialized module: function
+  // declarations hoist, so the listener could still reach `startDub`, but every
+  // `let` below the return was stranded in the temporal dead zone. Clicking
+  // Play then reported "Cannot access 'syncTickHandle' before initialization"
+  // instead of the reason — the guard produced exactly the confusing failure it
+  // was added to prevent. Bailing before any registration leaves nothing
+  // callable, so the only symptom is the message below.
+  //
+  // `__patmirInjected` is deliberately NOT set on this path, so a reload with
+  // the dependency present injects cleanly instead of being suppressed.
+  const S = globalThis.PatmirSync;
+  if (!S) {
+    console.error(
+      "[patmir] lib/sync.js did not load, so the dub overlay is disabled. " +
+      "manifest.json must list it before content.js in content_scripts.js — " +
+      "if you just updated the extension, hit Reload on chrome://extensions " +
+      "(a manifest change needs a full reload, not a page refresh).");
+    return;
+  }
+
   window.__patmirInjected = true;
 
   // --- state ----------------------------------------------------------
@@ -25,13 +51,29 @@
   let videoSrcAtStart = null;
   /** @type {string|null} */
   let urlAtStart = null;
+  /** @type {GainNode|null} */
+  let dubGain = null;
   /** @type {number|null} */
   let navWatchHandle = null;
-  let wasMuted = false;
-  let originalVolume = null;
+  // What the viewer wants from the page player, tracked via `volumechange`.
+  // While a dub is active we keep the element hard-muted -- the dub IS the
+  // audio track now -- so the element's own muted/volume stop expressing the
+  // viewer's intent and this does instead.
+  let viewer = { volume: 1, muted: false };
+  // `video.muted = true` writes we have issued and not yet seen echo back as a
+  // `volumechange`. See PatmirSync.resolveVolumeEvent for why this is a count
+  // and not a timeout.
+  let pendingForcedWrites = 0;
   let playing = false;
+  // Quality-mode playback anchor: the dub buffer position `audioStartOffset`
+  // was sounding at AudioContext time `audioStartCtxTime`, advancing at
+  // `currentSourceRate`. Integrating from here gives the audio's position now,
+  // which is what drift is measured against. (These three existed before but
+  // nothing ever read them -- the correction loop the D1 spec called for was
+  // never written.)
   let audioStartCtxTime = 0;
   let audioStartOffset = 0;
+  let currentSourceRate = 1;
 
   // --- message routing ------------------------------------------------
 
@@ -171,6 +213,141 @@
 
   // --- core playback --------------------------------------------------
 
+  // --- audio graph + volume ------------------------------------------
+  //
+  // Everything the dub plays goes through `dubGain`, whose level follows the
+  // page player's volume slider. Before this existed the graph was
+  // `BufferSource -> destination` and the only thing silencing the original was
+  // a one-shot `video.muted = true`, which YouTube's own unMute() cleared the
+  // moment the viewer touched the slider -- putting the original back
+  // underneath the dub.
+
+  function ensureAudioGraph() {
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (!dubGain) {
+      dubGain = audioCtx.createGain();
+      dubGain.connect(audioCtx.destination);
+    }
+    return audioCtx;
+  }
+
+  /** Where every dub source connects. */
+  function dubDestination() {
+    return dubGain || (audioCtx && audioCtx.destination) || null;
+  }
+
+  function applyDubGain() {
+    if (!dubGain || !audioCtx) return;
+    const g = S.dubGainFor(viewer.volume, viewer.muted);
+    // A slider drag fires a burst of events; stepping the gain discontinuously
+    // on each one clicks, so ramp.
+    try { dubGain.gain.setTargetAtTime(g, audioCtx.currentTime, 0.02); }
+    catch (_) { dubGain.gain.value = g; }
+  }
+
+  /** Force the element muted, counting the write so its `volumechange` echo can
+   * be told apart from the viewer touching the volume. Assigning `true` to an
+   * already-`true` `muted` fires no event, so that case must not be counted. */
+  function forceMute() {
+    if (!video || video.muted === true) return;
+    pendingForcedWrites++;
+    video.muted = true;
+  }
+
+  /** Take over the element's audio: capture what the viewer wanted, silence the
+   * original, point the dub's gain at that intent. */
+  function beginMuteControl() {
+    if (!video) return;
+    viewer = { volume: video.volume, muted: video.muted };
+    pendingForcedWrites = 0;
+    applyDubGain();
+    forceMute();
+  }
+
+  /** Hand the element's audio back, honouring whatever the viewer did to the
+   * volume while we held it. We never write `video.volume`, so the element
+   * already carries the right level -- only `muted` needs restoring, and to the
+   * viewer's intent rather than to whatever it was before we started. */
+  function endMuteControl() {
+    if (video) video.muted = viewer.muted;
+    pendingForcedWrites = 0;
+  }
+
+  function onVolumeChange() {
+    if (!video) return;
+    const r = S.resolveVolumeEvent(
+      { volume: video.volume, muted: video.muted }, pendingForcedWrites, viewer);
+    pendingForcedWrites = r.pendingForcedWrites;
+    if (r.consumedEcho) return;
+    viewer = r.viewer;
+    applyDubGain();
+    if (r.needsForceMute) forceMute();
+  }
+
+  // --- shared A/V sync engine ----------------------------------------
+  //
+  // One 250 ms tick drives both modes. Each tick asks two questions: is the
+  // picture actually moving (if not, do not start audio into a frozen frame --
+  // that is the seek bug), and how far has the audio drifted from the playhead.
+  // The correction policy lives in PatmirSync.driftDecision.
+
+  const SYNC_TICK_MS = 250;
+  const DRIFT_WINDOW = 5;         // samples the median is taken over
+
+  let syncTickHandle = null;
+  let lastTickCurrentTime = null; // video.currentTime at the previous tick
+  let driftSamples = [];
+  let rateNudge = 1;              // multiplier applied on top of video.playbackRate
+
+  /** Forget the drift history and re-seed the progress detector. Called from
+   * every event that invalidates the anchor: play, pause, seek, stall, rate
+   * change. Seeding from the CURRENT time rather than null means the very next
+   * tick can already tell whether the picture moved -- one tick of latency
+   * before audio resumes, not two. */
+  function resetSyncWindow() {
+    lastTickCurrentTime = (video && isFinite(video.currentTime)) ? video.currentTime : null;
+    driftSamples = [];
+    rateNudge = 1;
+  }
+
+  /** Did the picture move since the last tick? null when there is nothing to
+   * compare against yet. */
+  function sampleAdvance() {
+    if (!video) return null;
+    const c = video.currentTime;
+    const prev = lastTickCurrentTime;
+    lastTickCurrentTime = c;
+    if (prev === null) return null;
+    return c > prev;
+  }
+
+  function pushDrift(d) {
+    driftSamples.push(d);
+    if (driftSamples.length > DRIFT_WINDOW) driftSamples.shift();
+  }
+
+  function videoIsProgressing(advanced) {
+    if (!video) return false;
+    return S.shouldScheduleAudio({
+      paused: video.paused, seeking: video.seeking,
+      readyState: video.readyState, advanced: advanced,
+    });
+  }
+
+  function startSyncTick() {
+    if (syncTickHandle === null) syncTickHandle = setInterval(syncTick, SYNC_TICK_MS);
+  }
+
+  function stopSyncTick() {
+    if (syncTickHandle !== null) { clearInterval(syncTickHandle); syncTickHandle = null; }
+    resetSyncWindow();
+  }
+
+  function syncTick() {
+    if (waActive) { watchAlongTick(); return; }
+    if (playing) qualityTick();
+  }
+
   function findVideo() {
     // YouTube's primary player is the largest, longest-duration <video> on
     // the page. The thumbnail-preview <video> elements are short and tiny.
@@ -185,7 +362,7 @@
     video = findVideo();
     if (!video) throw new Error("No playable <video> element found on this page.");
 
-    if (!audioCtx) audioCtx = new AudioContext();
+    ensureAudioGraph();
 
     // Refetch + redecode if the user is dubbing a different video than the
     // last one we loaded. Without this the same dub plays for any video the
@@ -206,28 +383,22 @@
     videoSrcAtStart = video.currentSrc || video.src || null;
     urlAtStart = window.location.href;
 
-    // Mute (don't zero volume — leave that to the user).
-    wasMuted = video.muted;
-    if (originalVolume === null) originalVolume = video.volume;
-    video.muted = true;
+    beginMuteControl();
 
     attachVideoListeners();
     attachNavigationListeners();
-    if (!video.paused) {
-      startSourceAt(video.currentTime);
-    }
     playing = true;
+    // Audio starts from the tick, once the picture is confirmed moving.
+    resetSyncWindow();
+    startSyncTick();
   }
 
   function stopDub() {
-    if (dubSource) {
-      try { dubSource.stop(); } catch (_) { /* already stopped */ }
-      dubSource = null;
-    }
+    stopSyncTick();
+    stopDubSource();
     if (video) {
       detachVideoListeners();
-      video.muted = wasMuted;
-      if (originalVolume !== null) video.volume = originalVolume;
+      endMuteControl();
     }
     detachNavigationListeners();
     videoSrcAtStart = null;
@@ -235,20 +406,75 @@
     playing = false;
   }
 
+  function stopDubSource() {
+    if (dubSource) {
+      try { dubSource.stop(); } catch (_) { /* already stopped */ }
+      dubSource = null;
+    }
+  }
+
   function startSourceAt(offset) {
     if (!dubBuffer || !audioCtx) return;
-    if (dubSource) {
-      try { dubSource.stop(); } catch (_) { /* ok */ }
-    }
+    stopDubSource();
     const src = audioCtx.createBufferSource();
     src.buffer = dubBuffer;
-    src.playbackRate.value = (video && video.playbackRate) || 1.0;
-    src.connect(audioCtx.destination);
+    // A hard re-anchor lands us exactly on the playhead, so any accumulated
+    // nudge has done its job and goes back to unity.
+    rateNudge = 1;
+    currentSourceRate = (video && video.playbackRate) || 1.0;
+    src.playbackRate.value = currentSourceRate;
+    src.connect(dubDestination());
     const clipped = Math.max(0, Math.min(offset, dubBuffer.duration - 0.001));
     src.start(0, clipped);
     audioStartCtxTime = audioCtx.currentTime;
     audioStartOffset = clipped;
     dubSource = src;
+    driftSamples = [];
+  }
+
+  /** Resample the dub slightly so a small error walks itself out, instead of
+   * taking the audible cut a re-anchor costs. The anchor has to move with it:
+   * `audioStartOffset` is integrated at the OLD rate up to now, then the clock
+   * restarts from here at the new one. */
+  function applyRateNudge(baseRate, multiplier) {
+    if (!dubSource || !audioCtx) return;
+    const now = audioCtx.currentTime;
+    audioStartOffset = audioStartOffset + (now - audioStartCtxTime) * currentSourceRate;
+    audioStartCtxTime = now;
+    currentSourceRate = baseRate * multiplier;
+    rateNudge = multiplier;
+    try { dubSource.playbackRate.setValueAtTime(currentSourceRate, now); }
+    catch (_) { /* ok */ }
+  }
+
+  function qualityTick() {
+    if (!video || !audioCtx || !dubBuffer) return;
+    const advanced = sampleAdvance();
+    const rate = video.playbackRate || 1.0;
+
+    if (!videoIsProgressing(advanced)) {
+      // Paused, seeking, under-buffered, or the clock is frozen mid-stall.
+      // Silence rather than let the dub run on past a still picture -- that is
+      // precisely how a seek used to leave the two permanently offset.
+      stopDubSource();
+      driftSamples = [];
+      return;
+    }
+
+    if (!dubSource) { startSourceAt(video.currentTime); return; }
+
+    const actual = audioStartOffset +
+      (audioCtx.currentTime - audioStartCtxTime) * currentSourceRate;
+    pushDrift(video.currentTime - actual);
+
+    const d = S.driftDecision(driftSamples);
+    if (d.action === "reanchor") {
+      startSourceAt(video.currentTime);
+    } else if (d.action === "nudge") {
+      applyRateNudge(rate, d.rateMultiplier);
+    } else if (rateNudge !== 1) {
+      applyRateNudge(rate, 1);      // back inside the dead band; stop nudging
+    }
   }
 
   // --- video event wiring --------------------------------------------
@@ -264,30 +490,27 @@
     }
   }
 
+  // Every one of these invalidates the anchor, so they stop the audio and clear
+  // the drift history; `qualityTick` restarts it once the picture is confirmed
+  // moving again. `seeked` deliberately does NOT start audio itself -- the
+  // element reports a healthy readyState there while the frame is still frozen,
+  // and starting then is what left the dub permanently ahead.
   const handlers = {
     play() {
       if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
-      if (video) startSourceAt(video.currentTime);
+      resetSyncWindow();
     },
-    pause() {
-      if (dubSource) {
-        try { dubSource.stop(); } catch (_) { /* ok */ }
-        dubSource = null;
-      }
-    },
-    seeked() {
-      if (video && !video.paused) startSourceAt(video.currentTime);
-    },
-    ratechange() {
-      if (dubSource && video && audioCtx) {
-        try {
-          dubSource.playbackRate.setValueAtTime(video.playbackRate, audioCtx.currentTime);
-        } catch (_) { /* ok */ }
-      }
-    },
+    pause() { stopDubSource(); resetSyncWindow(); },
+    seeking() { stopDubSource(); resetSyncWindow(); },
+    seeked() { resetSyncWindow(); },
+    waiting() { stopDubSource(); resetSyncWindow(); },
+    stalled() { stopDubSource(); resetSyncWindow(); },
+    playing() { resetSyncWindow(); },
+    ratechange() { stopDubSource(); resetSyncWindow(); },
     ended() {
       stopDub();
     },
+    volumechange: onVolumeChange,
     emptied: onVideoSourceChanged,
     loadstart: onVideoSourceChanged,
   };
@@ -380,7 +603,6 @@
   let waSections = new Map();
   let waComplete = false;
   let waPollHandle = null;
-  let waTickHandle = null;
   let waDesiredPlaying = false;   // does the user want playback right now?
   // Guard so our own buffering-pause isn't mistaken for a user pause. The
   // <video> 'pause' event fires ASYNCHRONOUSLY after video.pause(), so this is
@@ -390,12 +612,15 @@
   let waLastPlayheadPost = 0;
 
   const WA_LOOKAHEAD = 15;        // seconds of sections to prefetch ahead of playhead
-  const WA_DRIFT = 0.08;          // ±80 ms sync tolerance before we re-anchor a node
+  // Drift tolerance is no longer a single flat number here -- it lives in
+  // PatmirSync.driftDecision, shared with quality mode. A flat 80 ms against a
+  // coarsely-quantized `currentTime` re-anchored on noise, and a re-anchor
+  // stops and restarts the node, which is audible.
 
   async function startWatchAlong(cacheKey) {
     video = findVideo();
     if (!video) throw new Error("No playable <video> element found on this page.");
-    if (!audioCtx) audioCtx = new AudioContext();
+    ensureAudioGraph();
 
     waActive = true;
     waCacheKey = cacheKey;
@@ -404,9 +629,7 @@
     urlAtStart = window.location.href;
     videoSrcAtStart = video.currentSrc || video.src || null;
 
-    wasMuted = video.muted;
-    if (originalVolume === null) originalVolume = video.volume;
-    video.muted = true;
+    beginMuteControl();
 
     waDesiredPlaying = !video.paused;
     waBuffering = false;
@@ -414,9 +637,9 @@
     attachWatchAlongListeners();
     attachNavigationListeners();
     if (waPollHandle === null) waPollHandle = setInterval(pollWatchAlongSections, 2000);
-    if (waTickHandle === null) waTickHandle = setInterval(watchAlongTick, 250);
+    resetSyncWindow();
+    startSyncTick();
     pollWatchAlongSections();
-    watchAlongTick();
   }
 
   function stopWatchAlong() {
@@ -432,11 +655,10 @@
     }
     waSections.clear();
     if (waPollHandle !== null) { clearInterval(waPollHandle); waPollHandle = null; }
-    if (waTickHandle !== null) { clearInterval(waTickHandle); waTickHandle = null; }
+    stopSyncTick();
     if (video) {
       detachWatchAlongListeners();
-      video.muted = wasMuted;
-      if (originalVolume !== null) video.volume = originalVolume;
+      endMuteControl();
     }
     detachNavigationListeners();
     waActive = false;
@@ -459,6 +681,15 @@
     for (const s of data.sections || []) {
       const existing = waSections.get(s.index);
       if (existing) {
+        // An index can be RE-POINTED: a resumed stream restarts its counter, so
+        // section_001.wav can come back describing a different span entirely.
+        // Keeping the already-decoded buffer then plays one part of the film
+        // over another. Drop it and refetch.
+        if (existing.start !== s.start || existing.end !== s.end || existing.file !== s.file) {
+          if (existing.node) { try { existing.node.stop(); } catch (_) { /* ok */ } existing.node = null; }
+          existing.buffer = null;
+          existing.fetching = false;
+        }
         existing.start = s.start; existing.end = s.end; existing.file = s.file;
       } else {
         waSections.set(s.index, {
@@ -466,6 +697,15 @@
           buffer: null, fetching: false, node: null, startCtx: 0, startOffset: 0, rate: 1,
         });
       }
+    }
+    // Evict entries the manifest no longer lists (deduplicated away server
+    // side); otherwise they linger forever and can still be picked.
+    const live = new Set((data.sections || []).map((x) => x.index));
+    for (const idx of Array.from(waSections.keys())) {
+      if (live.has(idx)) continue;
+      const gone = waSections.get(idx);
+      if (gone && gone.node) { try { gone.node.stop(); } catch (_) { /* ok */ } }
+      waSections.delete(idx);
     }
     // Stop polling once the whole video is on disk (rewatch / completed stream).
     if (waComplete && waPollHandle !== null) {
@@ -488,11 +728,27 @@
     finally { sec.fetching = false; }
   }
 
-  function sectionAt(c) {
+  /** The section that should sound at global time `c`.
+   *
+   * Delegates the choice to PatmirSync.pickSection, which prefers the LATEST
+   * start covering `c` (sections overlap after a seek, and the Map is in
+   * poll-arrival order, so "first match" picked between two renderings of the
+   * same dialogue at random) and skips a section whose decoded audio is already
+   * exhausted at `c` (a section's WAV can be shorter than its declared span). */
+  function sectionView() {
+    const view = [];
     for (const sec of waSections.values()) {
-      if (sec.start - 0.05 <= c && c < sec.end) return sec;
+      view.push({
+        index: sec.index, start: sec.start, end: sec.end,
+        duration: sec.buffer ? sec.buffer.duration : null,
+      });
     }
-    return null;
+    return view;
+  }
+
+  function pickPlayableSection(view, c) {
+    const chosen = S.pickSection(view, c);
+    return chosen ? waSections.get(chosen.index) : null;
   }
 
   function scheduleNode(sec, c, rate) {
@@ -506,8 +762,10 @@
     const now = audioCtx.currentTime;
     const src = audioCtx.createBufferSource();
     src.buffer = sec.buffer;
+    rateNudge = 1;                 // a hard re-anchor lands on the playhead exactly
+    driftSamples = [];
     src.playbackRate.value = rate;
-    src.connect(audioCtx.destination);
+    src.connect(dubDestination());
     let when, startOffset;
     if (c >= sec.start) { when = now; startOffset = offset; }
     else { when = now + (sec.start - c) / rate; startOffset = 0; }
@@ -516,14 +774,34 @@
     sec.node = src; sec.startCtx = when; sec.startOffset = startOffset; sec.rate = rate;
   }
 
+  /** Resample one section's node, moving its anchor with it -- the section
+   * equivalent of `applyRateNudge`. */
+  function nudgeNodeRate(sec, baseRate, multiplier) {
+    if (!sec.node || !audioCtx) return;
+    const now = audioCtx.currentTime;
+    sec.startOffset = sec.startOffset + (now - sec.startCtx) * sec.rate;
+    sec.startCtx = now;
+    sec.rate = baseRate * multiplier;
+    rateNudge = multiplier;
+    try { sec.node.playbackRate.setValueAtTime(sec.rate, now); } catch (_) { /* ok */ }
+  }
+
   function ensureScheduled(sec, c, rate) {
     if (!sec.buffer || !audioCtx) return;
     if (!sec.node) { scheduleNode(sec, c, rate); return; }
-    // Drift / rate check against the video playhead — re-anchor if off.
+    if (sec.rate !== rate * rateNudge) { scheduleNode(sec, c, rate); return; }
+
     const expected = c - sec.start;
     const actual = sec.startOffset + (audioCtx.currentTime - sec.startCtx) * sec.rate;
-    if (sec.rate !== rate || Math.abs(expected - actual) > WA_DRIFT) {
+    pushDrift(expected - actual);
+
+    const d = S.driftDecision(driftSamples);
+    if (d.action === "reanchor") {
       scheduleNode(sec, c, rate);
+    } else if (d.action === "nudge") {
+      nudgeNodeRate(sec, rate, d.rateMultiplier);
+    } else if (rateNudge !== 1) {
+      nudgeNodeRate(sec, rate, 1);
     }
   }
 
@@ -537,6 +815,7 @@
     if (!waActive || !video) return;
     const c = video.currentTime;
     const rate = video.playbackRate || 1.0;
+    const advanced = sampleAdvance();
 
     // Prefetch the current + upcoming sections.
     for (const sec of waSections.values()) {
@@ -545,21 +824,40 @@
 
     if (!waDesiredPlaying) return;
 
-    const cur = sectionAt(c);
-    if (!cur || !cur.buffer) {
-      // Underrun: the dub for the playhead isn't produced yet (still in the
-      // prelude, or the stream hasn't reached here). Freeze the video and
-      // silence any tail node; a later tick resumes once the section lands.
-      waBuffering = true;
+    const view = sectionView();
+    const cur = pickPlayableSection(view, c);
+    const usable = cur && cur.buffer && cur.start - S.SECTION_LEAD <= c && c < cur.end;
+    if (!usable) {
       stopAllNodes();
-      waPause();
-      reportPlayhead(true);
+      driftSamples = [];
+      if (S.isCovered(view, c)) {
+        // A section claims this second but has no audio to give -- its WAV came
+        // out shorter than its declared span. Nothing to play, but nothing to
+        // wait for either: pausing would WEDGE, because the playhead has to
+        // move past the short section before the next one becomes current.
+        waBuffering = false;
+        reportPlayhead(false);
+      } else {
+        // Genuine underrun: the dub for this point isn't produced yet. Freeze
+        // the video; a later tick resumes once the section lands.
+        waBuffering = true;
+        waPause();
+        reportPlayhead(true);
+      }
       return;
     }
     waBuffering = false;
     // Resume if we (or a stalled autoplay) left the video paused while the
     // user still wants to watch.
-    if (video.paused) waPlay();
+    if (video.paused) { waPlay(); resetSyncWindow(); reportPlayhead(false); return; }
+    if (!videoIsProgressing(advanced)) {
+      // Just resumed, seeking, or re-buffering: the frame is still frozen.
+      // Starting audio now offsets it by the length of the stall.
+      stopAllNodes();
+      driftSamples = [];
+      reportPlayhead(false);
+      return;
+    }
     ensureScheduled(cur, c, rate);
     reportPlayhead(false);
   }
@@ -595,27 +893,28 @@
     play() {
       if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
       waDesiredPlaying = true;
+      resetSyncWindow();
       reportPlayhead(true);
-      watchAlongTick();
     },
     pause() {
       if (waProgrammatic) { waProgrammatic = false; return; }  // our buffering-pause
       waDesiredPlaying = false;
       stopAllNodes();
+      resetSyncWindow();
       reportPlayhead(true);
     },
+    seeking() { stopAllNodes(); resetSyncWindow(); },
     seeked() {
       stopAllNodes();
+      resetSyncWindow();
       reportPlayhead(true);
-      watchAlongTick();
     },
-    ratechange() {
-      const c = video ? video.currentTime : 0;
-      const rate = video ? (video.playbackRate || 1) : 1;
-      const cur = sectionAt(c);
-      if (cur) scheduleNode(cur, c, rate);
-    },
+    waiting() { stopAllNodes(); resetSyncWindow(); },
+    stalled() { stopAllNodes(); resetSyncWindow(); },
+    playing() { resetSyncWindow(); },
+    ratechange() { stopAllNodes(); resetSyncWindow(); },
     ended() { stopWatchAlong(); },
+    volumechange: onVolumeChange,
     emptied: onVideoSourceChangedWA,
     loadstart: onVideoSourceChangedWA,
   };

@@ -484,14 +484,14 @@ class StreamManager:
         # played at 154.9 s and 190.3 s, live and on every rewatch.
         index_counter = {"n": _index_seed(prior, opening.index)}
 
-        def _process(start: float) -> SectionResult | None:
+        def _process(start: float, max_end: float | None = None) -> SectionResult | None:
             index_counter["n"] += 1
             try:
                 return process_section(
                     local_path, cfg, prelude.registry,
                     index=index_counter["n"], start=start, runs_root=self._runs_root,
                     stage_cache=stage_cache, cancel=cancel,
-                    source_lang=prelude.source_lang,
+                    source_lang=prelude.source_lang, max_end=max_end,
                 )
             except JobCancelled:
                 # MUST propagate. This except-Exception used to swallow it and

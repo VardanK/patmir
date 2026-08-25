@@ -66,6 +66,24 @@ class Coverage:
             return None
         return t
 
+    def next_covered_start(self, after: float) -> float | None:
+        """Start of the earliest covered run beginning strictly after `after`.
+
+        The clamp the scheduler needs. `first_uncovered` says where to *begin* a
+        section; it says nothing about where that section must *stop*, so a
+        window opened at a seek target runs its full ~35s straight through an
+        already-dubbed region. Both renderings of those seconds then land in the
+        manifest (`append_section` only de-duplicates starts within 0.5s), and
+        the client has to choose between them — heard as a repeated or skipped
+        line at the join.
+
+        Returns None when nothing is covered ahead, i.e. no clamp applies.
+        """
+        for s, _e in self._intervals:
+            if s > after:
+                return s
+        return None
+
     def is_complete(self, duration: float, *, tail_tolerance: float = 1.0) -> bool:
         """True if `[0, duration)` is fully dubbed (within `tail_tolerance` of
         the end — the final VAD-snapped section rarely lands exactly on EOF)."""
