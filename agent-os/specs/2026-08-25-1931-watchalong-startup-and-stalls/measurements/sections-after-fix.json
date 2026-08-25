@@ -1,0 +1,150 @@
+{
+  "cache_key": "d5af5653d745ed66",
+  "cache_version": 1,
+  "mode": "watch-along",
+  "source_id": "url:yt:os-jXiYRihI",
+  "source_url": "https://www.youtube.com/watch?v=os-jXiYRihI",
+  "duration": 1297.021,
+  "complete": false,
+  "created_at": 1787679673.6443589,
+  "pipeline": {
+    "ingest": {
+      "id": "ffmpeg"
+    },
+    "separate": {
+      "id": "htdemucs_fast"
+    },
+    "diarize": {
+      "id": "sortformer_nemo"
+    },
+    "emotion": {
+      "id": "emotion2vec_plus_base"
+    },
+    "asr": {
+      "id": "qwen3_asr_1_7b"
+    },
+    "translate": {
+      "id": "openrouter_gemini_flash_batch"
+    },
+    "tts": {
+      "id": "higgs_v3_torch_bf16"
+    },
+    "mux": {
+      "id": "ffmpeg_pad_stretch"
+    },
+    "output": {
+      "id": "mkv_default"
+    }
+  },
+  "sections": [
+    {
+      "index": 0,
+      "start": 0.0,
+      "end": 39.993,
+      "section_s": 39.99,
+      "wall_s": 36.36,
+      "analysis_wall_s": 8.8,
+      "dub_wall_s": 35.58,
+      "build_s": 0.0,
+      "rtf": 0.909,
+      "stage_wall_s": {
+        "ingest": 0.12,
+        "separate": 1.78,
+        "diarize": 0.56,
+        "emotion": 0.37,
+        "asr": 5.97,
+        "translate": 3.83,
+        "tts": 30.53,
+        "mux": 1.22,
+        "output": 0.0
+      },
+      "new_speakers": [
+        "SPEAKER_00"
+      ],
+      "other_s": 0.0,
+      "produced_at": 1787679726.191,
+      "file": "section_000.wav"
+    },
+    {
+      "index": 1,
+      "start": 39.993,
+      "end": 76.493,
+      "section_s": 36.5,
+      "wall_s": 42.23,
+      "analysis_wall_s": 5.89,
+      "dub_wall_s": 33.22,
+      "build_s": 0.0,
+      "rtf": 1.157,
+      "stage_wall_s": {
+        "ingest": 0.11,
+        "separate": 1.45,
+        "diarize": 0.28,
+        "emotion": 0.21,
+        "asr": 3.83,
+        "translate": 3.52,
+        "tts": 28.33,
+        "mux": 1.37,
+        "output": 0.0
+      },
+      "new_speakers": [],
+      "other_s": 3.11,
+      "buffer_ahead_s": 76.49,
+      "produced_at": 1787679768.423,
+      "file": "section_001.wav"
+    },
+    {
+      "index": 2,
+      "start": 76.493,
+      "end": 112.993,
+      "section_s": 36.5,
+      "wall_s": 32.24,
+      "analysis_wall_s": 5.53,
+      "dub_wall_s": 23.61,
+      "build_s": 0.0,
+      "rtf": 0.883,
+      "stage_wall_s": {
+        "ingest": 0.12,
+        "separate": 1.43,
+        "diarize": 0.28,
+        "emotion": 0.17,
+        "asr": 3.53,
+        "translate": 3.16,
+        "tts": 19.57,
+        "mux": 0.88,
+        "output": 0.0
+      },
+      "new_speakers": [],
+      "other_s": 3.1,
+      "buffer_ahead_s": 112.99,
+      "produced_at": 1787679800.669,
+      "file": "section_002.wav"
+    },
+    {
+      "index": 3,
+      "start": 112.993,
+      "end": 149.493,
+      "section_s": 36.5,
+      "wall_s": 39.36,
+      "analysis_wall_s": 5.29,
+      "dub_wall_s": 31.01,
+      "build_s": 0.0,
+      "rtf": 1.078,
+      "stage_wall_s": {
+        "ingest": 0.12,
+        "separate": 1.37,
+        "diarize": 0.28,
+        "emotion": 0.18,
+        "asr": 3.33,
+        "translate": 3.99,
+        "tts": 26.03,
+        "mux": 0.99,
+        "output": 0.0
+      },
+      "new_speakers": [],
+      "other_s": 3.06,
+      "buffer_ahead_s": 149.49,
+      "produced_at": 1787679840.031,
+      "file": "section_003.wav"
+    }
+  ]
+}

@@ -26,6 +26,7 @@ import json
 import subprocess
 import tempfile
 import threading
+from time import perf_counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -58,6 +59,10 @@ class SectionResult:
     job_dir: Path
     local_to_global: dict[str, str] = field(default_factory=dict)
     new_speakers: list[str] = field(default_factory=list)
+    # Wall seconds for the whole section, INCLUDING the work no stage owns
+    # (ffmpeg slice/trim, ECAPA embed, age-gender profile). Set by the two
+    # producers below so the live path and bench read one number, not two.
+    wall_s: float | None = None
 
 
 def _slice_audio(source: Path, start: float, duration: float, dest: Path) -> None:
@@ -152,6 +157,7 @@ def dub_prelude_window(
     runs_root: Path | None = None,
     stage_cache: dict | None = None,
     cancel: threading.Event | None = None,
+    bench: bool = False,
 ) -> SectionResult:
     """Produce the opening dub for the prelude window, reusing the prelude's
     already-completed analysis (no second Demucs/Scribe pass).
@@ -163,6 +169,7 @@ def dub_prelude_window(
     the streaming runner picks up at `window_end`.
     """
     runs_root = runs_root or cfg.storage.runs_root
+    t0 = perf_counter()
     job_dir = prelude.job_dir
     end_rel = prelude.window_end
 
@@ -176,6 +183,10 @@ def dub_prelude_window(
             "voice_assignments": prelude.registry.assignments(),
             "locked_refs": prelude.registry.locked_refs(),
             "speaker_profiles": prelude.registry.profiles(),
+            # Makes the tts/translate adapters write timings.jsonl. Watch-along
+            # never set it, which is why BenchResult.tts/.translate were
+            # hard-coded None for this mode.
+            **({"bench": True} if bench else {}),
         },
         stage_cache=stage_cache,
         cancel=cancel,
@@ -191,6 +202,7 @@ def dub_prelude_window(
     return SectionResult(
         index=0, start=0.0, end=end_rel, dub_wav=out_chunk, job_dir=job_dir,
         local_to_global={}, new_speakers=list(prelude.registry.known_speakers()),
+        wall_s=perf_counter() - t0,
     )
 
 
@@ -206,15 +218,24 @@ def process_section(
     runs_root: Path | None = None,
     stage_cache: dict | None = None,
     cancel: threading.Event | None = None,
+    bench: bool = False,
+    source_lang: str | None = None,
 ) -> SectionResult:
     runs_root = runs_root or cfg.storage.runs_root
+    t0 = perf_counter()
     slice_len = target_seconds + pad_seconds
 
     with tempfile.TemporaryDirectory(prefix=f"patmir-sec{index}-") as tmp:
         slice_wav = Path(tmp) / "section.wav"
         _slice_audio(source, start, slice_len, slice_wav)
         manifest = run_job(slice_wav, cfg, runs_root=runs_root, stop_after="asr",
-                           stage_cache=stage_cache, cancel=cancel)
+                           stage_cache=stage_cache, cancel=cancel,
+                           extra={"bench": True} if bench else None,
+                           # Skip ASR's per-section language probe (3.5-4.6 s
+                           # measured, 12-15% of section wall). The prelude
+                           # already detected it on the same soundtrack; ASR
+                           # short-circuits when ctx.source_lang is set.
+                           source_lang=source_lang)
         job_dir = runs_root / manifest.job_id
 
     # VAD-snap the section end (slice-relative). Snap as far into the padded
@@ -241,6 +262,7 @@ def process_section(
             "voice_assignments": registry.assignments(),
             "locked_refs": registry.locked_refs(),
             "speaker_profiles": registry.profiles(),
+            **({"bench": True} if bench else {}),
         },
         stage_cache=stage_cache,
     )
@@ -260,4 +282,5 @@ def process_section(
         job_dir=job_dir,
         local_to_global=mapping,
         new_speakers=new_speakers,
+        wall_s=perf_counter() - t0,
     )

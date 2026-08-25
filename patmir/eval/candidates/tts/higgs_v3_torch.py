@@ -215,8 +215,38 @@ def _sample_codes(logits_NV: Any, *, temperature: float, top_p: float | None,
         num_samples=1, generator=generator).squeeze(-1)
 
 
-def _chunks(items: list[int], size: int) -> list[list[int]]:
-    return [items[i:i + size] for i in range(0, len(items), size)]
+def _balanced_chunks(items: list[int], size: int) -> list[list[int]]:
+    """Split into the FEWEST chunks of at most `size`, balanced in length.
+
+    A chunk costs `max(steps)` over its rows, so a greedy fixed-size split is
+    actively harmful at the tail: with 9 cap-sorted requests and `size=8` it
+    yields [8, 1], and that final chunk is the single LONGEST line paying a full
+    chunk on its own. Measured on the author's 2026-08-25 prelude: a batch of 8
+    took 24.3 s and the trailing batch of 1 took **17.3 s**, 42% of the whole
+    TTS stage for one sentence.
+
+    Balancing gives [5, 4] instead. Same number of chunks and the same memory
+    ceiling (no chunk exceeds `size`), but the first chunk's cost drops from
+    "cap of the 8th-shortest" to "cap of the 5th-shortest" while the last chunk
+    is dominated by the longest line either way. Because chunks stay contiguous
+    slices of the cap-sorted order and every boundary moves earlier or stays
+    put, the total is never worse than the greedy split and is usually better.
+
+    Agrees with a greedy split whenever `size` divides the input evenly, so the
+    common full-batch case is unchanged.
+    """
+    n = len(items)
+    if n == 0:
+        return []
+    n_chunks = -(-n // size)          # ceil
+    base, rem = divmod(n, n_chunks)
+    out: list[list[int]] = []
+    i = 0
+    for c in range(n_chunks):
+        take = base + (1 if c < rem else 0)
+        out.append(items[i:i + take])
+        i += take
+    return out
 
 
 # The parameter `audio_head.weight` is tied to. Fixed by the checkpoint: its
@@ -624,7 +654,7 @@ class HiggsV3Torch:
         # Sort by cap before chunking: a chunk costs max(steps), not mean, so
         # grouping similar lengths is what makes batching pay.
         order = sorted(range(len(prepared)), key=lambda i: prepared[i].cap)
-        for chunk in _chunks(order, self.tts_max_batch):
+        for chunk in _balanced_chunks(order, self.tts_max_batch):
             started = time.perf_counter()
             pending = list(chunk)
             for attempt in range(self.max_retries + 1):

@@ -101,7 +101,15 @@ def main(argv: list[str] | None = None) -> int:
         "bench",
         help="Benchmark the pipeline: per-stage wall + RTF for a clip.",
     )
-    p_bench.add_argument("clip", type=Path)
+    p_bench.add_argument("clip", type=Path, nargs="?", default=None,
+                         help="Local media file. Omit it and pass --url instead.")
+    p_bench.add_argument("--url", type=str, default=None,
+                         help="Benchmark a URL the way the server does: yt-dlp "
+                              "pre-download into <downloads_root>/<cache_key>/, then "
+                              "run the pipeline on that file. Reuses an existing "
+                              "download, so re-benching the same URL does not refetch. "
+                              "Without this, bench took a local file only — so the "
+                              "video a user actually reported could not be measured.")
     p_bench.add_argument("--mode", choices=["batch", "watch-along"], default="batch")
     p_bench.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     p_bench.add_argument("--repeat", type=int, default=1,
@@ -116,6 +124,27 @@ def main(argv: list[str] | None = None) -> int:
                               "resident risks OOM; every reported repeat is then cold.")
     p_bench.add_argument("--max-sections", type=int, default=None,
                          help="watch-along only: cap the number of sections processed.")
+    p_bench.add_argument("--forward-loop", dest="scheduler",
+                         action="store_false", default=True,
+                         help="watch-along only: walk sections with a straight-line "
+                              "loop instead of driving StreamScheduler. The loop cannot "
+                              "stall, seek or idle, so it does not measure the live "
+                              "path — kept because every stored baseline used it.")
+    p_bench.add_argument("--playhead", choices=["greedy", "realtime"], default="greedy",
+                         help="watch-along + scheduler only. greedy: the viewer sits at "
+                              "the buffer edge, so wall time is pure production "
+                              "throughput. realtime: the viewer advances with the clock "
+                              "and stalls when production falls behind, which COUNTS "
+                              "the freezes — but costs about one video-duration of wall "
+                              "time, so pair it with --max-sections.")
+    p_bench.add_argument("--prewarm", action="store_true", default=False,
+                         help="watch-along only: prewarm the stage cache before the "
+                              "prelude, the way a live server does at boot. Off by "
+                              "default so stored baselines stay comparable.")
+    p_bench.add_argument("--no-traces", dest="traces",
+                         action="store_false", default=True,
+                         help="watch-along only: skip the per-sentence tts/translate "
+                              "timings.jsonl traces.")
     p_bench.add_argument("--report", type=Path, default=None,
                          help="Write machine-readable bench.json to this path.")
     p_bench.add_argument("--label", type=str, default=None)
@@ -270,17 +299,50 @@ def cmd_ui(port: int, runs_root: Path | None, config: Path) -> int:
     return 0
 
 
+def _bench_fetch_url(url: str, cfg, config_path: Path, mode: str) -> Path:
+    """Resolve a URL to a local file the way the server does.
+
+    Reuses `JobManager._download_url` rather than reimplementing yt-dlp, and
+    derives the SAME cache key the server would, so a video already fetched by
+    a real submission is reused instead of downloaded again. Constructing a
+    JobManager is cheap — it builds no models.
+    """
+    from patmir.ui import cache as cache_mod
+    from patmir.ui.jobs import JobManager
+
+    source_id = cache_mod.source_id_for_url(url)
+    if mode == "watch-along":
+        from patmir.pipeline.streaming.runner import streaming_config
+        key = cache_mod.cache_key(source_id, streaming_config(config_path), "watch-along")
+    else:
+        key = cache_mod.cache_key(source_id, cfg)
+    jm = JobManager(cfg, storage=cfg.storage)
+    print(f"resolving {url} (cache key {key})", file=sys.stderr)
+    return jm._download_url(url, key)
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
-    if not args.clip.exists():
-        print(f"error: {args.clip} not found", file=sys.stderr)
-        return 2
     if not _require_config(args.config):
+        return 2
+    if bool(args.clip) == bool(args.url):
+        print("error: pass either a clip path or --url, not both", file=sys.stderr)
         return 2
     from patmir import bench as benchmod
 
     cfg = load_pipeline_config(args.config)
     runs_root = cfg.storage.runs_root
     runs_root.mkdir(parents=True, exist_ok=True)
+
+    if args.url:
+        try:
+            args.clip = _bench_fetch_url(args.url, cfg, args.config, args.mode)
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: could not fetch {args.url}: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+    elif not args.clip.exists():
+        print(f"error: {args.clip} not found", file=sys.stderr)
+        return 2
     cache_mode = "warm cache shared across repeats" if args.warm_cache else "no warm cache (every repeat cold)"
     print(f"patmir bench {args.clip} (mode={args.mode}, repeat={args.repeat}, "
           f"profile={cfg.profile or '-'}, {cache_mode})",
@@ -296,6 +358,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
             args.clip, args.config, runs_root=runs_root,
             repeat=args.repeat, max_sections=args.max_sections, label=args.label,
             warm_cache=args.warm_cache,
+            scheduler=args.scheduler, playhead=args.playhead,
+            prewarm=args.prewarm, traces=args.traces,
         )
 
     print(benchmod.format_report(results))

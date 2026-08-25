@@ -201,6 +201,47 @@ across seeks. The browser client polls `/stream/<key>/sections`, fetches each
 section WAV, and schedules it on the Web Audio clock at its global `start`
 offset, pausing the `<video>` to buffer when the playhead outruns production.
 
+### Section boundaries
+
+Each section analyzes `[start, start + 30 + 8]` and cuts at a VAD silence inside
+the pad. A cut candidate must be an interval end **followed by a real gap**: the
+separate stage runs Silero with `speech_pad_ms=500`, so speech runs separated by
+under ~1 s of silence come back *touching*, and an end equal to the next start
+is mid-speech rather than a boundary. A candidate below half the target is also
+rejected — an early silence is the wrong cut when the only later boundary sits
+past the target, because the whole padded slice is analyzed either way. With no
+qualifying candidate the section cuts at the target, accepting a mid-utterance
+boundary (the transcript trim drops the partial sentence; the next section
+re-analyzes from there). ADR
+`2026-08-25-watchalong-startup-and-stall-causes`.
+
+### Pause, abandonment and restart
+
+A paused viewer is **not** an absent one. The scheduler's abandon timer keys off
+the client still asking for something (`/sections` polls and playhead POSTs),
+not off the playhead moving — the client stops POSTing the playhead while
+paused, so the older rule ended the stream after 45 s of pause and `submit()`
+then returned that finished record, leaving playback stuck with no recovery. A
+`done` stream whose cached manifest is not `complete` now restarts and resumes
+from the sections already cached, numbering **past** the highest cached index so
+a restart cannot overwrite `section_NNN.wav`.
+
+### Per-section telemetry
+
+Every section's timing is written into its `sections.json` entry — per-stage
+walls, `build_s`, `rtf`, `buffer_ahead_s`, and `other_s` (`wall_s` minus the sum
+of stage walls: the ffmpeg slice/trim, ECAPA embed and age-gender profile that
+no stage owns, ~1.6 s per section). The fields are additive and optional, and
+`index`/`start`/`end` always come from the caller, so audio and timing cannot
+disagree. `patmir/pipeline/streaming/timing.py` is the single reader, shared
+with `patmir bench`, so the live path and the benchmark cannot drift.
+
+Startup models that `prewarm_stage_cache` cannot reach — the speaker embedder
+and the age/gender profiler, which are not stages — are prewarmed at server boot
+alongside the **streaming** stage set, whose `separate` and `translate`
+candidates differ from batch and so were previously cache misses on the first
+stream of every server lifetime.
+
 NOTE (perf follow-up): `process_section` calls `run_job` twice per section
 (analysis, then translate→tts→mux), rebuilding stage models each call. A
 warm-model loop (build stages once, process sections in place) is an open

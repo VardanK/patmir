@@ -1,0 +1,963 @@
+[
+  {
+    "job_dir": "20260825-182143-prelude",
+    "kind": "prelude",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.118,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 3.407,
+        "build_s": 1.413,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.647,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.339,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 5.497,
+        "build_s": 0,
+        "state": "done"
+      },
+      "translate": {
+        "wall_s": 4.091,
+        "build_s": 0.008,
+        "state": "done"
+      },
+      "tts": {
+        "wall_s": 41.61,
+        "build_s": 0,
+        "state": "done"
+      },
+      "mux": {
+        "wall_s": 1.074,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.199
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.208
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.202
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.202
+      },
+      {
+        "between": "asr->translate",
+        "gap_s": 14.261
+      },
+      {
+        "between": "translate->tts",
+        "gap_s": 0.215
+      },
+      {
+        "between": "tts->mux",
+        "gap_s": 0.246
+      }
+    ],
+    "audio_s": 39.993016,
+    "vad_intervals": [
+      [
+        0.0,
+        11.0
+      ],
+      [
+        11.0,
+        32.6
+      ],
+      [
+        32.6,
+        33.6
+      ],
+      [
+        33.6,
+        39.993
+      ]
+    ],
+    "wall_s": 72.316,
+    "started": "18:21:43",
+    "ended": "18:22:56",
+    "stage_wall_sum_s": 56.783,
+    "untracked_s": 15.533
+  },
+  {
+    "job_dir": "20260825-182256-section",
+    "kind": "section",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.107,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 1.482,
+        "build_s": 0,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.273,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.202,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 6.583,
+        "build_s": 0,
+        "state": "done"
+      },
+      "translate": {
+        "wall_s": 6.22,
+        "build_s": 0,
+        "state": "done"
+      },
+      "tts": {
+        "wall_s": 17.964,
+        "build_s": 0,
+        "state": "done"
+      },
+      "mux": {
+        "wall_s": 0.843,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.213
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.216
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.22
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.211
+      },
+      {
+        "between": "asr->translate",
+        "gap_s": 0.293
+      },
+      {
+        "between": "translate->tts",
+        "gap_s": 0.217
+      },
+      {
+        "between": "tts->mux",
+        "gap_s": 0.256
+      }
+    ],
+    "audio_s": 38.0,
+    "vad_intervals": [
+      [
+        0.0,
+        6.3
+      ],
+      [
+        6.3,
+        15.3
+      ],
+      [
+        15.3,
+        35.4
+      ],
+      [
+        35.4,
+        38.0
+      ]
+    ],
+    "wall_s": 35.298,
+    "started": "18:22:56",
+    "ended": "18:23:31",
+    "stage_wall_sum_s": 33.674,
+    "untracked_s": 1.624
+  },
+  {
+    "job_dir": "20260825-182332-section",
+    "kind": "section",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.116,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 1.433,
+        "build_s": 0,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.234,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.185,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 9.082,
+        "build_s": 0,
+        "state": "done"
+      },
+      "translate": {
+        "wall_s": 4.206,
+        "build_s": 0,
+        "state": "done"
+      },
+      "tts": {
+        "wall_s": 15.508,
+        "build_s": 0,
+        "state": "done"
+      },
+      "mux": {
+        "wall_s": 0.361,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.21
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.239
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.224
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.212
+      },
+      {
+        "between": "asr->translate",
+        "gap_s": 0.315
+      },
+      {
+        "between": "translate->tts",
+        "gap_s": 0.222
+      },
+      {
+        "between": "tts->mux",
+        "gap_s": 0.226
+      }
+    ],
+    "audio_s": 38.0,
+    "vad_intervals": [
+      [
+        0.0,
+        6.3
+      ],
+      [
+        6.3,
+        8.1
+      ],
+      [
+        8.1,
+        38.0
+      ]
+    ],
+    "wall_s": 32.775,
+    "started": "18:23:32",
+    "ended": "18:24:04",
+    "stage_wall_sum_s": 31.125,
+    "untracked_s": 1.65
+  },
+  {
+    "job_dir": "20260825-182405-prelude",
+    "kind": "prelude",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.117,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 1.313,
+        "build_s": 0,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.272,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.192,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 5.367,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.214
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.223
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.209
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.212
+      }
+    ],
+    "audio_s": 39.993016,
+    "vad_intervals": [
+      [
+        0.0,
+        11.0
+      ],
+      [
+        11.0,
+        32.6
+      ],
+      [
+        32.6,
+        33.6
+      ],
+      [
+        33.6,
+        39.993
+      ]
+    ],
+    "wall_s": 8.119,
+    "started": "18:24:05",
+    "ended": "18:24:13",
+    "stage_wall_sum_s": 7.261,
+    "untracked_s": 0.858
+  },
+  {
+    "job_dir": "20260825-182413-prelude",
+    "kind": "prelude",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.12,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 1.308,
+        "build_s": 0,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.24,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.191,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 5.922,
+        "build_s": 0,
+        "state": "done"
+      },
+      "translate": {
+        "wall_s": 3.429,
+        "build_s": 0,
+        "state": "done"
+      },
+      "tts": {
+        "wall_s": 28.343,
+        "build_s": 0,
+        "state": "done"
+      },
+      "mux": {
+        "wall_s": 1.032,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.223
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.22
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.221
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.213
+      },
+      {
+        "between": "asr->translate",
+        "gap_s": 0.295
+      },
+      {
+        "between": "translate->tts",
+        "gap_s": 0.224
+      },
+      {
+        "between": "tts->mux",
+        "gap_s": 0.244
+      }
+    ],
+    "audio_s": 39.993016,
+    "vad_intervals": [
+      [
+        0.0,
+        11.0
+      ],
+      [
+        11.0,
+        32.6
+      ],
+      [
+        32.6,
+        33.6
+      ],
+      [
+        33.6,
+        39.993
+      ]
+    ],
+    "wall_s": 42.225,
+    "started": "18:24:13",
+    "ended": "18:24:56",
+    "stage_wall_sum_s": 40.585,
+    "untracked_s": 1.64
+  },
+  {
+    "job_dir": "20260825-182456-section",
+    "kind": "section",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.11,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 1.296,
+        "build_s": 0,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.246,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.179,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 9.067,
+        "build_s": 0,
+        "state": "done"
+      },
+      "translate": {
+        "wall_s": 4.002,
+        "build_s": 0,
+        "state": "done"
+      },
+      "tts": {
+        "wall_s": 19.96,
+        "build_s": 0,
+        "state": "done"
+      },
+      "mux": {
+        "wall_s": 1.009,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.209
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.22
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.225
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.22
+      },
+      {
+        "between": "asr->translate",
+        "gap_s": 0.299
+      },
+      {
+        "between": "translate->tts",
+        "gap_s": 0.219
+      },
+      {
+        "between": "tts->mux",
+        "gap_s": 0.24
+      }
+    ],
+    "audio_s": 38.0,
+    "vad_intervals": [
+      [
+        0.0,
+        31.3
+      ],
+      [
+        31.3,
+        38.0
+      ]
+    ],
+    "wall_s": 37.5,
+    "started": "18:24:56",
+    "ended": "18:25:34",
+    "stage_wall_sum_s": 35.869,
+    "untracked_s": 1.631
+  },
+  {
+    "job_dir": "20260825-182534-section",
+    "kind": "section",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.109,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 1.465,
+        "build_s": 0,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.265,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.19,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 6.671,
+        "build_s": 0,
+        "state": "done"
+      },
+      "translate": {
+        "wall_s": 2.996,
+        "build_s": 0,
+        "state": "done"
+      },
+      "tts": {
+        "wall_s": 8.24,
+        "build_s": 0,
+        "state": "done"
+      },
+      "mux": {
+        "wall_s": 0.427,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.211
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.216
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.218
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.216
+      },
+      {
+        "between": "asr->translate",
+        "gap_s": 0.31
+      },
+      {
+        "between": "translate->tts",
+        "gap_s": 0.221
+      },
+      {
+        "between": "tts->mux",
+        "gap_s": 0.245
+      }
+    ],
+    "audio_s": 38.0,
+    "vad_intervals": [
+      [
+        0.0,
+        12.7
+      ],
+      [
+        12.7,
+        13.6
+      ],
+      [
+        13.6,
+        38.0
+      ]
+    ],
+    "wall_s": 21.999,
+    "started": "18:25:34",
+    "ended": "18:25:56",
+    "stage_wall_sum_s": 20.363,
+    "untracked_s": 1.636
+  },
+  {
+    "job_dir": "20260825-182556-section",
+    "kind": "section",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.105,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 1.31,
+        "build_s": 0,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.223,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.18,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 7.769,
+        "build_s": 0,
+        "state": "done"
+      },
+      "translate": {
+        "wall_s": 3.463,
+        "build_s": 0,
+        "state": "done"
+      },
+      "tts": {
+        "wall_s": 14.652,
+        "build_s": 0,
+        "state": "done"
+      },
+      "mux": {
+        "wall_s": 0.74,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.21
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.22
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.208
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.212
+      },
+      {
+        "between": "asr->translate",
+        "gap_s": 0.295
+      },
+      {
+        "between": "translate->tts",
+        "gap_s": 0.214
+      },
+      {
+        "between": "tts->mux",
+        "gap_s": 0.242
+      }
+    ],
+    "audio_s": 38.0,
+    "vad_intervals": [
+      [
+        0.0,
+        29.1
+      ],
+      [
+        29.1,
+        38.0
+      ]
+    ],
+    "wall_s": 30.043,
+    "started": "18:25:56",
+    "ended": "18:26:26",
+    "stage_wall_sum_s": 28.442,
+    "untracked_s": 1.601
+  },
+  {
+    "job_dir": "20260825-182627-section",
+    "kind": "section",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.114,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 1.288,
+        "build_s": 0,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.242,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.177,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 6.118,
+        "build_s": 0,
+        "state": "done"
+      },
+      "translate": {
+        "wall_s": 3.328,
+        "build_s": 0,
+        "state": "done"
+      },
+      "tts": {
+        "wall_s": 18.244,
+        "build_s": 0,
+        "state": "done"
+      },
+      "mux": {
+        "wall_s": 0.795,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.213
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.215
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.206
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.211
+      },
+      {
+        "between": "asr->translate",
+        "gap_s": 0.3
+      },
+      {
+        "between": "translate->tts",
+        "gap_s": 0.217
+      },
+      {
+        "between": "tts->mux",
+        "gap_s": 0.239
+      }
+    ],
+    "audio_s": 38.0,
+    "vad_intervals": [
+      [
+        0.0,
+        17.5
+      ],
+      [
+        17.5,
+        29.9
+      ],
+      [
+        29.9,
+        38.0
+      ]
+    ],
+    "wall_s": 31.907,
+    "started": "18:26:27",
+    "ended": "18:26:59",
+    "stage_wall_sum_s": 30.306,
+    "untracked_s": 1.601
+  },
+  {
+    "job_dir": "20260825-182659-section",
+    "kind": "section",
+    "stages": {
+      "ingest": {
+        "wall_s": 0.117,
+        "build_s": 0,
+        "state": "done"
+      },
+      "separate": {
+        "wall_s": 1.316,
+        "build_s": 0,
+        "state": "done"
+      },
+      "diarize": {
+        "wall_s": 0.222,
+        "build_s": 0,
+        "state": "done"
+      },
+      "emotion": {
+        "wall_s": 0.227,
+        "build_s": 0,
+        "state": "done"
+      },
+      "asr": {
+        "wall_s": 7.361,
+        "build_s": 0,
+        "state": "done"
+      },
+      "translate": {
+        "wall_s": 3.673,
+        "build_s": 0,
+        "state": "done"
+      },
+      "tts": {
+        "wall_s": 22.765,
+        "build_s": 0,
+        "state": "done"
+      },
+      "mux": {
+        "wall_s": 0.894,
+        "build_s": 0,
+        "state": "done"
+      }
+    },
+    "gaps": [
+      {
+        "between": "ingest->separate",
+        "gap_s": 0.21
+      },
+      {
+        "between": "separate->diarize",
+        "gap_s": 0.216
+      },
+      {
+        "between": "diarize->emotion",
+        "gap_s": 0.212
+      },
+      {
+        "between": "emotion->asr",
+        "gap_s": 0.219
+      },
+      {
+        "between": "asr->translate",
+        "gap_s": 0.348
+      },
+      {
+        "between": "translate->tts",
+        "gap_s": 0.233
+      },
+      {
+        "between": "tts->mux",
+        "gap_s": 0.237
+      }
+    ],
+    "audio_s": 38.0,
+    "vad_intervals": [
+      [
+        0.0,
+        8.2
+      ],
+      [
+        8.2,
+        9.0
+      ],
+      [
+        9.0,
+        10.4
+      ],
+      [
+        10.4,
+        27.7
+      ],
+      [
+        27.7,
+        29.3
+      ],
+      [
+        29.3,
+        30.3
+      ],
+      [
+        30.3,
+        31.7
+      ],
+      [
+        31.7,
+        38.0
+      ]
+    ],
+    "wall_s": 38.25,
+    "started": "18:26:59",
+    "ended": "18:27:37",
+    "stage_wall_sum_s": 36.575,
+    "untracked_s": 1.675
+  }
+]

@@ -1,6 +1,39 @@
 # Pipeline performance — baseline + roadmap
 
-Last updated: 2026-08-24 (first RTX 3090 / CUDA baselines, both modes)
+Last updated: 2026-08-25 (watch-along startup/stall causes; **watch-along rows
+below are pre-fix and need re-measuring**)
+
+> **Watch-along rows here predate the 2026-08-25 fixes and describe a path that
+> no longer exists.** ADR
+> `2026-08-25-watchalong-startup-and-stall-causes` found four things that move
+> these numbers, all measured on the author's own session rather than a bench
+> run: a section-end snap that could cut **mid-speech and collapse a section to
+> 8.1 s of dub for 38 s of analysis** (RTF 4.0, hit 2 of 7 sections); a TTS
+> chunk tail costing **17.3 s of a 41.6 s stage** for one sentence; **14.3 s**
+> of prelude spent lazily loading two models that no stage owns and no manifest
+> records (measured directly at 18.0 s, of which the age/gender profiler is
+> 15.2 s); and per-section language re-detection at 3.5-4.6 s a section.
+>
+> Read the **1.456 aggregate / 0.877 steady-state** row below with that in mind:
+> it was measured with the forward-loop bench driver, which cannot stall, seek
+> or idle, on a clip that did not trigger the snap collapse. It is a real
+> number for what it measured; it is not what the author experienced. The
+> headline "watch-along cleared realtime" claim rests on it.
+>
+> **Measured after the fixes, 2026-08-25 21:41, through the live server** (not
+> bench), same video and box: **time to first audio 72.4 s -> 52.6 s (-27%)**,
+> the 14.3 s gap gone, every section a full 36.5 s where this clip previously
+> produced an 8.1 s section from 38 s of analysis. **But aggregate RTF is 1.005**
+> (sections 0.883-1.157) — production still does not clear realtime and the
+> buffer still does not grow; what is gone is the catastrophic case. TTS is
+> 60-72% of every section. Full table:
+> `agent-os/specs/2026-08-25-1931-watchalong-startup-and-stalls/measurements/RESULTS.md`.
+>
+> `bench --mode watch-along` now drives the real `StreamScheduler`, takes
+> `--url`, and reports `time_to_first_audio_s` plus per-section `other_s` (wall
+> minus the sum of stage walls — the work no stage owns, ~1.6 s/section). Live
+> streams also persist their own per-section timing into `sections.json` now, so
+> the next regression does not have to be reconstructed from `runs/` by hand.
 
 > **Status: two machines, and the Apple-Silicon rows need a caveat.** The
 > **sample_1 (Reacher)** rows are the Apple-Silicon numbers — current active set

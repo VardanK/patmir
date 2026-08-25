@@ -34,7 +34,7 @@ from patmir.eval.candidates.tts import higgs_v3_torch
 from patmir.eval.candidates.tts.higgs_v3_torch import (
     SR,
     HiggsV3Torch,
-    _chunks,
+    _balanced_chunks,
     _Request,
     _request_seed,
     _sample_codes,
@@ -133,16 +133,61 @@ class TokenCapTest(unittest.TestCase):
 
 class ChunksTest(unittest.TestCase):
     def test_exact_multiple(self):
-        self.assertEqual(_chunks([0, 1, 2, 3], 2), [[0, 1], [2, 3]])
+        self.assertEqual(_balanced_chunks([0, 1, 2, 3], 2), [[0, 1], [2, 3]])
 
     def test_ragged_tail(self):
-        self.assertEqual(_chunks([0, 1, 2], 2), [[0, 1], [2]])
+        self.assertEqual(_balanced_chunks([0, 1, 2], 2), [[0, 1], [2]])
 
     def test_batch_larger_than_input(self):
-        self.assertEqual(_chunks([0], 8), [[0]])
+        self.assertEqual(_balanced_chunks([0], 8), [[0]])
 
     def test_empty(self):
-        self.assertEqual(_chunks([], 4), [])
+        self.assertEqual(_balanced_chunks([], 4), [])
+
+    # --- the tail defect (spec 2026-08-25-1931, finding B1) ----------------
+
+    def test_nine_items_do_not_leave_a_batch_of_one(self):
+        """The measured case. A chunk costs max(steps), so a trailing chunk of
+        one is the single longest line paying for a whole chunk: 17.3 s of the
+        prelude's 41.6 s TTS stage, for one sentence."""
+        sizes = [len(c) for c in _balanced_chunks(list(range(9)), 8)]
+        self.assertEqual(sizes, [5, 4])
+
+    def test_never_exceeds_the_batch_ceiling(self):
+        """Balancing must not buy speed with memory — max_batch is a VRAM
+        bound, and this box already peaks at 16.4 GB of 24."""
+        for n in range(1, 40):
+            for size in (1, 2, 4, 8):
+                for c in _balanced_chunks(list(range(n)), size):
+                    self.assertLessEqual(len(c), size, f"n={n} size={size}")
+
+    def test_uses_the_fewest_possible_chunks(self):
+        for n in range(1, 40):
+            for size in (1, 2, 4, 8):
+                got = len(_balanced_chunks(list(range(n)), size))
+                self.assertEqual(got, -(-n // size), f"n={n} size={size}")
+
+    def test_partitions_the_input_in_order(self):
+        """Contiguity in cap-sorted order is what makes batching pay, and the
+        caller maps results back by slot — losing or reordering an item would
+        give a sentence someone else's audio."""
+        for n in range(0, 40):
+            items = list(range(n))
+            flat = [i for c in _balanced_chunks(items, 8) for i in c]
+            self.assertEqual(flat, items, f"n={n}")
+
+    def test_chunk_sizes_differ_by_at_most_one(self):
+        for n in range(1, 40):
+            for size in (2, 4, 8):
+                sizes = [len(c) for c in _balanced_chunks(list(range(n)), size)]
+                self.assertLessEqual(max(sizes) - min(sizes), 1, f"n={n} size={size}")
+
+    def test_matches_greedy_when_the_size_divides_evenly(self):
+        """The common full-batch case must be untouched, so this change cannot
+        move audio for a job whose sentence count is already a multiple."""
+        for n, size in ((8, 8), (16, 8), (24, 8), (4, 2)):
+            greedy = [list(range(i, i + size)) for i in range(0, n, size)]
+            self.assertEqual(_balanced_chunks(list(range(n)), size), greedy)
 
 
 class OrchestrationTest(unittest.TestCase):
@@ -212,7 +257,14 @@ class OrchestrationTest(unittest.TestCase):
             return [(np.zeros(8, dtype=np.float32), False) for _ in reqs]
 
         self._run(_bare(max_batch=3), ["a"] * 7, decode)
-        self.assertEqual(sorted(sizes), [1, 3, 3])
+        # The ceiling and total are the contract this test is named for.
+        self.assertTrue(all(n <= 3 for n in sizes), sizes)
+        self.assertEqual(sum(sizes), 7)
+        # Shape changed deliberately (spec 2026-08-25-1931, B1): this used to
+        # assert [1, 3, 3], pinning the greedy split's trailing chunk of ONE —
+        # which is the defect, not the contract. A chunk costs max(steps), so a
+        # lone trailing row pays a full chunk by itself.
+        self.assertEqual(sorted(sizes), [2, 2, 3])
 
     def test_overflow_is_retried_and_counted(self):
         import numpy as np

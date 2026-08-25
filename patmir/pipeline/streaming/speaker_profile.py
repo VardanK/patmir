@@ -13,6 +13,7 @@ still lands on a sensible voice. Treat age as approximate.
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -76,8 +77,24 @@ def _load_model():
                 h = torch.mean(self.wav2vec2(input_values).last_hidden_state, dim=1)
                 return self.age(h), self.gender(h)
 
-        device = "mps" if torch.backends.mps.is_available() else (
-            "cuda" if torch.cuda.is_available() else "cpu")
+        # CPU by default, for the same reason the ECAPA embedder is CPU-only
+        # (see `embeddings.py`): the workload is a handful of short ref clips —
+        # once per speaker in the prelude, once per NEW speaker per section — so
+        # the accelerator buys almost nothing, while this wav2vec2-large sits on
+        # the card for the whole server lifetime once loaded (`lru_cache`).
+        #
+        # It measured ~1.2 GB of VRAM, and that mattered: on the 24 GB 3090 under
+        # WSL2, prewarming it at boot (2026-08-25) put it resident BEFORE the
+        # prelude's emotion stage instead of after ASR, and the emotion stage
+        # then failed a 250 MiB allocation with 7.1 GB still free on the card —
+        # the commit-limit false-OOM documented in
+        # `docs/setup/windows-wsl2-cuda.md`. Set PATMIR_PROFILE_DEVICE to
+        # override (e.g. "cuda") on a box with headroom to spare.
+        forced = os.environ.get("PATMIR_PROFILE_DEVICE", "").strip().lower()
+        if forced:
+            device = forced
+        else:
+            device = "cpu"
         processor = Wav2Vec2Processor.from_pretrained(_MODEL)
         model = _AgeGender.from_pretrained(_MODEL).to(device).eval()
         return processor, model, device

@@ -1,0 +1,25 @@
+{
+  "accompaniment": "/home/vardan/patmir/runs/20260825-182332-section/accompaniment.wav",
+  "vocals": "/home/vardan/patmir/runs/20260825-182332-section/vocals.wav",
+  "speech_vocals": "/home/vardan/patmir/runs/20260825-182332-section/speech_vocals.wav",
+  "non_speech_vocals": "/home/vardan/patmir/runs/20260825-182332-section/non_speech_vocals.wav",
+  "vad_intervals": [
+    [
+      0.0,
+      6.3
+    ],
+    [
+      6.3,
+      8.1
+    ],
+    [
+      8.1,
+      38.0
+    ]
+  ],
+  "sample_rate": 44100,
+  "channels": 2,
+  "model": "htdemucs",
+  "vocals_only": false,
+  "device": "cuda"
+}

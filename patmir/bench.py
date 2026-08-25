@@ -42,13 +42,21 @@ from typing import Any
 
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.manifest import Manifest
-from patmir.pipeline.runner import _free_accelerator_cache, run_job
+from patmir.pipeline.runner import (
+    _free_accelerator_cache,
+    prewarm_stage_cache,
+    run_job,
+)
 from patmir.pipeline.stage import STAGE_ORDER
+from patmir.pipeline.streaming import timing as timing_mod
+from patmir.pipeline.streaming.scheduler import Playhead, StreamScheduler
 
 # The two run_job halves the watch-along section path runs (see
 # streaming/section.py): analysis (ingest→asr) then dub (translate→mux).
-ANALYSIS_STAGES = ["ingest", "separate", "diarize", "emotion", "asr"]
-DUB_STAGES = ["translate", "tts", "mux", "output"]
+# Defined in streaming/timing.py, which the LIVE stream path also uses — bench
+# and production must not be able to report different numbers for one run.
+ANALYSIS_STAGES = timing_mod.ANALYSIS_STAGES
+DUB_STAGES = timing_mod.DUB_STAGES
 
 # A stage_cache hit sets build_s to exactly 0.0 (runner.py), so this only has to
 # absorb per-stage rounding in the report.
@@ -118,10 +126,7 @@ def _sentence_count(job_dir: Path) -> int | None:
     return None
 
 
-def _stage_wall(st) -> float | None:
-    if st.started_at and st.finished_at:
-        return st.finished_at - st.started_at
-    return None
+_stage_wall = timing_mod.stage_wall
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -365,33 +370,84 @@ def bench_batch(clip: Path, cfg: PipelineConfig, *, runs_root: Path,
 # --------------------------------------------------------------------------- #
 # watch-along (D3)
 # --------------------------------------------------------------------------- #
+class BenchPlayhead:
+    """Synthetic viewer, so the bench exercises the scheduler the server runs.
+
+    `bench_watch_along` used to walk sections with its own forward `while`
+    loop, which meant coverage, lookahead, seek priority, idling and the
+    abandon timer — every part of `StreamScheduler` — were untested by the
+    benchmark that was supposed to characterise them.
+
+    Two viewers, because they answer different questions:
+
+    * `greedy` (default) sits exactly at the buffer edge, so the scheduler
+      always has work and wall time measures pure production throughput. Fast,
+      and comparable to the historical forward-loop numbers.
+    * `realtime` advances with the clock and **stalls when it outruns
+      production**, which is precisely what the browser client does. It counts
+      those stalls, so a freeze becomes a number instead of a complaint. Costs
+      about one video-duration of wall time — use `--max-sections`.
+    """
+
+    def __init__(self, mode: str = "greedy") -> None:
+        self.mode = mode
+        self._t0 = time.perf_counter()
+        self._ph = Playhead(t=0.0, paused=False, updated_at=time.time())
+        self.coverage = None          # set by the caller once the scheduler exists
+        self.stalls: list[dict[str, Any]] = []
+        self._stalled_at: float | None = None
+
+    def _covered_end(self, t: float) -> float:
+        if self.coverage is None:
+            return t
+        gap = self.coverage.first_uncovered(t)
+        return t if gap is None else gap
+
+    def __call__(self) -> Playhead:
+        # Keep the abandon timer fed: a synthetic viewer never goes away, and
+        # the scheduler would otherwise end the stream after 45 s of idling.
+        self._ph.updated_at = time.time()
+        if self.mode == "greedy":
+            self._ph.t = self._covered_end(self._ph.t)
+            return self._ph
+
+        wanted = time.perf_counter() - self._t0
+        edge = self._covered_end(self._ph.t)
+        if wanted > edge:
+            # Outran production: this is the freeze the author reported.
+            if self._stalled_at is None:
+                self._stalled_at = time.perf_counter()
+            self._ph.t = edge
+        else:
+            if self._stalled_at is not None:
+                self.stalls.append({
+                    "at_s": round(self._ph.t, 2),
+                    "waited_s": round(time.perf_counter() - self._stalled_at, 2),
+                })
+                self._stalled_at = None
+            self._ph.t = wanted
+        return self._ph
+
+
+
 def _section_record(index: int, sec, wall_s: float, runs_root: Path) -> dict[str, Any]:
-    job_dir = sec.job_dir
-    manifest = Manifest.from_path(job_dir / "manifest.json")
-    span = max(0.0, sec.end - sec.start)
-    per_stage = {n: (_stage_wall(manifest.stage(n)) or 0.0) for n in STAGE_ORDER}
-    build_total = sum((manifest.stage(n).build_s or 0.0) for n in STAGE_ORDER)
-    analysis = sum(per_stage[n] for n in ANALYSIS_STAGES)
-    dub = sum(per_stage[n] for n in DUB_STAGES)
-    return {
-        "index": index,
-        "start": round(sec.start, 2),
-        "end": round(sec.end, 2),
-        "section_s": round(span, 2),
-        "wall_s": round(wall_s, 2),
-        "analysis_wall_s": round(analysis, 2),
-        "dub_wall_s": round(dub, 2),
-        "build_s": round(build_total, 2),
-        "rtf": round(wall_s / span, 3) if span else None,
-        "stage_wall_s": {n: round(per_stage[n], 2) for n in STAGE_ORDER},
-        "new_speakers": list(sec.new_speakers),
-    }
+    """One section's timing. Thin wrapper over the shared reader so bench and
+    the live stream path cannot drift; `runs_root` is unused (the section's own
+    `job_dir` carries the manifest) and kept for call-site compatibility."""
+    return timing_mod.section_timing(
+        index=index, start=sec.start, end=sec.end, job_dir=sec.job_dir,
+        wall_s=wall_s, new_speakers=sec.new_speakers,
+    )
 
 
 def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                       repeat: int = 1, max_sections: int | None = None,
                       label: str | None = None,
-                      warm_cache: bool = True) -> list[BenchResult]:
+                      warm_cache: bool = True,
+                      scheduler: bool = True,
+                      playhead: str = "greedy",
+                      prewarm: bool = False,
+                      traces: bool = True) -> list[BenchResult]:
     """Run `clip` through the watch-along section loop `repeat` times.
 
     Unlike `bench_batch`, the cache is created INSIDE the repeat loop and stays
@@ -420,35 +476,81 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
         # Same warm-model cache the production stream loop uses (ui/stream.py)
         # — bench must measure the warm path, not the legacy rebuild path.
         stage_cache: dict[str, Any] | None = {} if warm_cache else None
+        # A live server prewarms at boot, so its section 0 pays no build. The
+        # default (no prewarm) keeps the historical baselines comparable; pass
+        # --prewarm to measure what the author's server actually does.
+        prewarm_s = 0.0
+        if prewarm and stage_cache is not None:
+            pt = time.perf_counter()
+            prewarm_stage_cache(cfg, stage_cache)
+            prewarm_s = time.perf_counter() - pt
         _gpu_peak_reset()
+        run_t0 = time.perf_counter()
         t0 = time.perf_counter()
         prelude = run_prelude(
             clip, cfg,
             window_seconds=cfg.options.prelude_window_seconds,
             runs_root=runs_root,
             stage_cache=stage_cache,
+            bench=traces,
         )
         prelude_wall = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        sec0 = dub_prelude_window(cfg, prelude, runs_root=runs_root, stage_cache=stage_cache)
+        sec0 = dub_prelude_window(cfg, prelude, runs_root=runs_root,
+                                  stage_cache=stage_cache, bench=traces)
         sec0_wall = time.perf_counter() - t0
         sections.append(_section_record(0, sec0, sec0_wall, runs_root))
+        # The author-facing number: nothing plays before this.
+        time_to_first_audio_s = time.perf_counter() - run_t0
 
-        idx = 1
-        t = prelude.window_end
-        while t < duration - 0.5:
+        counter = {"n": 0}
+        stalls: list[dict[str, Any]] = []
+
+        def _one(start: float):
+            counter["n"] += 1
             s0 = time.perf_counter()
             sec = process_section(
                 clip, cfg, prelude.registry,
-                index=idx, start=t, runs_root=runs_root,
-                stage_cache=stage_cache,
+                index=counter["n"], start=start, runs_root=runs_root,
+                stage_cache=stage_cache, bench=traces,
+                source_lang=prelude.source_lang,
             )
-            sections.append(_section_record(idx, sec, time.perf_counter() - s0, runs_root))
-            t = sec.end if sec.end > t + 0.5 else min(t + DEFAULT_SECTION_SECONDS, duration)
-            idx += 1
-            if max_sections is not None and idx > max_sections:
-                break
+            sections.append(_section_record(counter["n"], sec,
+                                            time.perf_counter() - s0, runs_root))
+            return sec
+
+        if scheduler:
+            # Drive the SAME scheduler the server runs, so coverage, lookahead,
+            # seek priority and idling are inside the measurement instead of
+            # being replaced by a straight-line loop that cannot stall.
+            ph = BenchPlayhead(playhead)
+
+            def _process(start: float):
+                if max_sections is not None and counter["n"] >= max_sections:
+                    sched.stop()
+                    return None
+                return _one(start)
+
+            sched = StreamScheduler(
+                duration=duration,
+                prelude_end=prelude.window_end,
+                process_fn=_process,
+                playhead_fn=ph,
+            )
+            ph.coverage = sched.coverage
+            sched.run()
+            stalls = ph.stalls
+        else:
+            idx = 1
+            t = prelude.window_end
+            while t < duration - 0.5:
+                counter["n"] = idx - 1
+                sec = _one(t)
+                t = sec.end if sec.end > t + 0.5 else min(t + DEFAULT_SECTION_SECONDS, duration)
+                idx += 1
+                if max_sections is not None and idx > max_sections:
+                    break
 
         dubbed_audio_s = sum(s["section_s"] for s in sections)
         sections_wall = sum(s["wall_s"] for s in sections)
@@ -495,6 +597,20 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                 "dubbed_audio_s": round(dubbed_audio_s, 2),
                 "n_sections": len(sections),
                 "total_build_s": round(total_build, 2),
+                # Submit -> first playable audio. The author's actual complaint
+                # ("the first chunk takes too long") had no metric before this.
+                "time_to_first_audio_s": round(time_to_first_audio_s, 2),
+                "prewarm_s": round(prewarm_s, 2) if prewarm else None,
+                # Work no stage owns, summed: ffmpeg slice/trim, ECAPA embed,
+                # age-gender profile, and any lazily-loaded model.
+                "other_s": round(sum(s_.get("other_s") or 0.0 for s_ in sections), 2),
+                "driver": "scheduler" if scheduler else "forward-loop",
+                "playhead": playhead if scheduler else None,
+                # Non-empty only under --playhead realtime: each entry is a
+                # freeze the viewer would have seen.
+                "stalls": stalls,
+                "stall_count": len(stalls),
+                "stall_total_s": round(sum(x["waited_s"] for x in stalls), 2),
                 "build_pct_of_wall": round(100 * total_build / total_wall, 1) if total_wall else None,
                 # `agg_rtf` above divides by DUBBED AUDIO, not source seconds —
                 # unlike batch and unlike the convention performance.md states.

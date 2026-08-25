@@ -74,6 +74,7 @@ class StreamScheduler:
         lookahead_seconds: float = DEFAULT_LOOKAHEAD_SECONDS,
         abandon_seconds: float = DEFAULT_ABANDON_SECONDS,
         idle_fn: Callable[[], bool] | None = None,
+        alive_fn: Callable[[], float] | None = None,
     ) -> None:
         self.duration = duration
         self.process_fn = process_fn
@@ -87,6 +88,15 @@ class StreamScheduler:
         # idles briefly and ends on stop() or viewer-abandonment. Injectable for
         # tests so run() terminates deterministically without wall-clock waits.
         self._idle_fn = idle_fn or self._default_idle
+        # "Is the viewer still there?" — deliberately NOT "is the playhead
+        # moving?". The browser client stops POSTing the playhead while paused,
+        # so keying abandonment off playhead movement ended the stream after
+        # `abandon_seconds` of pause and `submit()` then handed the viewer back
+        # the finished record instead of restarting it: the stream was
+        # unrecoverably dead at the buffer edge. Polling `/sections` continues
+        # while the tab is open, so it separates "paused" from "left".
+        # None keeps the old playhead-based behaviour (tests, bench).
+        self._alive_fn = alive_fn
         self.coverage = Coverage()
         # The prelude already dubbed [0, prelude_end].
         if prelude_end > 0:
@@ -113,10 +123,17 @@ class StreamScheduler:
         return target
 
     def _default_idle(self) -> bool:
-        """Idle while caught up. End the stream if stopped or the viewer has
-        stopped sending playhead updates (left)."""
-        ph = self.playhead_fn()
-        if ph.updated_at and (time.time() - ph.updated_at) > self.abandon_seconds:
+        """Idle while caught up. End the stream if stopped or the viewer left.
+
+        A paused viewer has NOT left: the scheduler keeps filling forward, which
+        is what this class's docstring always claimed and what the code did not
+        do.
+        """
+        last_seen = self._alive_fn() if self._alive_fn is not None else None
+        if last_seen is None:
+            ph = self.playhead_fn()
+            last_seen = ph.updated_at
+        if last_seen and (time.time() - last_seen) > self.abandon_seconds:
             return False
         # Interruptible 2s wait; returns True (keep waiting) unless stop() fired.
         return not self._stop.wait(2.0)
