@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 import time
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from urllib.parse import parse_qs, urlparse
 from patmir import paths
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.stage import STAGE_ORDER
+
+log = logging.getLogger(__name__)
 
 CACHE_VERSION = 1
 # Fallback for callers with no loaded config. The server takes its cache root
@@ -382,12 +385,20 @@ def append_section(
     start: float,
     end: float,
     src_wav: Path,
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Copy a finished section's WAV into the cache and add it to the manifest.
 
     Sections are keyed by their global `start` so an out-of-order section (e.g.
     one produced after a seek) replaces any prior section at the same start
     rather than duplicating it. Returns the updated manifest.
+
+    `timing` (from `streaming/timing.py:section_timing`) is merged into the
+    entry so a live stream records what it actually cost. It is additive and
+    optional: an entry written without it, or by an older build, stays valid —
+    readers must treat every timing key as absent-able. `index`, `start` and
+    `end` are always taken from the arguments, never from `timing`, so the two
+    cannot disagree.
     """
     cache_dir = stream_cache_dir(cache_root, key)
     fname = f"section_{index:03d}.wav"
@@ -396,7 +407,25 @@ def append_section(
         "cache_key": key, "complete": False, "sections": [],
     }
     sections = [s for s in manifest.get("sections", []) if abs(s.get("start", -1) - start) > 0.5]
-    sections.append({"index": index, "start": start, "end": end, "file": fname})
+    # The file name is derived from `index`, so two entries sharing an index
+    # necessarily share a FILE — and the copy above has just overwritten it.
+    # Any surviving entry with this index therefore now points at audio for a
+    # different window and must go. This is what silently corrupted cache key
+    # d5af5653d745ed66, where a restarted stream reset its counter to 0: indices
+    # 1 and 2 each appeared twice with different windows, so the wrong audio
+    # played at 154.9 s and 190.3 s. Dropping the stale entry here also repairs
+    # an already-damaged manifest on the next append.
+    stale = [s for s in sections if int(s.get("index", -1)) == index]
+    if stale:
+        log.warning(
+            "stream cache %s: dropping %d stale section(s) reusing index %d "
+            "(windows %s) — their file was just overwritten.",
+            key, len(stale), index, [round(s.get("start", -1), 1) for s in stale],
+        )
+        sections = [s for s in sections if int(s.get("index", -1)) != index]
+    entry: dict[str, Any] = dict(timing or {})
+    entry.update({"index": index, "start": start, "end": end, "file": fname})
+    sections.append(entry)
     sections.sort(key=lambda s: s["start"])
     manifest["sections"] = sections
     _write_stream_manifest(cache_root, key, manifest)

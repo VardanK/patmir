@@ -31,6 +31,7 @@ import contextlib
 import logging
 import threading
 import time
+from time import perf_counter
 import traceback
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ from patmir.pipeline.context import JobCancelled
 from patmir.pipeline.streaming.prelude import run_prelude
 from patmir.pipeline.streaming.runner import source_duration
 from patmir.pipeline.streaming.scheduler import Playhead, StreamScheduler
+from patmir.pipeline.streaming.timing import section_timing
 from patmir.pipeline.streaming.section import (
     SectionResult,
     dub_prelude_window,
@@ -75,6 +77,24 @@ class StreamRecord:
     window_end: float | None = None       # first section boundary (prelude end)
     sections_done: int = 0
     cached: bool = False
+    # Download progress. These four names are what JobManager's yt-dlp hook
+    # writes; carrying them here is what lets a watch-along stream pass `rec`
+    # into the shared `_download_url` and finally report progress instead of
+    # sitting silent for the whole fetch.
+    # Last time the client asked for anything. Feeds the scheduler's abandon
+    # timer, which used to key off playhead movement and so could not tell a
+    # paused viewer from a departed one.
+    last_seen_at: float | None = None
+    download_pct: float | None = None
+    live_stage: str | None = None
+    live_pct: float | None = None
+    live_msg: str | None = None
+    # Startup breakdown, in seconds. `first_audio_s` is the author-facing
+    # number: submit -> section 0 playable.
+    download_s: float | None = None
+    prelude_s: float | None = None
+    opening_dub_s: float | None = None
+    first_audio_s: float | None = None
     speakers: dict[str, Any] = field(default_factory=dict)
     # Mutated by the playhead POST handler; read by the scheduler loop.
     playhead: Playhead = field(default_factory=Playhead)
@@ -99,7 +119,36 @@ class StreamRecord:
             "cached": self.cached,
             "speakers": self.speakers,
             "playhead": {"t": self.playhead.t, "paused": self.playhead.paused},
+            "download_pct": self.download_pct,
+            "live_stage": self.live_stage,
+            "live_pct": self.live_pct,
+            "live_msg": self.live_msg,
+            "timing": {
+                "download_s": self.download_s,
+                "prelude_s": self.prelude_s,
+                "opening_dub_s": self.opening_dub_s,
+                "first_audio_s": self.first_audio_s,
+            },
         }
+
+
+def _index_seed(prior: dict[str, Any] | None, opening_index: int) -> int:
+    """Highest section index already in the cache, so a resumed stream numbers
+    PAST it instead of overwriting.
+
+    `append_section` names the file `section_{index:03d}.wav`, so reusing an
+    index overwrites that file. `dub_prelude_window` always returns index 0, so
+    a restarted stream restarted numbering at 0 while `append_section` deduped
+    by START and kept both entries — two windows, one file. Measured on cache
+    key d5af5653d745ed66: indices 1 and 2 each appeared twice with different
+    windows, so the wrong audio played at 154.9 s and 190.3 s, live and on every
+    rewatch.
+    """
+    indices = [
+        int(x["index"]) for x in (prior or {}).get("sections", [])
+        if isinstance(x, dict) and str(x.get("index", "")).lstrip("-").isdigit()
+    ]
+    return max([opening_index, *indices])
 
 
 class StreamManager:
@@ -180,8 +229,20 @@ class StreamManager:
             existing_id = self._by_cache_key.get(ck)
             if existing_id and existing_id in self._records and not spec.force:
                 rec = self._records[existing_id]
-                if rec.status in {"queued", "prelude", "streaming", "done"}:
+                if rec.status in {"queued", "prelude", "streaming"}:
                     return rec
+                if rec.status == "done":
+                    # `done` does NOT imply the video is dubbed: the scheduler
+                    # also returns when it thinks the viewer left, which a pause
+                    # used to trigger. Handing that record back left the viewer
+                    # frozen at the buffer edge with no way to restart short of
+                    # a server bounce. Only a genuinely complete stream is
+                    # reusable; anything else falls through and resumes from the
+                    # sections already cached.
+                    done_manifest = cache_mod.read_stream_manifest(self._cache_root, ck)
+                    if done_manifest is not None and done_manifest.get("complete"):
+                        return rec
+                    log.info("Stream %s was done but incomplete — restarting.", rec.job_id)
 
             manifest = None if spec.force else cache_mod.read_stream_manifest(self._cache_root, ck)
             if manifest is not None and manifest.get("complete"):
@@ -225,7 +286,8 @@ class StreamManager:
             return False
         rec.playhead.t = max(0.0, float(t))
         rec.playhead.paused = bool(paused)
-        rec.playhead.updated_at = time.time()  # resets the abandon timer
+        rec.playhead.updated_at = time.time()
+        rec.last_seen_at = time.time()  # resets the abandon timer
         return True
 
     def stop_stream(self, ck: str) -> bool:
@@ -280,6 +342,7 @@ class StreamManager:
         # Overlay live job status so the client knows the stream is still
         # producing (vs. a stale partial manifest from a killed run).
         if rec is not None:
+            rec.last_seen_at = time.time()
             manifest = {
                 **manifest,
                 "status": rec.status,
@@ -347,10 +410,17 @@ class StreamManager:
         thread; the heavy stages are synchronous."""
         cfg = self._streaming_cfg()
         ck = rec.cache_key
+        t_start = perf_counter()
 
         # Resolve the local source (download URLs via the shared JobManager path).
+        # `rec` is passed so yt-dlp's progress hook fires: without it the hook
+        # no-ops and a URL stream reported nothing at all for the whole fetch,
+        # which on a feature-length video is the longest silent stretch of the
+        # entire run.
         if rec.source_url:
-            local_path = self._jobs._download_url(rec.source_url, ck)
+            t_dl = perf_counter()
+            local_path = self._jobs._download_url(rec.source_url, ck, rec)
+            rec.download_s = perf_counter() - t_dl
         else:
             local_path = Path(rec.source_path or "").expanduser().resolve()
         if not local_path.is_file():
@@ -382,11 +452,13 @@ class StreamManager:
 
         # 1) Prelude — establish the cast + voices + embeddings. Window size is
         # a config knob (smaller → faster first audio, fewer characters up front).
+        t_prelude = perf_counter()
         prelude = run_prelude(
             local_path, cfg, runs_root=self._runs_root,
             window_seconds=cfg.options.prelude_window_seconds,
             stage_cache=stage_cache, cancel=cancel,
         )
+        rec.prelude_s = perf_counter() - t_prelude
         rec.window_end = prelude.window_end
         rec.speakers = prelude.speakers
 
@@ -394,12 +466,23 @@ class StreamManager:
         rec.status = "streaming"
         opening = dub_prelude_window(cfg, prelude, runs_root=self._runs_root,
                                      stage_cache=stage_cache, cancel=cancel)
+        rec.opening_dub_s = opening.wall_s
         self._emit(rec, opening)
+        # The number the viewer actually feels: submit -> first playable audio.
+        rec.first_audio_s = perf_counter() - t_start
 
         # 3) Stream the rest, playhead-driven. Seed the abandon timer so the
         # scheduler doesn't bail before the client's first playhead POST lands.
         rec.playhead.updated_at = time.time()
-        index_counter = {"n": opening.index}
+        rec.last_seen_at = time.time()
+        # Seed PAST any already-cached section. `opening.index` is always 0, so
+        # a resumed stream used to restart numbering at 0 and overwrite
+        # `section_001.wav`, `section_002.wav`, ... while `append_section`
+        # deduped by START and kept both entries — leaving two windows pointing
+        # at one file. Measured on cache key d5af5653d745ed66, where indices 1
+        # and 2 each appeared twice with different windows, so the wrong audio
+        # played at 154.9 s and 190.3 s, live and on every rewatch.
+        index_counter = {"n": _index_seed(prior, opening.index)}
 
         def _process(start: float) -> SectionResult | None:
             index_counter["n"] += 1
@@ -408,6 +491,7 @@ class StreamManager:
                     local_path, cfg, prelude.registry,
                     index=index_counter["n"], start=start, runs_root=self._runs_root,
                     stage_cache=stage_cache, cancel=cancel,
+                    source_lang=prelude.source_lang,
                 )
             except JobCancelled:
                 # MUST propagate. This except-Exception used to swallow it and
@@ -424,6 +508,7 @@ class StreamManager:
             process_fn=_process,
             playhead_fn=lambda: rec.playhead,
             on_section=lambda r: self._emit(rec, r),
+            alive_fn=lambda: rec.last_seen_at or 0.0,
         )
         # Re-seed prior cached sections so a resumed stream skips them.
         if prior:
@@ -442,5 +527,43 @@ class StreamManager:
             self._cache_root, rec.cache_key,
             index=result.index, start=result.start, end=result.end,
             src_wav=result.dub_wav,
+            timing=self._section_timing(rec, result),
         )
         rec.sections_done += 1
+
+    def _section_timing(self, rec: StreamRecord,
+                        result: SectionResult) -> dict[str, Any] | None:
+        """Per-section timing for the cache manifest, or None if it can't be
+        built. Telemetry must never fail a section that already succeeded, so
+        every failure here is swallowed — the dub is on disk either way."""
+        try:
+            return section_timing(
+                index=result.index,
+                start=result.start,
+                end=result.end,
+                job_dir=result.job_dir,
+                wall_s=result.wall_s,
+                new_speakers=result.new_speakers,
+                buffer_ahead_s=self._buffer_ahead(rec),
+                produced_at=time.time(),
+            )
+        except Exception:  # noqa: BLE001 — see docstring
+            log.exception("Section timing failed for %s.", rec.job_id)
+            return None
+
+    def _buffer_ahead(self, rec: StreamRecord) -> float | None:
+        """Seconds of continuous dubbed audio ahead of the playhead.
+
+        The single number that predicts a freeze: the client pauses when it
+        reaches audio that isn't there yet, so this crossing zero IS the stall.
+        Read after the scheduler has added the new section to coverage (its
+        loop is process -> coverage.add -> on_section), so it reflects the
+        section just emitted. None before the scheduler exists (section 0).
+        """
+        sched = rec._scheduler
+        if sched is None:
+            return None
+        t = rec.playhead.t
+        gap = sched.coverage.first_uncovered(t)
+        # None means everything from the playhead on is dubbed.
+        return (rec.duration or t) - t if gap is None else max(0.0, gap - t)

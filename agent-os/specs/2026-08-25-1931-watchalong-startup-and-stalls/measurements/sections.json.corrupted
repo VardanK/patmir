@@ -1,0 +1,89 @@
+{
+  "cache_key": "d5af5653d745ed66",
+  "cache_version": 1,
+  "mode": "watch-along",
+  "source_id": "url:yt:os-jXiYRihI",
+  "source_url": "https://www.youtube.com/watch?v=os-jXiYRihI",
+  "duration": 1297.021,
+  "complete": false,
+  "created_at": 1787667703.7001956,
+  "pipeline": {
+    "ingest": {
+      "id": "ffmpeg"
+    },
+    "separate": {
+      "id": "htdemucs_fast"
+    },
+    "diarize": {
+      "id": "sortformer_nemo"
+    },
+    "emotion": {
+      "id": "emotion2vec_plus_base"
+    },
+    "asr": {
+      "id": "qwen3_asr_1_7b"
+    },
+    "translate": {
+      "id": "openrouter_gemini_flash_batch"
+    },
+    "tts": {
+      "id": "higgs_v3_torch_bf16"
+    },
+    "mux": {
+      "id": "ffmpeg_pad_stretch"
+    },
+    "output": {
+      "id": "mkv_default"
+    }
+  },
+  "sections": [
+    {
+      "index": 0,
+      "start": 0.0,
+      "end": 39.993,
+      "file": "section_000.wav"
+    },
+    {
+      "index": 1,
+      "start": 154.946638,
+      "end": 190.346638,
+      "file": "section_001.wav"
+    },
+    {
+      "index": 2,
+      "start": 190.346638,
+      "end": 198.446638,
+      "file": "section_002.wav"
+    },
+    {
+      "index": 1,
+      "start": 198.547435,
+      "end": 229.84743500000002,
+      "file": "section_001.wav"
+    },
+    {
+      "index": 2,
+      "start": 229.84743500000002,
+      "end": 243.447435,
+      "file": "section_002.wav"
+    },
+    {
+      "index": 3,
+      "start": 243.447435,
+      "end": 272.547435,
+      "file": "section_003.wav"
+    },
+    {
+      "index": 4,
+      "start": 272.547435,
+      "end": 302.447435,
+      "file": "section_004.wav"
+    },
+    {
+      "index": 5,
+      "start": 302.447435,
+      "end": 334.147435,
+      "file": "section_005.wav"
+    }
+  ]
+}

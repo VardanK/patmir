@@ -28,6 +28,7 @@ from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.runner import prewarm_stage_cache
+from patmir.pipeline.streaming import warmup
 from patmir.pipeline.stage import STAGE_ORDER
 from patmir.ui import auth, cache as cache_mod
 from patmir.ui.jobs import JobManager, JobSpec
@@ -95,6 +96,31 @@ def _create_app(
                 print(f"[prewarm] {len(built)} stages in "
                       f"{sum(built.values()):.1f}s: "
                       + ", ".join(f"{k} {v:.1f}s" for k, v in built.items()),
+                      flush=True)
+            # Watch-along selects different candidates for `separate` and
+            # `translate`, and the cache is keyed (stage, candidate_id), so
+            # prewarming the batch config alone left both as misses — the first
+            # stream of every server lifetime built a Demucs model inside its
+            # prelude, on the critical path to first audio.
+            stream_cfg = await asyncio.to_thread(
+                warmup.streaming_prewarm_config, config_path)
+            if stream_cfg is not None:
+                extra = await asyncio.to_thread(
+                    prewarm_stage_cache, stream_cfg, stage_cache)
+                if extra:
+                    print(f"[prewarm] {len(extra)} watch-along stage(s) in "
+                          f"{sum(extra.values()):.1f}s: "
+                          + ", ".join(f"{k} {v:.1f}s" for k, v in extra.items()),
+                          flush=True)
+            # The speaker embedder and age/gender profiler are not stages, so
+            # `prewarm_stage_cache` never sees them. They loaded lazily inside
+            # the prelude instead — measured at 14.3s of the first stream's
+            # time-to-first-audio, owned by no stage and recorded nowhere.
+            models = await asyncio.to_thread(warmup.prewarm_streaming_models)
+            if models:
+                print(f"[prewarm] {len(models)} watch-along model(s) in "
+                      f"{sum(models.values()):.1f}s: "
+                      + ", ".join(f"{k} {v:.1f}s" for k, v in models.items()),
                       flush=True)
 
     @app.on_event("shutdown")

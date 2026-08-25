@@ -1,0 +1,42 @@
+{"ts": 1787667812.2207499, "stage": "ingest", "pct": 0.0, "msg": "start"}
+{"ts": 1787667812.2672586, "stage": "ingest", "pct": 0.1, "msg": "source duration=38.0s"}
+{"ts": 1787667812.336657, "stage": "ingest", "pct": 1.0, "msg": "done"}
+{"ts": 1787667812.5471528, "stage": "separate", "pct": 0.0, "msg": "start"}
+{"ts": 1787667812.597108, "stage": "separate", "pct": 0.05, "msg": "extracted full-quality audio"}
+{"ts": 1787667812.6073523, "stage": "separate", "pct": 0.1, "msg": "running demucs (htdemucs) on cuda"}
+{"ts": 1787667813.4479902, "stage": "separate", "pct": 0.85, "msg": "stems ready"}
+{"ts": 1787667813.5958257, "stage": "separate", "pct": 0.9, "msg": "running Silero VAD on vocals"}
+{"ts": 1787667813.980087, "stage": "separate", "pct": 1.0, "msg": "/home/vardan/patmir/runs/20260825-182332-section/accompaniment.wav"}
+{"ts": 1787667813.980205, "stage": "separate", "pct": 1.0, "msg": "done"}
+{"ts": 1787667814.2195158, "stage": "diarize", "pct": 0.0, "msg": "start"}
+{"ts": 1787667814.2196038, "stage": "diarize", "pct": 0.05, "msg": "sortformer-nemo (nvidia/diar_streaming_sortformer_4spk-v2.1) on cuda"}
+{"ts": 1787667814.2940238, "stage": "diarize", "pct": 0.1, "msg": "vocals -> mono 16000 Hz"}
+{"ts": 1787667814.2941656, "stage": "diarize", "pct": 0.15, "msg": "running diarization"}
+{"ts": 1787667814.4528465, "stage": "diarize", "pct": 0.8, "msg": "4 raw segments"}
+{"ts": 1787667814.453102, "stage": "diarize", "pct": 1.0, "msg": "1 speakers, 2 turns, 0 overlaps"}
+{"ts": 1787667814.4531376, "stage": "diarize", "pct": 1.0, "msg": "done"}
+{"ts": 1787667814.6776705, "stage": "emotion", "pct": 0.0, "msg": "start"}
+{"ts": 1787667814.6777658, "stage": "emotion", "pct": 0.05, "msg": "loaded emotion2vec on cuda"}
+{"ts": 1787667814.8127644, "stage": "emotion", "pct": 0.95, "msg": "scored 2/2 turns"}
+{"ts": 1787667814.813212, "stage": "emotion", "pct": 1.0, "msg": "2 turns: neutral=2"}
+{"ts": 1787667814.8624694, "stage": "emotion", "pct": 1.0, "msg": "done"}
+{"ts": 1787667815.0752892, "stage": "asr", "pct": 0.0, "msg": "start"}
+{"ts": 1787667815.0754118, "stage": "asr", "pct": 0.02, "msg": "qwen3-asr (Qwen/Qwen3-ASR-1.7B-hf) on cuda"}
+{"ts": 1787667815.1056423, "stage": "asr", "pct": 0.05, "msg": "3 chunks (VAD-snapped)"}
+{"ts": 1787667819.4285343, "stage": "asr", "pct": 0.08, "msg": "detected en"}
+{"ts": 1787667824.0176637, "stage": "asr", "pct": 0.7, "msg": "decoded 3/3"}
+{"ts": 1787667824.1534326, "stage": "asr", "pct": 0.95, "msg": "aligned 3/3"}
+{"ts": 1787667824.153926, "stage": "asr", "pct": 1.0, "msg": "10 sentences, 121 words"}
+{"ts": 1787667824.1570961, "stage": "asr", "pct": 1.0, "msg": "done"}
+{"ts": 1787667824.4726102, "stage": "translate", "pct": 0.0, "msg": "start"}
+{"ts": 1787667828.678283, "stage": "translate", "pct": 0.5, "msg": "sentence 1/2"}
+{"ts": 1787667828.6784666, "stage": "translate", "pct": 1.0, "msg": "sentence 2/2"}
+{"ts": 1787667828.67879, "stage": "translate", "pct": 1.0, "msg": "done"}
+{"ts": 1787667828.900546, "stage": "tts", "pct": 0.0, "msg": "start"}
+{"ts": 1787667844.406058, "stage": "tts", "pct": 1.0, "msg": "sentence 2/2 (batch of 2)"}
+{"ts": 1787667844.4068813, "stage": "tts", "pct": 1.0, "msg": "2 sentences in 1 batches"}
+{"ts": 1787667844.4078283, "stage": "tts", "pct": 1.0, "msg": "done"}
+{"ts": 1787667844.6345701, "stage": "mux", "pct": 0.0, "msg": "start"}
+{"ts": 1787667844.8678977, "stage": "mux", "pct": 0.5, "msg": "sentence 1/2"}
+{"ts": 1787667844.928304, "stage": "mux", "pct": 1.0, "msg": "sentence 2/2"}
+{"ts": 1787667844.9954839, "stage": "mux", "pct": 1.0, "msg": "done"}
