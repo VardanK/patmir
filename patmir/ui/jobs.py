@@ -13,8 +13,10 @@ MPS + cloud-API rate limits make parallel runs unsafe. Each job:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -24,13 +26,16 @@ from typing import Any, Literal
 
 from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
+from patmir.pipeline.context import JobCancelled
 from patmir.pipeline.runner import run_job
 from patmir.pipeline.stage import STAGE_ORDER
 from patmir.ui import cache as cache_mod
 
 log = logging.getLogger(__name__)
 
-JobStatus = Literal["queued", "running", "done", "failed"]
+JobStatus = Literal[
+    "queued", "waiting", "running", "cancelling", "cancelled", "done", "failed",
+]
 _INDEX_MAX_ENTRIES = 200
 
 
@@ -108,12 +113,27 @@ class JobManager:
         *,
         storage: StoragePaths,
         stage_cache: dict | None = None,
+        accelerator_lock: asyncio.Lock | None = None,
     ) -> None:
         self._cfg = cfg
         # Warm-model cache shared with StreamManager and owned by the app, so
         # models survive across submissions instead of being rebuilt per job.
         # None keeps the old build-per-job behavior (used by the tests).
         self._stage_cache = stage_cache
+        # Serializes accelerator work against StreamManager. The two managers
+        # have their own queue/lock and so serialize internally, but nothing
+        # stopped a batch job and a watch-along stream from running inference at
+        # the same time — which OOMs a 24 GB card: the resident weights alone are
+        # ~15-16 GB (tts ~8.5, asr+aligner ~5.5, diarize 0.9, plus emotion and
+        # *two* Demucs models, since batch selects `htdemucs_vocals` and
+        # watch-along `htdemucs_fast`), and two concurrent passes add a second
+        # set of activations on top. Observed 2026-08-25: three OOMs in 230 ms,
+        # ending with a *tiny* `.to(device)` failing because the card was full.
+        # Deliberately coarse — held for a whole run, so a batch job submitted
+        # during a long watch-along waits for it. That is the honest semantics
+        # when only one pipeline fits in VRAM; the alternative is losing both.
+        # None (the default) keeps the unserialized behavior for tests.
+        self._accel_lock = accelerator_lock
         self._storage = storage
         self._runs_root = storage.runs_root
         self._cache_root = storage.cache_root
@@ -123,6 +143,10 @@ class JobManager:
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        # Per-job cooperative cancel tokens, job_id → Event. Kept OUT of
+        # JobRecord on purpose: `_persist_index` does `asdict(r)`, which cannot
+        # serialize a threading.Event.
+        self._cancels: dict[str, threading.Event] = {}
 
     # --- lifecycle ------------------------------------------------------
 
@@ -217,9 +241,47 @@ class JobManager:
         # `stage_states` / `live_*` until `run_job` returns. Read the live
         # manifest + last progress line every time the popup polls so the
         # user sees real per-stage progress.
-        if rec.status == "running" and rec.run_job_id:
+        if rec.status in ("running", "cancelling") and rec.run_job_id:
             self._merge_live_state(rec)
         return rec
+
+    def cancel(self, job_id: str) -> bool:
+        """Ask a job to stop. Returns False only for an unknown job_id.
+
+        Two genuinely different cases:
+
+        - **Not started yet** (`queued` / `waiting`) — nothing has touched the
+          accelerator, so this is immediate and exact: mark it `cancelled` and
+          the worker skips it when it reaches the front of the queue. The
+          shared accelerator lock made this case common, since a job submitted
+          during a watch-along can sit in `waiting` for a long time.
+        - **Running** — cooperative only. A Python thread cannot be killed, so
+          we set the token and the run aborts at its next checkpoint (stage
+          boundary, or a TTS decode chunk ~8s). Status goes `cancelling` and
+          becomes `cancelled` when the thread actually returns — which is also
+          when the accelerator lock is released, so the next job does not start
+          before this one has really stopped.
+
+        Idempotent: cancelling a finished, failed or already-cancelled job is a
+        no-op that still reports success.
+        """
+        rec = self._records.get(job_id)
+        if rec is None:
+            return False
+        if rec.status in ("done", "failed", "cancelled"):
+            return True
+        if rec.status in ("queued", "waiting"):
+            rec.status = "cancelled"
+            rec.finished_at = time.time()
+            self._persist_index()
+            return True
+        # running / cancelling
+        ev = self._cancels.get(job_id)
+        if ev is not None:
+            ev.set()
+        rec.status = "cancelling"
+        self._persist_index()
+        return True
 
     def _merge_live_state(self, rec: JobRecord) -> None:
         run_dir = self._runs_root / (rec.run_job_id or "")
@@ -301,22 +363,48 @@ class JobManager:
             rec = self._records.get(job_id)
             if rec is None:
                 continue
-            rec.status = "running"
-            rec.started_at = time.time()
-            self._persist_index()
-            try:
-                await asyncio.to_thread(self._run_one, rec)
-                rec.status = "done"
-            except Exception as exc:  # noqa: BLE001
-                rec.error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-                rec.status = "failed"
-                log.exception("Job %s failed.", rec.job_id)
-            finally:
-                rec.finished_at = time.time()
+            # Cancelled before it ever started (see `cancel`). Never touched the
+            # accelerator, so there is nothing to unwind — and importantly, don't
+            # take the lock for it.
+            if rec.status == "cancelled":
+                continue
+            # Surface the wait only when there is one, so the common
+            # uncontended path keeps its single status transition.
+            if self._accel_lock is not None and self._accel_lock.locked():
+                rec.status = "waiting"
+                self._persist_index()
+            async with (self._accel_lock or contextlib.nullcontext()):
+                # A cancel can land while we were queued behind the lock.
+                if rec.status == "cancelled":
+                    continue
+                ev = threading.Event()
+                self._cancels[job_id] = ev
+                rec.status = "running"
+                rec.started_at = time.time()
+                self._persist_index()
+                try:
+                    await asyncio.to_thread(self._run_one, rec, ev)
+                    rec.status = "done"
+                except JobCancelled:
+                    # Deliberate stop: not an error, and no traceback. Partial
+                    # artifacts stay in the job dir so `--resume-from` works.
+                    rec.status = "cancelled"
+                    log.info("Job %s cancelled.", rec.job_id)
+                except Exception as exc:  # noqa: BLE001
+                    rec.error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+                    rec.status = "failed"
+                    log.exception("Job %s failed.", rec.job_id)
+                finally:
+                    rec.finished_at = time.time()
+                    self._cancels.pop(job_id, None)
                 self._persist_index()
 
-    def _run_one(self, rec: JobRecord) -> None:
-        """Synchronous job execution — runs in a worker thread."""
+    def _run_one(self, rec: JobRecord, cancel: threading.Event | None = None) -> None:
+        """Synchronous job execution — runs in a worker thread.
+
+        `cancel` is the cooperative token; `run_job` checks it at each stage
+        boundary and the TTS adapter at each decode chunk.
+        """
         if rec.source_url:
             rec.stage_states["download"] = "running"
             rec.live_stage = "download"
@@ -345,6 +433,7 @@ class JobManager:
             source_lang=rec.source_lang,
             on_job_dir_created=_on_job_dir,
             stage_cache=self._stage_cache,
+            cancel=cancel,
         )
         rec.run_job_id = manifest.job_id
         # Keep download state in stage_states post-success.

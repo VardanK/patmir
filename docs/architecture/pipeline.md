@@ -127,6 +127,31 @@ video file
 
 Pattern: a stage's typed return value is in `state[stage_name]`. `ctx.extra` is for cross-stage hand-offs the typed contracts don't carry.
 
+### `JobContext.cancel` is NOT in `extra`
+
+The cooperative cancel token is its own field (`cancel: threading.Event | None`),
+with `ctx.cancelled()` and `ctx.raise_if_cancelled()` helpers, because `extra` is
+the *data* hand-off channel above and a control signal is not that.
+
+Cancellation has to be cooperative: the heavy stages run in a worker thread via
+`asyncio.to_thread`, and a Python thread cannot be killed — `task.cancel()` only
+abandons the await while the thread runs on, holding the GPU **and** the shared
+accelerator lock, so the next job would queue behind a job the user believes is
+dead. Checkpoints, and their cost:
+
+| Checkpoint | Where | Worst-case latency |
+| --- | --- | --- |
+| Each stage boundary | `runner.py`, before the stage builds | bounded by the longest stage (tts, ~77 s on CUDA) |
+| Each TTS decode chunk | the adapter's `on_chunk`, which the candidate already calls | **~8 s** (~7.7 sentences/chunk) |
+| Each sentence | the adapter's serial (non-batched) path | per sentence |
+
+Raising from `on_chunk` needs no cooperation from the TTS candidate, because it
+already invokes that callback after every chunk. `None` (the CLI, bench, tests)
+disables every checkpoint. A cancelled run leaves completed stages' artifacts on
+disk and marks the stage `cancelled` rather than `failed`, so the job stays
+resumable with `--resume-from`. ADR:
+`decisions/2026-08-25-cooperative-job-cancellation.md`.
+
 ## Post-stage runner steps
 
 Two operations run inside the runner, *not* as their own stages, because they bridge stages without independent value:

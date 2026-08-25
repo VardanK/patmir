@@ -61,9 +61,18 @@ def _create_app(
     # collide with the batch config. Without this every submission rebuilt every
     # stage inside the same long-lived server process.
     stage_cache: dict = {}
-    manager = JobManager(cfg, storage=storage, stage_cache=stage_cache)
+    # One accelerator at a time. Each manager already serializes its own work,
+    # but nothing stopped a batch job and a watch-along stream from running
+    # inference concurrently — which exhausts a 24 GB card (see JobManager's
+    # comment). Constructed here rather than per-manager precisely so the two
+    # share it. Safe to build off the loop: since 3.10 asyncio.Lock binds the
+    # running loop on first use, and both uses are inside the loop.
+    accelerator_lock = asyncio.Lock()
+    manager = JobManager(cfg, storage=storage, stage_cache=stage_cache,
+                         accelerator_lock=accelerator_lock)
     streamer = StreamManager(config_path, jobs=manager, storage=storage,
-                             stage_cache=stage_cache)
+                             stage_cache=stage_cache,
+                             accelerator_lock=accelerator_lock)
 
     app.add_middleware(
         CORSMiddleware,
@@ -254,6 +263,30 @@ def _create_app(
         if rec is None:
             raise HTTPException(status_code=404, detail="unknown job_id")
         return rec.to_public()
+
+    @app.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_token)])
+    def jobs_cancel(job_id: str):
+        """Ask a job to stop, in either mode.
+
+        One endpoint for both because `job_id` already disambiguates (stream ids
+        are `stream-`-prefixed) and the lookup below mirrors `jobs_get`.
+
+        Idempotent by design: cancelling a finished, failed or already-cancelled
+        job is a 200 no-op, so a client that retries or double-clicks Stop never
+        sees an error. Only an unknown `job_id` is a 404.
+
+        A job that had not started yet is `cancelled` by the time this returns. A
+        running one goes to `cancelling` and reaches `cancelled` when its worker
+        thread notices the token — the thread cannot be killed, so poll
+        `GET /jobs/{job_id}` for the transition rather than assuming it is done.
+        """
+        target = (streamer if job_id.startswith("stream-") else manager)
+        other = (manager if target is streamer else streamer)
+        if not target.cancel(job_id) and not other.cancel(job_id):
+            raise HTTPException(status_code=404, detail="unknown job_id")
+        rec = streamer.get(job_id) or manager.get(job_id)
+        return rec.to_public() if rec is not None else {"job_id": job_id,
+                                                        "status": "cancelled"}
 
     # ---------- D3: watch-along streaming ----------------------------------
 
