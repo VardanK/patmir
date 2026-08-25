@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -88,6 +89,7 @@ def stream_sections(
     section_seconds: float = DEFAULT_SECTION_SECONDS,
     runs_root: Path | None = None,
     max_sections: int | None = None,
+    cancel: threading.Event | None = None,
 ) -> Iterator[SectionResult]:
     """Yield dubbed sections in order, starting from the prelude's window end."""
     duration = source_duration(source)
@@ -100,7 +102,7 @@ def stream_sections(
         result = process_section(
             source, cfg, prelude.registry,
             index=index, start=t, target_seconds=section_seconds, runs_root=runs_root,
-            stage_cache=stage_cache,
+            stage_cache=stage_cache, cancel=cancel,
         )
         yield result
         # Advance to this section's VAD-snapped end; guard against no-forward-

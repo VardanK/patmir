@@ -7,6 +7,7 @@ each stage from the pipeline config, runs them in order, and writes
 from __future__ import annotations
 
 import json
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from patmir.pipeline.config import PipelineConfig
-from patmir.pipeline.context import JobContext
+from patmir.pipeline.context import JobCancelled, JobContext
 from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.stage import STAGE_ORDER
 
@@ -101,6 +102,7 @@ def run_job(
     extra: dict[str, Any] | None = None,
     on_job_dir_created: Any = None,
     stage_cache: dict[str, Any] | None = None,
+    cancel: threading.Event | None = None,
 ) -> Manifest:
     """Run the full pipeline.
 
@@ -154,6 +156,7 @@ def run_job(
         source_path=source,
         options=cfg.options,
         source_lang=manifest.source_lang,
+        cancel=cancel,
     )
     if extra:
         # Seed cross-stage hand-offs (e.g. streaming voice_assignments) before
@@ -171,6 +174,12 @@ def run_job(
             # Stage skipped on resume — load its artifact paths from manifest into state.
             state[name] = _load_resume_artifact(name, job_dir, ctx)
             continue
+        # Cancellation checkpoint. Between stages is the cheapest place to stop
+        # and leaves every completed stage's artifacts on disk, so the job stays
+        # resumable via `--resume-from`. On its own this bounds cancel latency by
+        # the LONGEST stage (tts, ~77s on CUDA / 55% of wall), which is why the
+        # TTS adapter checks again at each decode chunk (~8s).
+        ctx.raise_if_cancelled()
         st.state = "running"
         st.started_at = time.time()
         manifest.to_path(manifest_path)
@@ -204,6 +213,16 @@ def run_job(
             if name == "output" and cfg.storage.library_root is not None:
                 manifest.published_dir = _publish(job_dir, job_id, cfg, ctx)
             manifest.to_path(manifest_path)
+        except JobCancelled:
+            # A deliberate stop, not a failure: no traceback in the manifest and
+            # a distinct state, so the UI doesn't show a red error and a reader
+            # can tell "the user stopped this" from "this broke". Artifacts from
+            # completed stages stay on disk for `--resume-from`.
+            st.state = "cancelled"
+            st.finished_at = time.time()
+            manifest.to_path(manifest_path)
+            ctx.progress(name, 1.0, "cancelled")
+            raise
         except Exception as exc:
             st.state = "failed"
             st.finished_at = time.time()

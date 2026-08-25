@@ -306,6 +306,9 @@ function renderJob(rec) {
   let line;
   if (rec.status === "queued") {
     line = "Queued…";
+  } else if (rec.status === "waiting") {
+    // Blocked on the accelerator lock — another mode is using the GPU.
+    line = "Waiting for the GPU (another job is running)…";
   } else if (running) {
     let detail = running;
     if (running === "download" && typeof rec.download_pct === "number") {
@@ -326,6 +329,7 @@ function renderJob(rec) {
 function renderStreamJob(rec) {
   let line;
   if (rec.status === "queued") line = "Queued…";
+  else if (rec.status === "waiting") line = "Waiting for the GPU (another job is running)…";
   else if (rec.status === "prelude") line = "Analyzing opening (prelude)…";
   else if (rec.status === "streaming") {
     line = "Streaming — " + (rec.sections_done || 0) + " sections dubbed";

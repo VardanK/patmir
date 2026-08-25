@@ -27,7 +27,9 @@ agree on where a downloaded source lives.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -37,6 +39,7 @@ from typing import Any
 
 from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
+from patmir.pipeline.context import JobCancelled
 from patmir.pipeline.streaming.prelude import run_prelude
 from patmir.pipeline.streaming.runner import source_duration
 from patmir.pipeline.streaming.scheduler import Playhead, StreamScheduler
@@ -51,7 +54,7 @@ from patmir.ui.jobs import JobManager, JobSpec
 log = logging.getLogger(__name__)
 
 MODE = "watch-along"
-StreamStatus = str  # "queued" | "prelude" | "streaming" | "done" | "failed"
+StreamStatus = str  # queued|prelude|streaming|cancelling|cancelled|done|failed
 
 
 @dataclass
@@ -107,8 +110,14 @@ class StreamManager:
         jobs: JobManager,
         storage: StoragePaths,
         stage_cache: dict | None = None,
+        accelerator_lock: asyncio.Lock | None = None,
     ) -> None:
         self._config_path = config_path
+        # Serializes accelerator work against JobManager — see the matching
+        # comment there for why (one pipeline at a time is all a 24 GB card
+        # fits). Held for the whole stream, so a batch job submitted mid
+        # watch-along waits until the stream ends rather than OOMing it.
+        self._accel_lock = accelerator_lock
         # Warm-model cache shared with JobManager and owned by the app. It used
         # to be a local in `_run_blocking`, so every model was rebuilt when a
         # new stream started; hoisting it here keeps them resident. Keys are
@@ -124,6 +133,10 @@ class StreamManager:
         self._by_cache_key: dict[str, str] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
+        # Per-stream cooperative cancel tokens, job_id → Event. See
+        # JobManager._cancels; StreamRecord isn't persisted, but keeping the
+        # tokens here matches the batch side and keeps the record serializable.
+        self._cancels: dict[str, threading.Event] = {}
 
     # --- lifecycle ------------------------------------------------------
 
@@ -218,11 +231,44 @@ class StreamManager:
     def stop_stream(self, ck: str) -> bool:
         """Stop a stream's scheduler immediately (viewer hit Stop / closed the
         tab). Prevents an abandoned stream from dubbing — and paying ElevenLabs
-        + Scribe for — the rest of the video."""
+        + Scribe for — the rest of the video.
+
+        Keyed by cache_key, kept because the extension calls it. It now also
+        trips the cancel token, so the section *currently* being dubbed aborts at
+        its next checkpoint instead of running to completion (~35s of section)
+        while the scheduler sits stopped. Sections already written to the cache
+        stay there — that is the free-rewatch feature, not leftover garbage.
+        """
         rec = self.get_by_cache_key(ck)
-        if rec is None or rec._scheduler is None:
+        if rec is None:
             return False
-        rec._scheduler.stop()
+        if rec._scheduler is not None:
+            rec._scheduler.stop()
+        self.cancel(rec.job_id)
+        return True
+
+    def cancel(self, job_id: str) -> bool:
+        """Ask a stream to stop. Returns False only for an unknown job_id.
+
+        Mirrors `JobManager.cancel`: instant if it never started, cooperative if
+        it is running. Also stops the scheduler, so no *further* sections are
+        scheduled even before the in-flight one notices the token.
+        """
+        rec = self._records.get(job_id)
+        if rec is None:
+            return False
+        if rec.status in ("done", "failed", "cancelled"):
+            return True
+        if rec._scheduler is not None:
+            rec._scheduler.stop()
+        if rec.status == "queued":
+            rec.status = "cancelled"
+            rec.finished_at = time.time()
+            return True
+        ev = self._cancels.get(job_id)
+        if ev is not None:
+            ev.set()
+        rec.status = "cancelling"
         return True
 
     def sections_manifest(self, ck: str) -> dict[str, Any] | None:
@@ -262,11 +308,27 @@ class StreamManager:
             self._records.popitem(last=False)
 
     async def _run(self, rec: StreamRecord, force: bool) -> None:
+        # Surface the wait only when there is one, so an uncontended stream
+        # goes straight to "prelude" as it always did.
+        if self._accel_lock is not None and self._accel_lock.locked():
+            rec.status = "waiting"
+        async with (self._accel_lock or contextlib.nullcontext()):
+            if rec.status == "cancelled":   # cancelled while queued for the lock
+                return
+            await self._run_locked(rec, force)
+
+    async def _run_locked(self, rec: StreamRecord, force: bool) -> None:
+        ev = threading.Event()
+        self._cancels[rec.job_id] = ev
         rec.status = "prelude"
         rec.started_at = time.time()
         try:
-            await asyncio.to_thread(self._run_blocking, rec, force)
+            await asyncio.to_thread(self._run_blocking, rec, force, ev)
             rec.status = "done"
+        except JobCancelled:
+            # Deliberate stop. Sections already in the cache remain playable.
+            rec.status = "cancelled"
+            log.info("Stream %s cancelled.", rec.job_id)
         except asyncio.CancelledError:
             rec.status = "failed"
             rec.error = "cancelled"
@@ -277,8 +339,10 @@ class StreamManager:
             log.exception("Stream %s failed.", rec.job_id)
         finally:
             rec.finished_at = time.time()
+            self._cancels.pop(rec.job_id, None)
 
-    def _run_blocking(self, rec: StreamRecord, force: bool) -> None:
+    def _run_blocking(self, rec: StreamRecord, force: bool,
+                      cancel: threading.Event | None = None) -> None:
         """Prelude → opening dub → playhead-driven streaming. Runs on a worker
         thread; the heavy stages are synchronous."""
         cfg = self._streaming_cfg()
@@ -321,7 +385,7 @@ class StreamManager:
         prelude = run_prelude(
             local_path, cfg, runs_root=self._runs_root,
             window_seconds=cfg.options.prelude_window_seconds,
-            stage_cache=stage_cache,
+            stage_cache=stage_cache, cancel=cancel,
         )
         rec.window_end = prelude.window_end
         rec.speakers = prelude.speakers
@@ -329,7 +393,7 @@ class StreamManager:
         # 2) Dub the prelude window (section 0), reusing the prelude analysis.
         rec.status = "streaming"
         opening = dub_prelude_window(cfg, prelude, runs_root=self._runs_root,
-                                     stage_cache=stage_cache)
+                                     stage_cache=stage_cache, cancel=cancel)
         self._emit(rec, opening)
 
         # 3) Stream the rest, playhead-driven. Seed the abandon timer so the
@@ -343,8 +407,13 @@ class StreamManager:
                 return process_section(
                     local_path, cfg, prelude.registry,
                     index=index_counter["n"], start=start, runs_root=self._runs_root,
-                    stage_cache=stage_cache,
+                    stage_cache=stage_cache, cancel=cancel,
                 )
+            except JobCancelled:
+                # MUST propagate. This except-Exception used to swallow it and
+                # report a failed section, so Stop would be silently downgraded
+                # to "one section didn't work" and the stream would carry on.
+                raise
             except Exception:  # noqa: BLE001
                 log.exception("Section at %.1fs failed.", start)
                 return None

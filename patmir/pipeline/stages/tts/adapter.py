@@ -305,6 +305,13 @@ class SentenceTTS:
                 chunk_spans.append((list(indices), wall_s))
                 ctx.progress("tts", min(done / total, 1.0),
                              f"sentence {done}/{total} (batch of {len(indices)})")
+                # Cancellation checkpoint at each decode chunk. TTS is ~55% of
+                # batch wall (~77s on CUDA), so a stage-boundary-only check would
+                # make Stop take over a minute; at ~7.7 sentences per chunk this
+                # bounds it to ~8s. Raising here aborts the candidate's chunk
+                # loop — no change needed in the candidate itself, because it
+                # already calls this after every chunk.
+                ctx.raise_if_cancelled()
 
             batch_kwargs: dict[str, Any] = {}
             if self._batch_on_chunk:
@@ -330,6 +337,9 @@ class SentenceTTS:
                     ctx.progress("tts", done / total, f"sentence {done}/{total}")
         else:
             for i in range(len(jobs)):
+                # Per-sentence checkpoint: the serial path is the finest
+                # granularity available for free.
+                ctx.raise_if_cancelled()
                 _synth(i)
                 ctx.progress("tts", (i + 1) / total, f"sentence {i + 1}/{total}")
 

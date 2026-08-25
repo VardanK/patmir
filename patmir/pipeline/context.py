@@ -7,10 +7,28 @@ ASR), pipeline options, and a `progress(...)` callback that appends to
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+class JobCancelled(Exception):
+    """Raised at a checkpoint when the job's cancel token has been set.
+
+    A distinct type, not a generic failure: the runner marks the stage
+    `cancelled` rather than `failed`, and the server reports `cancelled` so a
+    deliberate stop does not render as a red error.
+
+    Cancellation is necessarily **cooperative**. The heavy stages run in a
+    worker thread via `asyncio.to_thread`, and a Python thread cannot be killed
+    — `task.cancel()` only abandons the await while the thread runs on, holding
+    the GPU *and* the shared accelerator lock (ADR
+    `2026-08-25-one-accelerator-at-a-time`), so the next job would queue behind
+    a job the user believes is dead. Hence a token checked at explicit
+    checkpoints, and never `task.cancel()`.
+    """
 
 
 @dataclass
@@ -122,6 +140,20 @@ class JobContext:
     options: PipelineOptions
     source_lang: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    # Cooperative cancel token, owned by the caller (the server's JobManager /
+    # StreamManager keep one per job). Deliberately a separate field rather than
+    # a key in `extra`: `extra` is the cross-stage data hand-off channel
+    # (vad_intervals, diarization, emotion_predictions — see pipeline.md), and a
+    # control signal is not that.
+    cancel: threading.Event | None = None
+
+    def cancelled(self) -> bool:
+        return self.cancel is not None and self.cancel.is_set()
+
+    def raise_if_cancelled(self) -> None:
+        """Checkpoint. Call where aborting is cheap and leaves usable state."""
+        if self.cancelled():
+            raise JobCancelled()
 
     def progress(self, stage: str, pct: float, msg: str = "") -> None:
         record = {

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -99,6 +100,7 @@ def run_prelude(
     runs_root: Path | None = None,
     voice_pool: list | None = None,
     stage_cache: dict | None = None,
+    cancel: threading.Event | None = None,
 ) -> PreludeResult:
     pool = build_pool(voice_pool) if voice_pool else _default_pool()
     registry = SpeakerRegistry(pool)
@@ -107,7 +109,7 @@ def run_prelude(
         slice_wav = Path(tmp) / "prelude.wav"
         _slice_audio(source, window_seconds, slice_wav)
         manifest = run_job(slice_wav, cfg, runs_root=runs_root, stop_after="asr",
-                           stage_cache=stage_cache)
+                           stage_cache=stage_cache, cancel=cancel)
         job_dir = (runs_root or cfg.storage.runs_root) / manifest.job_id
 
     window_end = _snap_window_end(job_dir, window_seconds)

@@ -900,3 +900,61 @@ class SampleCodesTest(unittest.TestCase):
             out = _sample_codes(logits, temperature=1.0, top_p=0.01, top_k=None,
                                 generator=g)
             self.assertEqual(out.tolist(), [1])
+
+
+class ChunkLoopCancellationTest(unittest.TestCase):
+    """Cancellation granularity inside TTS.
+
+    TTS is ~55% of batch wall (~77s on CUDA), so checking the cancel token only
+    at stage boundaries would make Stop take over a minute. The adapter instead
+    raises from the `on_chunk` callback the candidate already invokes after every
+    decode chunk (~7.7 sentences, ~8s), which needs NO cooperation from the
+    candidate — provided an exception raised in that callback really does abort
+    the loop rather than being swallowed. That is what these pin down.
+    """
+
+    def _decode(self, calls):
+        import numpy as np
+
+        def decode(reqs, attempt=0):
+            calls.append(len(reqs))
+            return [(np.zeros(8, dtype=np.float32), False) for _ in reqs]
+        return decode
+
+    def test_raising_from_on_chunk_aborts_the_loop_early(self):
+        from patmir.pipeline.context import JobCancelled
+
+        calls: list[int] = []
+        cand = _bare(max_batch=2)
+        cand._decode_chunk = self._decode(calls)  # type: ignore[method-assign]
+
+        def on_chunk(indices, wall_s):
+            raise JobCancelled()
+
+        # 8 sentences at max_batch=2 would be 4 chunks if it ran to completion.
+        with self.assertRaises(JobCancelled):
+            cand.synthesize_batch([{"text": "x" * 50} for _ in range(8)],
+                                  on_chunk=on_chunk)
+        self.assertEqual(calls, [2], "loop did not stop at the first chunk")
+
+    def test_on_chunk_is_called_per_chunk(self):
+        """The granularity claim itself: one callback per chunk, so the check
+        happens ~every `max_batch` sentences rather than once per stage."""
+        calls: list[int] = []
+        seen: list[list[int]] = []
+        cand = _bare(max_batch=2)
+        cand._decode_chunk = self._decode(calls)  # type: ignore[method-assign]
+        cand.synthesize_batch([{"text": "x" * 50} for _ in range(8)],
+                              on_chunk=lambda idx, w: seen.append(list(idx)))
+        self.assertEqual(len(seen), 4, f"expected 4 chunks, got {seen}")
+        self.assertEqual(sorted(i for c in seen for i in c), list(range(8)))
+
+    def test_uncancelled_batch_completes(self):
+        """Control: the hook must not perturb the normal path."""
+        calls: list[int] = []
+        cand = _bare(max_batch=2)
+        cand._decode_chunk = self._decode(calls)  # type: ignore[method-assign]
+        out = cand.synthesize_batch([{"text": "x" * 50} for _ in range(8)],
+                                    on_chunk=lambda idx, w: None)
+        self.assertEqual(len(out), 8)
+        self.assertEqual(len(calls), 4)

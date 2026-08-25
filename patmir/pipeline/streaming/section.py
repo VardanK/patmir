@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -150,6 +151,7 @@ def dub_prelude_window(
     *,
     runs_root: Path | None = None,
     stage_cache: dict | None = None,
+    cancel: threading.Event | None = None,
 ) -> SectionResult:
     """Produce the opening dub for the prelude window, reusing the prelude's
     already-completed analysis (no second Demucs/Scribe pass).
@@ -176,6 +178,7 @@ def dub_prelude_window(
             "speaker_profiles": prelude.registry.profiles(),
         },
         stage_cache=stage_cache,
+        cancel=cancel,
     )
 
     dub = job_dir / "dub.wav"
@@ -202,6 +205,7 @@ def process_section(
     pad_seconds: float = DEFAULT_PAD_SECONDS,
     runs_root: Path | None = None,
     stage_cache: dict | None = None,
+    cancel: threading.Event | None = None,
 ) -> SectionResult:
     runs_root = runs_root or cfg.storage.runs_root
     slice_len = target_seconds + pad_seconds
@@ -210,7 +214,7 @@ def process_section(
         slice_wav = Path(tmp) / "section.wav"
         _slice_audio(source, start, slice_len, slice_wav)
         manifest = run_job(slice_wav, cfg, runs_root=runs_root, stop_after="asr",
-                           stage_cache=stage_cache)
+                           stage_cache=stage_cache, cancel=cancel)
         job_dir = runs_root / manifest.job_id
 
     # VAD-snap the section end (slice-relative). Snap as far into the padded
