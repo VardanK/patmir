@@ -20,6 +20,8 @@ Human-facing navigation. The agent loads the always-loaded tier automatically vi
 - **[runs.md](runs.md)** — what every file in `runs/<job>/` is; debugging guide
 - **[glossary.md](glossary.md)** — terms (SER, VAD, DiT, ref clip, flow matching, etc.)
 - **[performance.md](performance.md)** — per-stage RTF baselines (batch + watch-along) + perf roadmap; how `patmir bench` measures
+- **[sota-review-brief.md](sota-review-brief.md)** — self-contained inventory for a "is this still SOTA?" research pass: constraints, active set, and every model + approach already rejected with its reason
+- **[doc-drift.md](doc-drift.md)** — which docs currently disagree with `patmir.toml` about what is active, and what the right answer is
 
 ### Decisions (ADRs)
 
