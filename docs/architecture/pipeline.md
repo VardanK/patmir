@@ -242,10 +242,50 @@ alongside the **streaming** stage set, whose `separate` and `translate`
 candidates differ from batch and so were previously cache misses on the first
 stream of every server lifetime.
 
-NOTE (perf follow-up): `process_section` calls `run_job` twice per section
-(analysis, then translate→tts→mux), rebuilding stage models each call. A
-warm-model loop (build stages once, process sections in place) is an open
-optimization, not a correctness issue.
+### Section pipelining (2026-08-28)
+
+`process_section` calls `run_job` twice per section — an **analysis** half
+(ingest→asr, plus the VAD end-snap, ECAPA identity resolve and transcript remap)
+and a **dub** half (translate→tts→mux). Models are not rebuilt between them: the
+shared `stage_cache` keeps every stage warm for the whole stream.
+
+Those two halves are now **overlapped across sections**: section N's dub runs on a
+worker thread under section N+1's analysis. On the pre-change baseline the split
+was 77.20 s of analysis against 140.48 s of dub over nine sections, so the loop
+costs `max(analyze, dub)` per section instead of their sum, and since the dub
+dominates the analysis becomes effectively free.
+
+```
+analyze(1) │ analyze(2) │ analyze(3) │ …      ← scheduler thread, serial
+           │ dub(1)     │ dub(2)     │ …      ← one worker, one section behind
+```
+
+The split is `analyze_section` → `SectionAnalysis` → `dub_section`;
+`process_section` remains their serial composition and is what the CLI, `patmir
+bench --serial-sections` and the tests drive. `StreamScheduler` pipelines only
+when handed both halves.
+
+Three invariants the split preserves, each pinned by test in
+`test_streaming_pipeline.py`:
+
+- **Order** — one dub worker, and N's dub is emitted before N+1's is submitted, so
+  two manifest entries can never share an index (quality issue #22).
+- **Isolation** — `SectionAnalysis` carries registry *snapshots* taken on the
+  scheduler thread, so a running dub cannot see the next section's identity
+  resolution half-applied. The halves also use disjoint stages, so they share no
+  instance out of the warm cache.
+- **Nothing dropped** — the in-flight dub is drained before idling and in
+  `finally`; otherwise the last section of every stream is lost.
+
+Coverage is recorded as soon as the *analysis* knows the boundary, because that is
+what decides where the next section starts — waiting for the dub would serialize
+the loop again.
+
+This is concurrency *within* one stream, which the accelerator lock
+(`2026-08-25-one-accelerator-at-a-time`) permits: that lock serializes a stream
+against a batch job, not the two halves of a section. It deliberately does not
+extend to two dubs in flight — that would put two 4B decodes on a card that fits
+one pipeline. ADR: `decisions/2026-08-28-watchalong-section-pipeline.md`.
 
 ## Audio artifacts written per job
 

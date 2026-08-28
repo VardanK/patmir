@@ -1,0 +1,43 @@
+card idle: 1333 MB in use
+
+true-shape MLP GEMM [8,2560]@[2560,9728]  weight 50 MB
+  bf16         0.0637 ms    782 GB/s  1.00x
+  fp16+f16acc  0.0687 ms    725 GB/s  0.93x
+
+=== bf16 ===
+Fetching 8 files:   0%|          | 0/8 [00:00<?, ?it/s]Fetching 8 files: 100%|██████████| 8/8 [00:00<00:00, 925.10it/s]
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:  22%|██▏       | 87/399 [00:00<00:00, 866.49it/s]Loading weights:  53%|█████▎    | 212/399 [00:00<00:00, 1086.07it/s]Loading weights: 100%|██████████| 399/399 [00:00<00:00, 1333.68it/s]
+[transformers] [1mHiggsMultimodalQwen3ForConditionalGeneration LOAD REPORT[0m from: /mnt/e/models_cache/hub/models--multimodalart--higgs-audio-v3-tts-4b-transformers/snapshots/30f01593ee6a12efa586c92455afe4b76e45095d
+Key               | Status  | 
+------------------+---------+-
+audio_head.weight | MISSING | 
+
+Notes:
+- MISSING:	those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+  decode-active weights 7.31 GB -> bandwidth floor 9.06 ms/step (q8 would be 4.53)
+  DynamicCache kv=  300:  43.13 ms/step    4.8x floor   overhead 79%
+  DynamicCache kv=  600:  44.06 ms/step    4.9x floor   overhead 79%
+  DynamicCache kv= 1200:  51.60 ms/step    5.7x floor   overhead 82%
+  cache-growth slope: 9.416 ms per 1000 tokens of KV
+  StaticCache  kv=  300:  43.91 ms/step   vs dynamic  43.13 -> 0.98x
+  StaticCache  kv= 1200:  48.67 ms/step   vs dynamic  51.60 -> 1.06x
+  sampler/step: as-shipped 4.73 ms | no per-row .cpu() 2.94 ms | vectorized 0.17 ms
+    -> removing the syncs saves 1.79 ms/step; vectorizing saves 4.56 ms/step
+
+=== fp16+f16acc ===
+Fetching 8 files:   0%|          | 0/8 [00:00<?, ?it/s]Fetching 8 files: 100%|██████████| 8/8 [00:00<00:00, 988.70it/s]
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights:   1%|          | 2/399 [00:00<00:57,  6.85it/s]Loading weights:   3%|▎         | 13/399 [00:00<00:15, 24.62it/s]Loading weights:   6%|▌         | 24/399 [00:00<00:12, 30.62it/s]Loading weights:   9%|▉         | 35/399 [00:01<00:11, 32.82it/s]Loading weights:  12%|█▏        | 46/399 [00:01<00:10, 33.27it/s]Loading weights:  14%|█▍        | 57/399 [00:01<00:09, 34.20it/s]Loading weights:  17%|█▋        | 68/399 [00:02<00:09, 34.10it/s]Loading weights:  20%|█▉        | 79/399 [00:02<00:09, 34.96it/s]Loading weights:  23%|██▎       | 90/399 [00:02<00:08, 35.51it/s]Loading weights:  25%|██▌       | 101/399 [00:03<00:08, 36.33it/s]Loading weights:  28%|██▊       | 112/399 [00:03<00:07, 36.43it/s]Loading weights:  31%|███       | 123/399 [00:03<00:07, 35.75it/s]Loading weights:  34%|███▎      | 134/399 [00:03<00:07, 35.90it/s]Loading weights:  36%|███▋      | 145/399 [00:04<00:06, 36.45it/s]Loading weights:  39%|███▉      | 156/399 [00:04<00:06, 36.25it/s]Loading weights:  42%|████▏     | 167/399 [00:04<00:06, 35.95it/s]Loading weights:  45%|████▍     | 178/399 [00:05<00:06, 35.56it/s]Loading weights:  47%|████▋     | 189/399 [00:05<00:05, 35.57it/s]Loading weights:  50%|█████     | 200/399 [00:05<00:05, 35.74it/s]Loading weights:  53%|█████▎    | 211/399 [00:06<00:05, 34.96it/s]Loading weights:  56%|█████▌    | 222/399 [00:06<00:05, 35.11it/s]Loading weights:  58%|█████▊    | 233/399 [00:06<00:04, 34.81it/s]Loading weights:  61%|██████    | 244/399 [00:07<00:04, 34.99it/s]Loading weights:  64%|██████▍   | 255/399 [00:07<00:04, 34.99it/s]Loading weights:  67%|██████▋   | 266/399 [00:07<00:04, 33.17it/s]Loading weights:  69%|██████▉   | 277/399 [00:08<00:03, 31.71it/s]Loading weights:  72%|███████▏  | 288/399 [00:08<00:03, 30.70it/s]Loading weights:  75%|███████▍  | 299/399 [00:08<00:03, 30.44it/s]Loading weights:  78%|███████▊  | 310/399 [00:09<00:02, 30.09it/s]Loading weights:  80%|████████  | 321/399 [00:09<00:02, 29.93it/s]Loading weights:  83%|████████▎ | 332/399 [00:10<00:02, 29.60it/s]Loading weights:  86%|████████▌ | 343/399 [00:10<00:01, 29.31it/s]Loading weights:  89%|████████▊ | 354/399 [00:10<00:01, 29.10it/s]Loading weights:  91%|█████████▏| 365/399 [00:11<00:01, 29.15it/s]Loading weights:  94%|█████████▍| 376/399 [00:11<00:00, 29.28it/s]Loading weights:  97%|█████████▋| 387/399 [00:11<00:00, 29.40it/s]Loading weights: 100%|█████████▉| 398/399 [00:12<00:00, 34.71it/s]Loading weights: 100%|██████████| 399/399 [00:13<00:00, 28.92it/s]
+[transformers] [1mHiggsMultimodalQwen3ForConditionalGeneration LOAD REPORT[0m from: /mnt/e/models_cache/hub/models--multimodalart--higgs-audio-v3-tts-4b-transformers/snapshots/30f01593ee6a12efa586c92455afe4b76e45095d
+Key               | Status  | 
+------------------+---------+-
+audio_head.weight | MISSING | 
+
+Notes:
+- MISSING:	those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+  decode-active weights 7.31 GB -> bandwidth floor 9.06 ms/step (q8 would be 4.53)
+  DynamicCache kv=  300:  44.30 ms/step    4.9x floor   overhead 80%
+  DynamicCache kv=  600:  46.55 ms/step    5.1x floor   overhead 81%
+  DynamicCache kv= 1200:  55.62 ms/step    6.1x floor   overhead 84%
+  cache-growth slope: 12.576 ms per 1000 tokens of KV
+  StaticCache  kv=  300:  71.28 ms/step   vs dynamic  44.30 -> 0.62x
+  StaticCache  kv= 1200:  50.98 ms/step   vs dynamic  55.62 -> 1.09x

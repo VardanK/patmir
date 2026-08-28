@@ -37,10 +37,11 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 from patmir.pipeline.streaming.coverage import Coverage
-from patmir.pipeline.streaming.section import SectionResult
+from patmir.pipeline.streaming.section import SectionAnalysis, SectionResult
 
 # Minimum forward step when a section reports no usable progress (no VAD gap in
 # the window) — keeps the loop from spinning on the same start.
@@ -72,6 +73,8 @@ class StreamScheduler:
         prelude_end: float,
         process_fn: Callable[[float, float | None], SectionResult | None],
         playhead_fn: Callable[[], Playhead],
+        analyze_fn: Callable[[float, float | None], SectionAnalysis | None] | None = None,
+        dub_fn: Callable[[SectionAnalysis], SectionResult | None] | None = None,
         on_section: Callable[[SectionResult], None] | None = None,
         section_seconds: float = 30.0,
         lookahead_seconds: float = DEFAULT_LOOKAHEAD_SECONDS,
@@ -82,6 +85,12 @@ class StreamScheduler:
         self.duration = duration
         self.process_fn = process_fn
         self.playhead_fn = playhead_fn
+        # When BOTH halves are supplied, `run()` overlaps them across sections
+        # (see `_run_pipelined`). Supplying neither keeps the serial loop, which
+        # is what `patmir bench`, the CLI loop and every scheduler unit test use
+        # — they inject a single fake `process_fn` and must keep working.
+        self.analyze_fn = analyze_fn
+        self.dub_fn = dub_fn
         self.on_section = on_section
         self.section_seconds = section_seconds
         self.lookahead_seconds = lookahead_seconds
@@ -152,6 +161,19 @@ class StreamScheduler:
     def run(self) -> None:
         """Track the playhead, dubbing a bounded window ahead. Ends on stop(),
         viewer-abandonment, or when the rest of the video within range is done."""
+        if self.analyze_fn is not None and self.dub_fn is not None:
+            self._run_pipelined()
+        else:
+            self._run_serial()
+
+    def _ceiling(self, max_end: float | None) -> float:
+        return self.duration if max_end is None else min(self.duration, max_end)
+
+    def _section_end(self, start: float, end: float, ceiling: float) -> float:
+        """Clamp a reported end that made no real progress, so the loop advances."""
+        return min(start + self.section_seconds, ceiling) if end <= start + 0.5 else end
+
+    def _run_serial(self) -> None:
         while not self._stop.is_set():
             nxt = self._next_start()
             if nxt is None:
@@ -160,15 +182,72 @@ class StreamScheduler:
                 continue           # caught up; wait for the playhead to advance
             start, max_end = nxt
             result = self.process_fn(start, max_end)
-            ceiling = self.duration if max_end is None else min(self.duration, max_end)
+            ceiling = self._ceiling(max_end)
             if result is None:
                 # Processing failed for this window; force progress so we don't
                 # retry the same start forever.
                 self.coverage.add(start, min(start + _MIN_STEP, ceiling))
                 continue
-            end = result.end
-            if end <= start + 0.5:
-                end = min(start + self.section_seconds, ceiling)
-            self.coverage.add(start, end)
+            self.coverage.add(start, self._section_end(start, result.end, ceiling))
             if self.on_section is not None and result.dub_wav is not None:
                 self.on_section(result)
+
+    def _emit(self, pending: "Future | None") -> "Future | None":
+        """Wait for an in-flight dub and hand it to `on_section`. Returns None.
+
+        Exceptions propagate. A dub that raises must not be silently dropped —
+        `JobCancelled` in particular has to reach `run()`'s caller, which is the
+        bug `_process`'s bare `except Exception` once caused in the serial path.
+
+        Callers assign the return value back over their handle, so a future is
+        awaited exactly once: without that, a dub that raised inside the loop
+        would be awaited a second time by `_run_pipelined`'s `finally` and
+        re-raise from the cleanup path.
+        """
+        if pending is None:
+            return None
+        result = pending.result()
+        if result is not None and self.on_section is not None and result.dub_wav is not None:
+            self.on_section(result)
+        return None
+
+    def _run_pipelined(self) -> None:
+        """Serial loop, except the dub of section N runs under the analysis of N+1.
+
+        The two halves use disjoint stages — analysis is separate/diarize/emotion/asr,
+        the dub is translate/tts/mux — so they share no stage instance out of the warm
+        `stage_cache`, and `SectionAnalysis` carries registry SNAPSHOTS so a running
+        dub cannot see the next section's identity resolution half-applied.
+
+        Order is preserved by construction: one worker, and each section's dub is
+        emitted before the next is submitted. Coverage is recorded as soon as the
+        ANALYSIS knows the boundary, because that is what decides where the next
+        section starts — waiting for the dub would serialize the loop again.
+
+        The dub is drained before idling and in `finally`, so a stream that stops or
+        completes never abandons a finished section that was still in flight.
+        """
+        pending: Future | None = None
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="patmir-dub") as pool:
+            try:
+                while not self._stop.is_set():
+                    nxt = self._next_start()
+                    if nxt is None:
+                        pending = self._emit(pending)
+                        if not self._idle_fn():
+                            break      # stopped or abandoned
+                        continue       # caught up; wait for the playhead
+                    start, max_end = nxt
+                    analysis = self.analyze_fn(start, max_end)   # type: ignore[misc]
+                    ceiling = self._ceiling(max_end)
+                    if analysis is None:
+                        self.coverage.add(start, min(start + _MIN_STEP, ceiling))
+                        continue
+                    end = self._section_end(
+                        start, analysis.start + analysis.end_rel, ceiling)
+                    self.coverage.add(start, end)
+                    # Section N-1's dub has been running under this analysis.
+                    pending = self._emit(pending)
+                    pending = pool.submit(self.dub_fn, analysis)  # type: ignore[arg-type]
+            finally:
+                pending = self._emit(pending)

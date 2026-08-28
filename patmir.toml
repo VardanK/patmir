@@ -453,11 +453,29 @@ codec_device  = "mps"
 # `max_batch` is the headline knob: the AR decode is memory-bandwidth-bound on
 # the 4B weights, so a step reads all of them to advance ONE sentence at batch 1.
 # Batching amortizes that read, which is why TTS (~69% of batch wall) is the
-# stage worth batching. 8 is chosen to be safely conservative on 24 GB rather
-# than measured: weights are ~8 GB bf16 and the KV cache is cheap here because
-# the model is GQA with 8 KV heads — 144 KiB/token, so B=8 over a 1500-token
-# context is only ~1.7 GiB. Raise it after measuring; the ceiling is compute,
-# not memory. Set to 1 to fall back to the adapter's per-sentence loop.
+# stage worth batching. 8 was chosen to be safely conservative on 24 GB rather
+# than measured; it is now measured (2026-08-28, idle 3090).
+#
+# Decode step time is FLAT from B=1 to B=24 (45-49 ms at kv=300) while
+# per-sentence cost falls linearly — the step sits at ~20% of the card's
+# 807 GB/s bandwidth roof at every batch size we can reach, so more rows per
+# step are close to free. The microbenchmark says B=24 is 3.1x cheaper per
+# sentence than B=8.
+#
+# 12, not 24, because the END-TO-END measurement is what governs: on a real
+# watch-along section (12 translated sentences, real pinned refs) 8 -> 12 takes
+# the TTS stage 24.16 -> 18.08 s (1.34x) at +1.21 GB peak, and 16 and 24 are
+# indistinguishable from 12 because the section is already ONE chunk at 12.
+# A section only has ~10-12 sentences, so the microbenchmark's remaining
+# headroom has nothing to batch. Batch mode (77 sentences) gets 7 chunks
+# instead of 10 from the same setting.
+#
+# NOTE: changing this changes every line's AUDIO. The decode is reproducible but
+# not batch-INVARIANT (ADR 2026-08-24-tts-sampling-reproducibility): chunk
+# membership changes the left-padded prefill shape, and at temperature 0.8 a
+# one-bit logit difference flips a multinomial draw. Measured: 12 of 12 lines
+# redrawn. Not a quality regression — but not a no-op either, so it wants an ear
+# check. Set to 1 to fall back to the adapter's per-sentence loop.
 #
 # `attn_implementation` stays "sdpa": the upstream port declares `_supports_sdpa`
 # only, so flash_attention_2 is refused by transformers until upstream flags it.
@@ -478,7 +496,7 @@ temperature   = 0.8
 top_p         = 0.95
 seed          = 0
 max_retries   = 2
-max_batch     = 8
+max_batch     = 12          # measured 2026-08-28; see the note above
 
 [[eval.tts.candidates]]
 id            = "omnivoice_mlx_bf16"

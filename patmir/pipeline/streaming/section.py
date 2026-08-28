@@ -206,7 +206,31 @@ def dub_prelude_window(
     )
 
 
-def process_section(
+@dataclass
+class SectionAnalysis:
+    """The analysis half's output: everything `dub_section` needs to run.
+
+    Exists so the two halves can run on different threads. The registry
+    snapshots are taken HERE, on the scheduler's single thread, rather than read
+    inside the dub — a pipelined dub of section N runs concurrently with section
+    N+1's `_resolve_identities`, which mutates the registry, and passing the live
+    registry through would make the dub's voice assignments depend on how far the
+    next section had got.
+    """
+    index: int
+    start: float
+    end_rel: float               # section length, slice-relative (VAD-snapped)
+    job_dir: Path
+    local_to_global: dict[str, str]
+    new_speakers: list[str]
+    voice_assignments: dict
+    locked_refs: dict
+    speaker_profiles: dict
+    bench: bool = False
+    t0: float = 0.0              # perf_counter at slice time, so wall_s spans both halves
+
+
+def analyze_section(
     source: Path,
     cfg: PipelineConfig,
     registry: SpeakerRegistry,
@@ -221,7 +245,13 @@ def process_section(
     bench: bool = False,
     source_lang: str | None = None,
     max_end: float | None = None,
-) -> SectionResult:
+) -> SectionAnalysis:
+    """Slice, analyze (ingest->asr), snap the end, resolve identities, remap.
+
+    Mutates `registry` (new speakers are registered here), so this half must stay
+    on one thread. Everything downstream of it is pure with respect to the
+    registry, which is what makes `dub_section` safe to run concurrently.
+    """
     runs_root = runs_root or cfg.storage.runs_root
     t0 = perf_counter()
     slice_len = target_seconds + pad_seconds
@@ -266,7 +296,33 @@ def process_section(
     _remap_and_trim_transcript(job_dir, mapping, end_rel)
     _remap_refs(job_dir, mapping)
 
-    # translate → tts → mux on the (remapped) transcript, with registry voices.
+    return SectionAnalysis(
+        index=index, start=start, end_rel=end_rel, job_dir=job_dir,
+        local_to_global=mapping, new_speakers=new_speakers,
+        voice_assignments=registry.assignments(),
+        locked_refs=registry.locked_refs(),
+        speaker_profiles=registry.profiles(),
+        bench=bench, t0=t0,
+    )
+
+
+def dub_section(
+    cfg: PipelineConfig,
+    analysis: SectionAnalysis,
+    *,
+    runs_root: Path | None = None,
+    stage_cache: dict | None = None,
+    cancel: threading.Event | None = None,
+) -> SectionResult:
+    """translate -> tts -> mux on the analyzed (remapped) transcript.
+
+    Touches no shared mutable state: the registry values it needs were snapshot
+    into `analysis`, and its job dir is its own. That is what lets the scheduler
+    run it while the next section is being analyzed.
+    """
+    runs_root = runs_root or cfg.storage.runs_root
+    job_dir = analysis.job_dir
+
     # On resume the `source` arg is unused (earlier stages load from disk).
     run_job(
         job_dir,
@@ -276,28 +332,66 @@ def process_section(
         resume_from="translate",
         stop_after="mux",
         extra={
-            "voice_assignments": registry.assignments(),
-            "locked_refs": registry.locked_refs(),
-            "speaker_profiles": registry.profiles(),
-            **({"bench": True} if bench else {}),
+            "voice_assignments": analysis.voice_assignments,
+            "locked_refs": analysis.locked_refs,
+            "speaker_profiles": analysis.speaker_profiles,
+            **({"bench": True} if analysis.bench else {}),
         },
         stage_cache=stage_cache,
+        # The serial version never threaded a cancel token into this half, so a
+        # Stop could not interrupt translate/tts/mux and had to wait out the
+        # longest stage. That was tolerable when the dub was the last thing in a
+        # section; with the dub now running under the NEXT section's analysis,
+        # an uncancellable dub would hold the stream open past a Stop.
+        cancel=cancel,
     )
 
     dub = job_dir / "dub.wav"
     out_chunk = job_dir / "section_dub.wav"
     if dub.exists():
-        _trim_wav(dub, end_rel, out_chunk)
+        _trim_wav(dub, analysis.end_rel, out_chunk)
     else:
         out_chunk = None  # type: ignore[assignment]
 
     return SectionResult(
-        index=index,
-        start=start,
-        end=start + end_rel,
+        index=analysis.index,
+        start=analysis.start,
+        end=analysis.start + analysis.end_rel,
         dub_wav=out_chunk,
         job_dir=job_dir,
-        local_to_global=mapping,
-        new_speakers=new_speakers,
-        wall_s=perf_counter() - t0,
+        local_to_global=analysis.local_to_global,
+        new_speakers=analysis.new_speakers,
+        wall_s=perf_counter() - analysis.t0,
     )
+
+
+def process_section(
+    source: Path,
+    cfg: PipelineConfig,
+    registry: SpeakerRegistry,
+    *,
+    index: int,
+    start: float,
+    target_seconds: float = DEFAULT_SECTION_SECONDS,
+    pad_seconds: float = DEFAULT_PAD_SECONDS,
+    runs_root: Path | None = None,
+    stage_cache: dict | None = None,
+    cancel: threading.Event | None = None,
+    bench: bool = False,
+    source_lang: str | None = None,
+    max_end: float | None = None,
+) -> SectionResult:
+    """Analyze then dub one section, serially. The two halves composed.
+
+    Kept as the single-threaded entry point: `patmir bench`, the CLI streaming
+    loop and every existing test drive this. The scheduler calls the two halves
+    separately so it can overlap them across sections.
+    """
+    analysis = analyze_section(
+        source, cfg, registry, index=index, start=start,
+        target_seconds=target_seconds, pad_seconds=pad_seconds,
+        runs_root=runs_root, stage_cache=stage_cache, cancel=cancel,
+        bench=bench, source_lang=source_lang, max_end=max_end,
+    )
+    return dub_section(cfg, analysis, runs_root=runs_root, stage_cache=stage_cache,
+                       cancel=cancel)

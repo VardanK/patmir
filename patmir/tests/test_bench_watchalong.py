@@ -122,7 +122,7 @@ class BenchUrlWiringTest(unittest.TestCase):
         base = dict(clip=None, url=None, mode="watch-along", config=cli.DEFAULT_CONFIG,
                     repeat=1, warm_cache=True, max_sections=1, report=None, label=None,
                     profile=None, scheduler=True, playhead="greedy", prewarm=False,
-                    traces=True)
+                    traces=True, serial_sections=False)
         base.update(kw)
         return argparse.Namespace(**base)
 

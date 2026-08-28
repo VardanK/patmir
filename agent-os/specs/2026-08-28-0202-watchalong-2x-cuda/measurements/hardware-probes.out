@@ -1,0 +1,32 @@
+torch 2.11.0+cu128  cuda 12.8
+device NVIDIA GeForce RTX 3090  capability (8, 6)
+bf16 supported True
+
+card idle: 1333 MB in use
+
+HBM read+write : 807 GB/s  (spec 936)
+
+decode GEMM [8,4096]@[4096,14336]  weight 117 MB  HBM roof 0.147 ms
+  bf16 default               0.223 ms    527 GB/s  1.00x
+  bf16 +reduced_reduction    0.216 ms    544 GB/s  1.03x
+  fp16 default (fp32 acc)    0.220 ms    534 GB/s  1.01x
+  fp16 +fp16_accum           0.153 ms    769 GB/s  1.46x
+
+fp16+accum speedup vs bf16 by batch (flops/byte = 2B):
+  B=    1  ai=     2   bf16  0.167 ms   fp16+acc  0.154 ms   1.08x
+  B=    8  ai=    16   bf16  0.225 ms   fp16+acc  0.165 ms   1.37x
+  B=   16  ai=    32   bf16  0.241 ms   fp16+acc  0.145 ms   1.66x
+  B=   64  ai=   128   bf16  0.347 ms   fp16+acc  0.154 ms   2.25x
+  B=  256  ai=   512   bf16  0.545 ms   fp16+acc  0.318 ms   1.71x
+  B= 1024  ai=  2048   bf16  1.927 ms   fp16+acc  1.262 ms   1.53x
+
+fp8 _scaled_mm : UNAVAILABLE - torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm MI300+
+W8A8 _int_mm n=4096:   2.32 ms ->  59.2 TOPS  (spec 284)
+W8A8 _int_mm n=8192:  18.31 ms ->  60.0 TOPS  (spec 284)
+
+tiny kernel launch : 10.5 us
+tensor.cpu() sync  : 29.8 us
+
+fp32-accum rel err : 1.762e-04
+fp16-accum rel err : 2.194e-03  (12x worse)
+activation absmax  : 7.0  (fp16 ceiling 65504)

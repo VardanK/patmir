@@ -47,7 +47,9 @@ from patmir.pipeline.streaming.scheduler import Playhead, StreamScheduler
 from patmir.pipeline.streaming.timing import section_timing
 from patmir.pipeline.streaming.section import (
     SectionResult,
+    analyze_section,
     dub_prelude_window,
+    dub_section,
     process_section,
 )
 from patmir.ui import cache as cache_mod
@@ -502,10 +504,40 @@ class StreamManager:
                 log.exception("Section at %.1fs failed.", start)
                 return None
 
+        # The same work, split so the scheduler can run a section's dub under the
+        # next section's analysis. Failure handling matches `_process` exactly:
+        # JobCancelled propagates, anything else costs one section, not the stream.
+        def _analyze(start: float, max_end: float | None = None):
+            index_counter["n"] += 1
+            try:
+                return analyze_section(
+                    local_path, cfg, prelude.registry,
+                    index=index_counter["n"], start=start, runs_root=self._runs_root,
+                    stage_cache=stage_cache, cancel=cancel,
+                    source_lang=prelude.source_lang, max_end=max_end,
+                )
+            except JobCancelled:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("Section analysis at %.1fs failed.", start)
+                return None
+
+        def _dub(analysis) -> SectionResult | None:
+            try:
+                return dub_section(cfg, analysis, runs_root=self._runs_root,
+                                   stage_cache=stage_cache, cancel=cancel)
+            except JobCancelled:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("Section dub at %.1fs failed.", analysis.start)
+                return None
+
         scheduler = StreamScheduler(
             duration=rec.duration,
             prelude_end=prelude.window_end,
             process_fn=_process,
+            analyze_fn=_analyze,
+            dub_fn=_dub,
             playhead_fn=lambda: rec.playhead,
             on_section=lambda r: self._emit(rec, r),
             alive_fn=lambda: rec.last_seen_at or 0.0,

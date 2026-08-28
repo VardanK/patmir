@@ -320,6 +320,49 @@ content, no for dense. TTS + ASR are the two levers; both scale with speech.
 
 ## Watch-along (D3, streaming mode)
 
+### sample_1.mkv (Reacher) on CUDA / RTX 3090 — 2026-08-28, section pipeline + `max_batch` 12
+
+Two arms, **same code, same session, idle card**, scheduler driver, greedy playhead.
+Steady state = sections 1-9 (the prelude and its dub are identical either way).
+Reports: `agent-os/specs/2026-08-28-0202-watchalong-2x-cuda/measurements/bench-watch-{serial-control,pipelined}.json`.
+
+| | serial control | pipelined |
+| --- | --: | --: |
+| steady elapsed | 182.52 s | **158.48 s** |
+| steady audio | 296.5 s | 287.3 s |
+| **steady RTF** | **0.616** | **0.552** |
+| sum of per-section walls | 182.52 s | 300.33 s |
+| peak VRAM | 15.61 GB | 15.60 GB |
+| time to first audio | 163.5 s | 165.9 s |
+
+**1.12x from the pipeline.** The target for this work was 0.44 and it is not met.
+
+Why it is 12% and not 45%: **both halves are GPU-bound and two threads time-slice one
+device.** Run concurrently, ASR takes **2.09x** longer (31.08 -> 64.97 s) and TTS
+**1.37x** (82.92 -> 113.61 s); total work rises 162.3 -> 225.6 s while elapsed falls
+24 s. Not memory — peak VRAM is unchanged with 7.8 GB free. The overlap can only
+recover genuinely non-GPU work: the cloud translate call (28.58 s), ffmpeg slice/trim,
+ECAPA, and the age/gender profile.
+
+Cost not visible in the RTF: **per-section latency variance gets worse.** Worst section
+serial 31.19 s wall for 36.5 s audio (0.85); pipelined 44.14 s for 36.5 s (**1.21** —
+the buffer shrinks during it). Both arms ran `--playhead greedy`, which measures
+throughput and *cannot stall by construction*, so **a `--playhead realtime` stall count
+on both arms is still outstanding** and is the verification this baseline is missing.
+
+Steady-state stage split (serial arm): tts 82.92 s (45%), asr 31.08 s (17%), translate
+28.58 s (16%), separate 10.06 s (6%), unowned ~20 s (11%).
+
+**Do not compare either arm to the 0.877 below.** Every stored watch-along baseline
+records no `driver` and so predates the scheduler-driven bench; the same-code serial
+control is the only valid control, which is what `--serial-sections` exists for.
+`max_batch` explains part of 0.877 -> 0.616 (TTS 0.360 -> 0.280 s per audio-second,
+1.29x, matching the isolated 1.34x) but **not ASR, which is 2.1x faster per
+audio-second than that baseline for reasons nothing in this work changed** — unexplained
+and worth chasing before trusting cross-date watch-along comparisons.
+
+ADR: `decisions/2026-08-28-watchalong-section-pipeline.md`.
+
 ### sample_1.mkv (Reacher) on CUDA / RTX 3090 — 2026-08-24, re-measured after the speaker-identity work
 
 `agg RTF 1.456 · steady-state sections 1-9 = 0.877 · wall 438s · build 147s`

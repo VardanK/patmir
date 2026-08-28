@@ -442,6 +442,7 @@ def _section_record(index: int, sec, wall_s: float, runs_root: Path) -> dict[str
 
 def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                       repeat: int = 1, max_sections: int | None = None,
+                      serial_sections: bool = False,
                       label: str | None = None,
                       warm_cache: bool = True,
                       scheduler: bool = True,
@@ -464,6 +465,8 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
     from patmir.pipeline.streaming.section import (
         DEFAULT_SECTION_SECONDS,
         dub_prelude_window,
+        analyze_section,
+        dub_section,
         process_section,
     )
 
@@ -506,6 +509,10 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
 
         counter = {"n": 0}
         stalls: list[dict[str, Any]] = []
+        # Real elapsed seconds of the streaming phase. Under the pipeline the
+        # per-section walls OVERLAP, so summing them double-counts and would
+        # report no improvement however well the overlap worked.
+        stream_elapsed_s: float | None = None
 
         def _one(start: float, max_end: float | None = None):
             counter["n"] += 1
@@ -523,26 +530,75 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                                             time.perf_counter() - s0, runs_root))
             return sec
 
+        def _process_serial(start: float, max_end: float | None = None):
+            if max_sections is not None and counter["n"] >= max_sections:
+                sched.stop()
+                return None
+            return _one(start, max_end)
+
         if scheduler:
             # Drive the SAME scheduler the server runs, so coverage, lookahead,
             # seek priority and idling are inside the measurement instead of
-            # being replaced by a straight-line loop that cannot stall.
+            # being replaced by a straight-line loop that cannot stall. That
+            # includes the PIPELINE: the server overlaps a section's dub with the
+            # next section's analysis, so a bench that ran them serially would
+            # measure a configuration nobody ships.
             ph = BenchPlayhead(playhead)
+            pending: dict[str, Any] = {}
 
-            def _process(start: float, max_end: float | None = None):
+            def _analyze(start: float, max_end: float | None = None):
                 if max_sections is not None and counter["n"] >= max_sections:
                     sched.stop()
                     return None
-                return _one(start, max_end)
+                counter["n"] += 1
+                idx = counter["n"]
+                pending[str(idx)] = time.perf_counter()
+                return analyze_section(
+                    clip, cfg, prelude.registry,
+                    index=idx, start=start, runs_root=runs_root,
+                    stage_cache=stage_cache, bench=traces,
+                    source_lang=prelude.source_lang, max_end=max_end,
+                )
+
+            def _dub(analysis):
+                sec = dub_section(cfg, analysis, runs_root=runs_root,
+                                  stage_cache=stage_cache)
+                s0 = pending.pop(str(analysis.index), time.perf_counter())
+                sections.append(_section_record(analysis.index, sec,
+                                                time.perf_counter() - s0, runs_root))
+                return sec
+
+            def _bench_idle() -> bool:
+                """End the run when the whole video is covered.
+
+                `BenchPlayhead` deliberately keeps `updated_at` fresh — a
+                synthetic viewer never leaves — so the scheduler's default idle,
+                which ends a stream after `abandon_seconds` without a sign of
+                life, can never fire here. Without this the scheduler-driven
+                bench spins at 2 s a tick forever once the last section lands and
+                the report is never written. Every stored scheduler run used
+                `--max-sections`, which stops through a different path, so a
+                full-length scheduler run had never reached this state.
+                """
+                if sched.coverage.first_uncovered(after=0.0,
+                                                  until=duration - 1.0) is None:
+                    return False
+                time.sleep(0.25)
+                return True
 
             sched = StreamScheduler(
                 duration=duration,
                 prelude_end=prelude.window_end,
-                process_fn=_process,
+                process_fn=_process_serial,
+                analyze_fn=None if serial_sections else _analyze,
+                dub_fn=None if serial_sections else _dub,
                 playhead_fn=ph,
+                idle_fn=_bench_idle,
             )
             ph.coverage = sched.coverage
+            _stream_t0 = time.perf_counter()
             sched.run()
+            stream_elapsed_s = time.perf_counter() - _stream_t0
             stalls = ph.stalls
         else:
             idx = 1
@@ -555,9 +611,24 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                 if max_sections is not None and idx > max_sections:
                     break
 
+        sections.sort(key=lambda s_: s_["index"])
         dubbed_audio_s = sum(s["section_s"] for s in sections)
+        # Sum of per-section walls: still the right denominator for per-stage
+        # attribution, but NOT the wall the viewer experiences once the halves
+        # overlap -- a section's analyze and the previous section's dub run at the
+        # same wall-clock time, so the sum counts that time twice.
         sections_wall = sum(s["wall_s"] for s in sections)
-        total_wall = prelude_wall + sections_wall
+        # `stream_elapsed_s` is measured around `sched.run()`, which covers only
+        # sections 1..N -- section 0 is the prelude dub and finishes before the
+        # scheduler starts. Comparing it against a sum that INCLUDES section 0
+        # understates the total by section 0's wall and reports a ~70 s "overlap"
+        # on a serial run. So both sides of the comparison are steady-state only.
+        steady_wall = sum(s["wall_s"] for s in sections if s["index"] >= 1)
+        steady_audio_s = sum(s["section_s"] for s in sections if s["index"] >= 1)
+        sec0_wall_s = sum(s["wall_s"] for s in sections if s["index"] == 0)
+        steady_elapsed = stream_elapsed_s if stream_elapsed_s is not None else steady_wall
+        sections_elapsed = sec0_wall_s + steady_elapsed
+        total_wall = prelude_wall + sections_elapsed
 
         # Aggregate per-stage walls + builds across all sections, so the table
         # is comparable to batch (and exposes total rebuild cost).
@@ -597,6 +668,19 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
             notes={
                 "prelude_wall_s": round(prelude_wall, 2),
                 "sections_wall_s": round(sections_wall, 2),
+                # Wall clock actually spent on sections (section 0 + the measured
+                # elapsed of the scheduler loop). Differs from `sections_wall_s`
+                # by exactly what the pipeline overlapped.
+                "sections_elapsed_s": round(sections_elapsed, 2),
+                # Steady state = sections 1..N, i.e. excluding the prelude dub.
+                # This is the pair to compare across arms: the prelude is not
+                # pipelined and its cost is identical either way.
+                "steady_wall_sum_s": round(steady_wall, 2),
+                "steady_elapsed_s": round(steady_elapsed, 2),
+                "steady_audio_s": round(steady_audio_s, 2),
+                "steady_rtf": (round(steady_elapsed / steady_audio_s, 3)
+                               if steady_audio_s else None),
+                "pipeline_overlap_s": round(steady_wall - steady_elapsed, 2),
                 "dubbed_audio_s": round(dubbed_audio_s, 2),
                 "n_sections": len(sections),
                 "total_build_s": round(total_build, 2),
@@ -608,6 +692,10 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                 # age-gender profile, and any lazily-loaded model.
                 "other_s": round(sum(s_.get("other_s") or 0.0 for s_ in sections), 2),
                 "driver": "scheduler" if scheduler else "forward-loop",
+                # Whether a section's dub overlapped the NEXT section's
+                # analysis. False is the pre-2026-08-28 behaviour and is the
+                # control any pipelined number has to be read against.
+                "pipelined": bool(scheduler and not serial_sections),
                 "playhead": playhead if scheduler else None,
                 # Non-empty only under --playhead realtime: each entry is a
                 # freeze the viewer would have seen.

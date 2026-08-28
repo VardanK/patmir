@@ -130,6 +130,11 @@ def main(argv: list[str] | None = None) -> int:
                               "loop instead of driving StreamScheduler. The loop cannot "
                               "stall, seek or idle, so it does not measure the live "
                               "path — kept because every stored baseline used it.")
+    p_bench.add_argument("--serial-sections", action="store_true", default=False,
+                         help="watch-along + scheduler only: run each section's "
+                              "analysis and dub in sequence instead of overlapping "
+                              "a section's dub with the next section's analysis. "
+                              "The pre-2026-08-28 behaviour, kept as the control.")
     p_bench.add_argument("--playhead", choices=["greedy", "realtime"], default="greedy",
                          help="watch-along + scheduler only. greedy: the viewer sits at "
                               "the buffer edge, so wall time is pure production "
@@ -360,6 +365,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
             warm_cache=args.warm_cache,
             scheduler=args.scheduler, playhead=args.playhead,
             prewarm=args.prewarm, traces=args.traces,
+            serial_sections=args.serial_sections,
         )
 
     print(benchmod.format_report(results))
