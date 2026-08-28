@@ -75,37 +75,100 @@
   let audioStartOffset = 0;
   let currentSourceRate = 1;
 
+  // --- YouTube ads ----------------------------------------------------
+  //
+  // Ads play through the SAME <video> element as the content, which breaks the
+  // dub in two ways, and the second one used to be permanent:
+  //
+  //   (a) `currentTime` during an ad is the AD's timeline, so every anchor
+  //       computed from it is wrong.
+  //   (b) the src swap fires `emptied`/`loadstart`, which `onVideoSourceChanged`
+  //       read as "the viewer navigated to another video" and answered with a
+  //       full `stopDub()`. An unskippable mid-roll therefore killed the dub for
+  //       the rest of the video, with no way back short of pressing play again.
+  //
+  // So: detect the ad, silence the dub WITHOUT tearing it down, and let the
+  // ordinary "picture confirmed moving" path re-anchor when the content
+  // resumes. Detection lives in `adState()` and is polled from the sync tick
+  // that already runs -- no new timer.
+  let adShowing = false;
+  // The content source, remembered across an ad break so the navigation guard
+  // has something true to compare against once the ad ends.
+  let contentSrc = null;
+  // Duration of the video the viewer actually came to watch, sampled whenever
+  // the player is NOT showing an ad. The last line of defence for the auto-skip
+  // seek: if the element we are about to seek reports this duration, whatever
+  // else we believe, it is the content and we must not touch it.
+  let contentDuration = null;
+
   // --- message routing ------------------------------------------------
 
+  // The playback primitives, extracted from the message handlers so the
+  // in-page overlay reaches EXACTLY the same code path the popup does. One
+  // implementation matters most for the opt-out bookkeeping below: a stop that
+  // skipped `setVideoDisabled(url, true)` would be undone by the auto-play
+  // listener within a tick, and the button would look broken.
+  async function playQuality(cacheKey) {
+    // Explicit play also removes any prior opt-out for this video so the next
+    // visit auto-plays again.
+    await setVideoDisabled(window.location.href, false);
+    stopWatchAlong();
+    await startDub(cacheKey);
+    return { ok: true };
+  }
+
+  async function playWatchAlongFor(cacheKey) {
+    await setVideoDisabled(window.location.href, false);
+    stopDub();
+    await startWatchAlong(cacheKey);
+    return { ok: true };
+  }
+
+  // Switches the AUDIO TRACK off, nothing else: the dub source stops, the mute
+  // control hands `video.muted` back to the viewer's own intent (so the original
+  // comes back), and the picture keeps rolling. Never pauses, never seeks.
+  async function stopTranslation() {
+    // Explicit stop opts this video out of future auto-play — "off" has to stay
+    // off, and it is also what stops the auto-play listener restarting the dub
+    // the moment `patmirDisabledVideos` changes.
+    await setVideoDisabled(window.location.href, true);
+    stopPlayback();
+    return { ok: true };
+  }
+
+  async function playbackStatus() {
+    const url = window.location.href;
+    const disabled = await isVideoDisabled(url);
+    const isPlaying = playing || waActive;
+    const mode = waActive ? "watch-along" : (playing ? "quality" : null);
+    return {
+      ok: true, playing: isPlaying, mode, hasVideo: !!findVideo(), disabled,
+      buffering: waActive && waBuffering,
+      adShowing: adState().showing,
+    };
+  }
+
+  // Message types this script answers. Anything else must fall through WITHOUT
+  // claiming the response channel: overlay.js registers its own listener in the
+  // same isolated world, and returning `true` for its messages left a port open
+  // that nothing here ever closed.
+  const OWN_MESSAGES = new Set([
+    "patmir:play", "patmir:play-watchalong", "patmir:stop",
+    "patmir:status", "patmir:current-url",
+  ]);
+
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || !OWN_MESSAGES.has(msg.type)) return undefined;
     (async () => {
       try {
         if (msg.type === "patmir:play") {
-          // Explicit play also removes any prior opt-out for this video so
-          // the next visit auto-plays again.
-          await setVideoDisabled(window.location.href, false);
-          stopWatchAlong();
-          await startDub(msg.cache_key);
-          sendResponse({ ok: true });
+          sendResponse(await playQuality(msg.cache_key));
         } else if (msg.type === "patmir:play-watchalong") {
-          await setVideoDisabled(window.location.href, false);
-          stopDub();
-          await startWatchAlong(msg.cache_key);
-          sendResponse({ ok: true });
+          sendResponse(await playWatchAlongFor(msg.cache_key));
         } else if (msg.type === "patmir:stop") {
-          // Explicit stop opts this video out of future auto-play.
-          await setVideoDisabled(window.location.href, true);
-          stopPlayback();
-          sendResponse({ ok: true });
+          sendResponse(await stopTranslation());
         } else if (msg.type === "patmir:status") {
-          const url = window.location.href;
-          const disabled = await isVideoDisabled(url);
-          const isPlaying = playing || waActive;
-          const mode = waActive ? "watch-along" : (playing ? "quality" : null);
-          sendResponse({
-            ok: true, playing: isPlaying, mode, hasVideo: !!findVideo(), disabled,
-            buffering: waActive && waBuffering,
-          });
+          sendResponse(await playbackStatus());
         } else if (msg.type === "patmir:current-url") {
           sendResponse({ ok: true, url: window.location.href });
         }
@@ -326,11 +389,117 @@
     if (driftSamples.length > DRIFT_WINDOW) driftSamples.shift();
   }
 
+  /** Read the DOM signals that mean "an ad is on screen".
+   *
+   * Read rather than inferred from the media element, because during an ad the
+   * element looks entirely healthy — it is just playing something else. The
+   * classification itself is pure and lives in lib/sync.js.
+   */
+  function adState() {
+    let playerClasses = "";
+    let hasAdOverlay = false;
+    let hasAdPreview = false;
+    let skipButtonPresent = false;
+    let skipButtonEnabled = false;
+    try {
+      const player = document.querySelector("#movie_player");
+      if (player) playerClasses = player.className || "";
+      // NON-EMPTY, not merely present. `.ytp-ad-module` and
+      // `.ytp-ad-player-overlay` are containers YouTube ships on every watch
+      // page and leaves in the DOM when there is no ad, so `!!querySelector(...)`
+      // was true always — which made the ad predicate true always, and the
+      // auto-skip seek then jumped every video to its end. These are
+      // corroboration only now (see classifyAd), but they still have to be
+      // true statements.
+      hasAdOverlay = hasContent(document.querySelector(
+        ".ytp-ad-player-overlay, .ytp-ad-player-overlay-layout, .ytp-ad-module"));
+      hasAdPreview = hasContent(document.querySelector(".ytp-ad-preview-container"));
+      const skip = findSkipControl();
+      skipButtonPresent = !!skip;
+      skipButtonEnabled = !!skip && !skip.disabled && isVisible(skip);
+    } catch (_) { /* a hostile or half-built DOM must not break the tick */ }
+    const st = S.classifyAd({
+      playerClasses, hasAdOverlay, hasAdPreview,
+      skipButtonPresent, skipButtonEnabled,
+    });
+    // Sampled here rather than only from the dub's sync tick, because the
+    // overlay polls this on every page whether or not a dub is playing — and it
+    // is the overlay that can ask for a seek.
+    if (!st.showing) noteContentDuration();
+    return st;
+  }
+
+  /** Does this node actually carry something, or is it an empty shell? */
+  function hasContent(el) {
+    if (!el) return false;
+    if (el.children && el.children.length) return true;
+    return !!(el.textContent && el.textContent.trim());
+  }
+
+  /** Visible enough to click.
+   *
+   * NOT `offsetParent !== null`: that is null for anything inside a
+   * position:fixed ancestor even when it is plainly on screen, which would make
+   * a live skip button look unclickable and push us onto the seek path instead.
+   */
+  function isVisible(el) {
+    if (!el) return false;
+    if (typeof el.getBoundingClientRect !== "function") return true;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+
+  // YouTube has renamed this control repeatedly; try the modern names first.
+  const SKIP_SELECTORS = [
+    ".ytp-skip-ad-button",
+    ".ytp-ad-skip-button-modern",
+    ".ytp-ad-skip-button",
+    ".ytp-ad-skip-button-slot button",
+  ];
+
+  function findSkipControl() {
+    for (const sel of SKIP_SELECTORS) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  /** Sample the content video's duration while no ad is on screen. */
+  function noteContentDuration() {
+    const v = findVideo();
+    if (v && isFinite(v.duration) && v.duration > 1) contentDuration = v.duration;
+  }
+
+  /** Called from the tick. Returns true when the ad state changed. */
+  function updateAdState() {
+    const showing = adState().showing;
+    if (showing === adShowing) return false;
+    adShowing = showing;
+    if (showing) {
+      // Silence, do NOT tear down. Keeping the listeners, the decoded buffer,
+      // `playing`, and the mute control is the whole difference between "the
+      // dub pauses for the ad" and "the dub is gone for the rest of the video".
+      stopDubSource();
+      stopAllNodes();
+      resetSyncWindow();
+    } else {
+      // Content is back and `currentTime` is its timeline again. Re-seed the
+      // progress detector; the ordinary tick re-anchors on the next confirmed
+      // advance, and the src we compare against is the content's.
+      if (video) contentSrc = video.currentSrc || video.src || null;
+      if (contentSrc) videoSrcAtStart = contentSrc;
+      resetSyncWindow();
+    }
+    return true;
+  }
+
   function videoIsProgressing(advanced) {
     if (!video) return false;
     return S.shouldScheduleAudio({
       paused: video.paused, seeking: video.seeking,
       readyState: video.readyState, advanced: advanced,
+      adShowing: adShowing,
     });
   }
 
@@ -344,6 +513,10 @@
   }
 
   function syncTick() {
+    // Polled here rather than from a new timer: this interval already runs
+    // whenever a dub is active, which is exactly when an ad matters.
+    updateAdState();
+    if (adShowing) return;   // the element's clock belongs to the ad
     if (waActive) { watchAlongTick(); return; }
     if (playing) qualityTick();
   }
@@ -381,6 +554,7 @@
     //   (b) Shorts scroll, which swaps to a different <video> element
     //       in a different URL — listeners on the old element never fire.
     videoSrcAtStart = video.currentSrc || video.src || null;
+    contentSrc = videoSrcAtStart;
     urlAtStart = window.location.href;
 
     beginMuteControl();
@@ -484,6 +658,12 @@
     // by swapping the media source. Either `emptied` or `loadstart` fires
     // when this happens — the dub belongs to the previous video, so stop.
     if (!playing) return;
+    // ...UNLESS an ad is starting. An ad swaps the src on the same element for
+    // the same video, and treating that as a navigation is what made an
+    // unskippable mid-roll kill the dub for the rest of the video. The ad is a
+    // suspension, handled by `updateAdState`; only a real source change is a
+    // teardown.
+    if (adState().showing) { updateAdState(); return; }
     const currentSrc = video ? (video.currentSrc || video.src || null) : null;
     if (currentSrc !== videoSrcAtStart) {
       stopDub();
@@ -880,6 +1060,10 @@
 
   function reportPlayhead(force) {
     if (!waActive || !waCacheKey || !video) return;
+    // An ad's `currentTime` starts near zero. Posting it would tell the
+    // scheduler the viewer seeked to the beginning, and it would start dubbing
+    // sections that are already covered.
+    if (adShowing) return;
     const now = Date.now();
     if (!force && now - waLastPlayheadPost < 1000) return;
     waLastPlayheadPost = now;
@@ -921,6 +1105,8 @@
 
   function onVideoSourceChangedWA() {
     if (!waActive) return;
+    // Same ad exemption as the quality path — see onVideoSourceChanged.
+    if (adState().showing) { updateAdState(); return; }
     const currentSrc = video ? (video.currentSrc || video.src || null) : null;
     if (currentSrc !== videoSrcAtStart) stopWatchAlong();
   }
@@ -938,11 +1124,85 @@
   // Also poll the URL even when *not* currently playing — covers the
   // Shorts case where the user scrolls from a non-dubbed video to a
   // previously-dubbed one. Cheap (string compare every 500 ms).
+  //
+  // This is the ONLY navigation signal that fires while nothing is playing, so
+  // overlay.js registers here (via `onUrlChange`) rather than starting a second
+  // identical poll of its own.
+  const urlChangeCallbacks = [];
+
+  function onUrlChange(cb) {
+    if (typeof cb === "function") urlChangeCallbacks.push(cb);
+    return () => {
+      const i = urlChangeCallbacks.indexOf(cb);
+      if (i >= 0) urlChangeCallbacks.splice(i, 1);
+    };
+  }
+
   let lastSeenUrl = window.location.href;
   setInterval(() => {
     if (window.location.href !== lastSeenUrl) {
       lastSeenUrl = window.location.href;
       if (!playing) setTimeout(autoPlayIfApplicable, 300);
+      for (const cb of urlChangeCallbacks.slice()) {
+        try { cb(lastSeenUrl); } catch (_) { /* one bad subscriber, not all */ }
+      }
     }
   }, 500);
+
+  // --- facade for overlay.js -------------------------------------------
+  //
+  // Published LAST, after every `let` above is initialized. The bootstrap guard
+  // at the top of this file exists because a listener registered over a
+  // half-initialized module reported "Cannot access X before initialization"
+  // instead of the real problem; publishing this facade earlier would reopen
+  // exactly that window for the overlay.
+  //
+  // Deliberately four playback methods plus three read-only helpers, and NOT a
+  // handle on the audio graph: `dubGain`, the mute arbitration and the drift
+  // tick have one owner, and it is this file.
+  globalThis.PatmirPlayer = {
+    play: playQuality,
+    playWatchAlong: playWatchAlongFor,
+    stop: stopTranslation,
+    status: playbackStatus,
+    findVideo,
+    canonicalUrl,
+    onUrlChange,
+    adState,
+    /** Perform an ad-skip action decided by `PatmirSync.adSkipPlan`.
+     *
+     * Lives here, not in the overlay, because it is the one place that already
+     * owns a reference to the media element — and because the `showing` guard
+     * has to be re-checked against live DOM immediately before a seek. A seek
+     * that lands on the CONTENT video is the single destructive failure
+     * available in this feature.
+     */
+    applyAdAction(action) {
+      if (action !== "click" && action !== "seek") return false;
+      const st = adState();
+      if (!st.showing) return false;
+      if (action === "click") {
+        const skip = findSkipControl();
+        if (!skip || skip.disabled) return false;
+        try { skip.click(); return true; } catch (_) { return false; }
+      }
+      // Everything below is the destructive path, and it is re-checked here
+      // against live DOM rather than trusting the plan the caller computed a
+      // tick ago. The first version checked only `showing`, which was true on
+      // every watch page because of a broken predicate — and so it seeked the
+      // viewer's actual video to the end, on every video. Three independent
+      // conditions now have to agree, and any one of them failing is a refusal:
+      //   1. #movie_player ITSELF says an ad is playing;
+      //   2. the media element's duration is short enough to be an ad;
+      //   3. it is not the duration we recorded for this page's content video.
+      if (!st.classConfirmed) return false;
+      const v = findVideo();
+      if (!v || !isFinite(v.duration) || v.duration <= 0) return false;
+      if (v.duration > S.MAX_AD_SECONDS) return false;
+      if (contentDuration != null && Math.abs(v.duration - contentDuration) < 0.5) {
+        return false;
+      }
+      try { v.currentTime = v.duration; return true; } catch (_) { return false; }
+    },
+  };
 })();

@@ -9,12 +9,20 @@
 //   { type: "cache:lookup", url, mode? }       → { cached, cache_key, ... }
 //   { type: "jobs:submit",  url? | source_path?, mode? } → { job_id, status, ... }
 //   { type: "jobs:get",     job_id }           → JobRecord
+//   { type: "jobs:cancel",  job_id }           → JobRecord
+//   { type: "options:open" }                   → opens the options page
+//
+// The audience age level is attached HERE, from chrome.storage.local, rather
+// than by each caller — `cache:lookup` and `jobs:submit` must agree on it or the
+// client is told "not dubbed" for a dub that exists, and content.js's auto-play
+// lookup would otherwise have to remember to pass it too.
 //   { type: "cache:dub-wav", cache_key }       → { bytesB64 }
 //   { type: "stream:sections", cache_key }     → { sections, complete, ... }
 //   { type: "stream:section-wav", cache_key, index } → { bytesB64 }
 //   { type: "stream:playhead", cache_key, t, paused } → { ok }
 
 const DEFAULT_SERVER = "http://127.0.0.1:8765";
+const DEFAULT_AUDIENCE = "teenager";
 
 async function getToken() {
   const { patmirToken } = await chrome.storage.local.get("patmirToken");
@@ -27,6 +35,19 @@ async function getToken() {
 async function getServer() {
   const { patmirServer } = await chrome.storage.local.get("patmirServer");
   return patmirServer || DEFAULT_SERVER;
+}
+
+/** Age register the translator is steered toward, from the options page.
+ *
+ * Defaults to "teenager", matching DEFAULT_AUDIENCE in
+ * patmir/pipeline/context.py: a softened register is what you get by not
+ * choosing. The server's own default is the same, but we always send a value
+ * explicitly — the extension wins over patmir.toml, and being explicit means
+ * the lookup and the submit cannot resolve differently.
+ */
+async function getAudience() {
+  const { patmirAudience } = await chrome.storage.local.get("patmirAudience");
+  return patmirAudience || DEFAULT_AUDIENCE;
 }
 
 async function api(path, opts = {}) {
@@ -53,6 +74,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === "cache:lookup") {
         let path = "/cache/lookup?url=" + encodeURIComponent(msg.url);
         if (msg.mode) path += "&mode=" + encodeURIComponent(msg.mode);
+        path += "&audience=" + encodeURIComponent(await getAudience());
         const r = await api(path);
         sendResponse({ ok: true, data: await r.json() });
       } else if (msg.type === "jobs:submit") {
@@ -60,10 +82,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.source_lang) body.source_lang = msg.source_lang;
         if (msg.force) body.force = true;
         if (msg.mode) body.mode = msg.mode;
+        body.audience = await getAudience();
         const r = await api("/jobs", { method: "POST", body: JSON.stringify(body) });
         sendResponse({ ok: true, data: await r.json() });
       } else if (msg.type === "jobs:get") {
         const r = await api("/jobs/" + encodeURIComponent(msg.job_id));
+        sendResponse({ ok: true, data: await r.json() });
+      } else if (msg.type === "options:open") {
+        // A content script has no chrome.runtime.openOptionsPage, so the
+        // in-page button's "no token" state routes through here.
+        await chrome.runtime.openOptionsPage();
+        sendResponse({ ok: true });
+      } else if (msg.type === "jobs:cancel") {
+        // The endpoint is idempotent, so a cancel racing a completion is fine.
+        // Without this the in-page Չթարգմանել would stop the UI while the GPU
+        // kept grinding — the waste `stream:stop` already prevents for
+        // watch-along.
+        const r = await api(
+          "/jobs/" + encodeURIComponent(msg.job_id) + "/cancel",
+          { method: "POST", body: JSON.stringify({}) },
+        );
         sendResponse({ ok: true, data: await r.json() });
       } else if (msg.type === "cache:dub-wav") {
         const r = await api("/cache/" + encodeURIComponent(msg.cache_key) + "/dub.wav");

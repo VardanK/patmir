@@ -8,6 +8,7 @@
     h1 { font-size: 16px; }
     label { display: block; margin-top: 14px; font-weight: 500; }
     input[type=text] { width: 100%; padding: 6px 8px; font-family: ui-monospace, monospace; box-sizing: border-box; }
+    select { padding: 5px 8px; font: inherit; }
     button { margin-top: 14px; padding: 8px 14px; }
     .hint { color: #666; font-size: 12px; margin-top: 6px; }
     .ok { color: #1e8e3e; }
@@ -31,6 +32,41 @@
     <span>Auto-play cached dubs</span>
   </label>
   <div class="hint">When a YouTube video has already been translated, play the dub automatically. You can still stop it from the popup; the choice is remembered per video.</div>
+
+  <label for="audience">Audience</label>
+  <select id="audience">
+    <option value="child">Child (about 5-10)</option>
+    <option value="teenager">Teenager (about 11-15)</option>
+    <option value="adult">Adult — no softening</option>
+  </select>
+  <div class="hint">
+    Steers the Armenian toward age-appropriate wording. <strong>Nothing is ever cut,
+    muted or bleeped</strong> — every line is still spoken, in gentler words. Each
+    level is cached separately, so switching re-translates the video once.
+  </div>
+
+  <label style="display:flex;align-items:center;gap:8px;margin-top:18px;font-weight:normal;">
+    <input id="skipads" type="checkbox" />
+    <span>Auto-skip YouTube ads</span>
+  </label>
+  <div class="hint">
+    Presses <em>Skip Ad</em> as soon as it appears. The dub pauses for an ad and
+    resumes afterwards either way, so turning this off costs you nothing but the
+    wait. If you already run an ad blocker, this never fires.
+  </div>
+
+  <label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-weight:normal;">
+    <input id="skipadseek" type="checkbox" />
+    <span>Also jump to the end of unskippable ads</span>
+  </label>
+  <div class="hint">
+    <strong>Off by default, and the only setting here that can affect playback.</strong>
+    It writes to the player's position, so if ad detection is ever wrong it moves
+    the video you are actually watching. It is now refused unless YouTube's own
+    player reports an ad, the clip is short enough to be one, and its length does
+    not match the video you opened — but the safe half of auto-skip is the
+    checkbox above, and this is the half that isn't.
+  </div>
 
   <button id="save">Save</button>
   <span id="status" style="margin-left:10px;"></span>

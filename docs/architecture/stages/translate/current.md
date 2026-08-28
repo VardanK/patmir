@@ -36,6 +36,32 @@ The casual-register prompt (rewritten 2026-05-26) lives at `patmir/eval/candidat
 
 Per-sentence user message also gets an emotion hint (`The speaker's emotion is angry; the Armenian should sound angry too.`) when the source sentence carries one.
 
+### Audience age guardrail (2026-08-28)
+
+`_audience_clause(level)` in the same module appends a register clause to
+`_SYSTEM`. `openrouter_batch.py` imports the function alongside `_SYSTEM`, so the
+per-sentence and the batched (watch-along) candidate cannot drift; in the batch
+prompt the clause sits **between** `_SYSTEM` and `_BATCH_SYSTEM_SUFFIX`, keeping
+the JSON-shape rules last.
+
+| level | clause |
+| --- | --- |
+| `adult` | **empty string** — the composed prompt is byte-for-byte the pre-guardrail one. Pinned by test, because it is what lets existing cache keys stand. |
+| `child` (~5-10) | profanity and crude insults become mild Armenian interjections a child could repeat; slurs translate their *force*, never their content; sex stays non-explicit; violence keeps the fact and drops the gore; substances named plainly, never glamorised. |
+| `teenager` (~11-15) | sharp but clean — insults may bite, no obscenity, no slurs, nothing sexually explicit; violence may be tense without lingering on gore; substances may be discussed with consequences, no instructions, no glamour. |
+
+Both non-adult clauses end with a **HARD RULE** paragraph forbidding deletion,
+empty output, bleeping, starring out, `[...]`, and refusals or warnings — and
+forbidding changes to who says what, the plot facts, the names or the numbers.
+The words soften; the story does not. That paragraph exists because the dub is
+its listener's only audio track, so a silent gap is strictly worse than a gentler
+word. Redaction vocabulary is deliberately never offered to the model: handing it
+those words is how a safety-shaped refusal comes back as a blank line.
+
+The level reaches the candidate as a per-call `audience=` kwarg, probed for by
+the adapter exactly as `emotion` is. See ADR
+`2026-08-28-audience-age-guardrail`.
+
 ## Disabled alternates
 
 - `openrouter_claude_opus` — registered, **rejected for Patmir** (user 2026-05-26: cost). Do not re-enable without explicit ask.

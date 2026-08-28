@@ -40,6 +40,7 @@ from patmir.eval.candidates.translation.openrouter import (
     OpenRouterTranslator,
     _LANG_NAME,
     _SYSTEM,
+    _audience_clause,
     _strip_thinking,
 )
 
@@ -174,11 +175,19 @@ class OpenRouterBatchTranslator:
 
     # --- public API ------------------------------------------------------
 
-    def translate(self, text: str, source_lang: str, emotion: str | None = None) -> str:
+    def translate(
+        self,
+        text: str,
+        source_lang: str,
+        emotion: str | None = None,
+        audience: str | None = None,
+    ) -> str:
         """Single-sentence path (uses the fallback candidate). Lets this
         candidate be used by the adapter the same way as the per-sentence
         one when only one sentence is in scope."""
-        return self._fallback.translate(text, source_lang=source_lang, emotion=emotion)
+        return self._fallback.translate(
+            text, source_lang=source_lang, emotion=emotion, audience=audience,
+        )
 
     def translate_batch(
         self,
@@ -186,6 +195,7 @@ class OpenRouterBatchTranslator:
         source_lang: str,
         *,
         progress: Callable[[int, int, str], None] | None = None,
+        audience: str | None = None,
     ) -> dict[int, str]:
         """Translate a list of sentences in chunks. Returns `{idx: target_text}`.
 
@@ -198,6 +208,11 @@ class OpenRouterBatchTranslator:
         idx set, empty translations), the candidate falls back to
         per-sentence translation for that chunk's sentences. The run keeps
         going.
+
+        `audience` is the age-register guardrail. It rides all the way into
+        `_fallback_chunk` on purpose: a chunk that falls back must degrade with
+        the SAME register, or a single malformed response would silently revert
+        those lines to the adult prompt.
         """
         items = to_items(sentences)
         results: dict[int, str] = {}
@@ -212,13 +227,17 @@ class OpenRouterBatchTranslator:
         for ci, chunk in enumerate(chunks):
             try:
                 chunk_out = self._translate_chunk(
-                    chunk, source_lang=source_lang, prior=prior[-self.overlap:] if self.overlap else [],
+                    chunk, source_lang=source_lang,
+                    prior=prior[-self.overlap:] if self.overlap else [],
+                    audience=audience,
                 )
             except _BatchError as exc:
                 # Per-chunk fallback — keep going.
                 if progress:
                     progress(translated_so_far, total, f"chunk {ci + 1}/{len(chunks)} fell back to per-sentence ({exc})")
-                chunk_out = self._fallback_chunk(chunk, source_lang=source_lang)
+                chunk_out = self._fallback_chunk(
+                    chunk, source_lang=source_lang, audience=audience,
+                )
 
             for it in chunk:
                 target = chunk_out.get(it.idx, "")
@@ -239,12 +258,19 @@ class OpenRouterBatchTranslator:
         *,
         source_lang: str,
         prior: list[tuple[_Item, str]],
+        audience: str | None = None,
     ) -> dict[int, str]:
         user_msg = _user_prompt_for_chunk(chunk, source_lang=source_lang, prior=prior)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": _SYSTEM + "\n\n" + _BATCH_SYSTEM_SUFFIX},
+                # Register clause goes with _SYSTEM, BEFORE the JSON-shape
+                # rules, so the schema instructions stay last where the model
+                # weights them most. Adult contributes "", making this the exact
+                # pre-guardrail string.
+                {"role": "system",
+                 "content": _SYSTEM + _audience_clause(audience)
+                            + "\n\n" + _BATCH_SYSTEM_SUFFIX},
                 {"role": "user", "content": user_msg},
             ],
             "max_tokens": self.max_tokens,
@@ -291,12 +317,15 @@ class OpenRouterBatchTranslator:
             out[int(t["idx"])] = text
         return out
 
-    def _fallback_chunk(self, chunk: list[_Item], *, source_lang: str) -> dict[int, str]:
+    def _fallback_chunk(
+        self, chunk: list[_Item], *, source_lang: str, audience: str | None = None,
+    ) -> dict[int, str]:
         out: dict[int, str] = {}
         for it in chunk:
             try:
                 out[it.idx] = self._fallback.translate(
                     it.text, source_lang=source_lang, emotion=it.emotion,
+                    audience=audience,
                 )
             except Exception:  # noqa: BLE001
                 out[it.idx] = ""

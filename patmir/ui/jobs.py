@@ -20,13 +20,18 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
 from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
-from patmir.pipeline.context import JobCancelled
+from patmir.pipeline.context import (
+    NEUTRAL_AUDIENCE,
+    JobCancelled,
+    normalize_audience,
+    resolve_audience,
+)
 from patmir.pipeline.runner import run_job
 from patmir.pipeline.stage import STAGE_ORDER
 from patmir.ui import cache as cache_mod
@@ -49,12 +54,21 @@ class JobSpec:
     # routes watch-along specs to the StreamManager; the mode is also folded
     # into the cache key so the two modes never collide.
     mode: str = "quality"
+    # Audience age level for this submission: "child" | "teenager" | "adult".
+    # None = fall back to the server's `[pipeline.options].audience`. Folded into
+    # the cache key when non-neutral, so re-picking a level re-dubs rather than
+    # replaying the previous level's audio.
+    audience: str | None = None
 
     def __post_init__(self) -> None:
         if not self.source_url and not self.source_path:
             raise ValueError("source_url or source_path is required")
         if self.mode not in {"quality", "watch-along"}:
             raise ValueError(f"unknown mode: {self.mode!r}")
+        if self.audience is not None:
+            # Raises ValueError, which the /jobs handler turns into a 400 —
+            # same path `mode` already takes.
+            self.audience = normalize_audience(self.audience)
 
 
 @dataclass
@@ -67,6 +81,15 @@ class JobRecord:
     source_lang: str | None
     status: JobStatus
     submitted_at: float
+    # Resolved audience level this job ran (or will run) at. A plain string, so
+    # `asdict` persistence keeps working.
+    audience: str = NEUTRAL_AUDIENCE
+    # Cache key computed at the NEUTRAL level, used only to name the yt-dlp
+    # download directory. The source file is identical at every audience level,
+    # so keying the download by the audience-bearing key would re-download the
+    # whole video every time the level is flipped on the same episode — which is
+    # exactly the workflow this feature invites.
+    download_key: str = ""
     started_at: float | None = None
     finished_at: float | None = None
     error: str | None = None
@@ -86,6 +109,7 @@ class JobRecord:
             "source_url": self.source_url,
             "source_path": self.source_path,
             "source_lang": self.source_lang,
+            "audience": self.audience,
             "submitted_at": self.submitted_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -174,13 +198,19 @@ class JobManager:
         any cached download is removed so the pipeline reruns from scratch.
         """
         source_id, source_url = self._resolve_source_id(spec)
-        ck = cache_mod.cache_key(source_id, self._cfg)
+        # Resolve ONCE and reuse for both the key and the run. Two resolutions
+        # is how the popup ends up polling one key while the pipeline writes
+        # another.
+        audience = resolve_audience(spec.audience, self._cfg.options)
+        ck = cache_mod.cache_key(source_id, self._cfg, audience=audience)
+        dl_key = cache_mod.cache_key(source_id, self._cfg, audience=NEUTRAL_AUDIENCE)
         if spec.force:
             cache_mod.invalidate(self._cache_root, ck)
             # Drop the cached source download so a re-translate also picks
             # up a fresh source (useful if YouTube updated the audio or the
-            # download was partial).
-            dest = self._downloads_dir / ck
+            # download was partial). Keyed audience-free — `force` means "get a
+            # fresh source", and the source is shared across levels.
+            dest = self._downloads_dir / dl_key
             if dest.is_dir():
                 import shutil as _shutil
                 _shutil.rmtree(dest, ignore_errors=True)
@@ -201,6 +231,8 @@ class JobManager:
                     source_url=source_url,
                     source_path=spec.source_path,
                     source_lang=spec.source_lang,
+                    audience=audience,
+                    download_key=dl_key,
                     status="done",
                     submitted_at=time.time(),
                     started_at=entry.created_at,
@@ -218,6 +250,8 @@ class JobManager:
                 source_url=source_url,
                 source_path=spec.source_path,
                 source_lang=spec.source_lang,
+                audience=audience,
+                download_key=dl_key,
                 status="queued",
                 submitted_at=time.time(),
             )
@@ -322,11 +356,38 @@ class JobManager:
             except (OSError, json.JSONDecodeError):
                 pass
 
-    def lookup_cache_by_url(self, url: str) -> cache_mod.CacheEntry | None:
-        return cache_mod.lookup_by_url(self._cache_root, url, self._cfg)
+    def lookup_cache_by_url(
+        self, url: str, audience: str | None = None,
+    ) -> cache_mod.CacheEntry | None:
+        return cache_mod.lookup_by_url(
+            self._cache_root, url, self._cfg,
+            audience=self.resolved_audience(audience),
+        )
 
-    def cache_key_for_url(self, url: str) -> str:
-        return cache_mod.cache_key(cache_mod.source_id_for_url(url), self._cfg)
+    def cache_key_for_url(self, url: str, audience: str | None = None) -> str:
+        return cache_mod.cache_key(
+            cache_mod.source_id_for_url(url), self._cfg,
+            audience=self.resolved_audience(audience),
+        )
+
+    def resolved_audience(self, requested: str | None) -> str:
+        """The level a submission with this `requested` value would run at."""
+        return resolve_audience(requested, self._cfg.options)
+
+    def _cfg_for(self, audience: str) -> PipelineConfig:
+        """Per-job view of the config carrying this job's audience level.
+
+        ONLY `options` is replaced; `entries` is shared by reference, so
+        `stage_cache_key` — `(stage, candidate_id)` — is identical to the
+        server-default config's and the startup prewarm still hits. Baking the
+        level into `entries` instead would either hand a job the previous job's
+        warm candidate (the id being unchanged) or, if the level were added to
+        the stage-cache key, fragment the warm cache three ways. See ADR
+        2026-08-28-audience-age-guardrail.
+        """
+        if audience == self._cfg.options.audience:
+            return self._cfg
+        return replace(self._cfg, options=replace(self._cfg.options, audience=audience))
 
     # --- internals ------------------------------------------------------
 
@@ -411,7 +472,9 @@ class JobManager:
             rec.live_pct = 0.0
             rec.live_msg = "starting yt-dlp"
             try:
-                local_path = self._download_url(rec.source_url, rec.cache_key, rec)
+                local_path = self._download_url(
+                    rec.source_url, rec.download_key or rec.cache_key, rec,
+                )
             except Exception:
                 rec.stage_states["download"] = "failed"
                 raise
@@ -425,10 +488,12 @@ class JobManager:
         def _on_job_dir(job_dir: Path, job_id_: str) -> None:
             rec.run_job_id = job_id_
 
-        # Run the existing batch pipeline unchanged.
+        # Run the existing batch pipeline unchanged, on a config carrying this
+        # job's audience level (see `_cfg_for` — options only, never entries).
+        cfg = self._cfg_for(rec.audience)
         manifest = run_job(
             local_path,
-            self._cfg,
+            cfg,
             runs_root=self._runs_root,
             source_lang=rec.source_lang,
             on_job_dir_created=_on_job_dir,
@@ -452,7 +517,7 @@ class JobManager:
             source_url=rec.source_url,
             job_id=manifest.job_id,
             duration=duration,
-            pipeline_summary=cache_mod.pipeline_summary(self._cfg),
+            pipeline_summary=cache_mod.pipeline_summary(cfg),
         )
 
     def _download_url(self, url: str, cache_key: str, rec: "JobRecord | None" = None) -> Path:

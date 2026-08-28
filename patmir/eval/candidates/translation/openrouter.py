@@ -11,10 +11,13 @@ path per the local-first policy:
 See ADR `2026-05-26-cloud-translate-via-openrouter.md` for the local
 exhaustion that triggered this.
 
-Same `translate(text, source_lang, emotion=None) -> str` contract as the
-local translator candidates (Qwen3-Instruct-MLX in particular). The
-SentenceTranslator adapter probes the signature and only forwards
-`emotion=` when accepted — this candidate accepts it.
+Same `translate(text, source_lang, emotion=None, audience=None) -> str`
+contract as the local translator candidates (Qwen3-Instruct-MLX in
+particular). The SentenceTranslator adapter probes the signature and only
+forwards `emotion=` / `audience=` when accepted — this candidate accepts
+both. `audience` is the age-register guardrail (see `_audience_clause`);
+candidates that take no prompt at all (NLLB, MADLAD, OPUS-MT) simply never
+receive it, and the adapter warns rather than failing.
 
 Reads the API key from the env var named by `api_key_env` (default
 `OPENROUTER_API_KEY`). Raises a clear error if missing.
@@ -52,6 +55,98 @@ _SYSTEM = (
     "Reply with ONLY the Armenian translation — no quotes, no explanations, "
     "no source-language echoing, no translator notes."
 )
+
+# ── Audience age guardrail ────────────────────────────────────────────────────
+#
+# An additive clause appended to `_SYSTEM`. "adult" contributes the empty string,
+# so the adult prompt is byte-for-byte what it was before this feature existed
+# and nothing regresses — a property pinned by test.
+#
+# The rule these clauses enforce is PROMPT-ONLY SOFTENING: choose gentler
+# wording, never remove content. This dub is watched by a hearing-aid-wearing
+# child who is reading the dub the way another viewer reads subtitles — a missing
+# line is a hole in the story, strictly worse than a softened word. Hence the
+# HARD RULE paragraph in both clauses, and hence no redaction / bleep / "[...]"
+# vocabulary is offered to the model anywhere. Giving it that vocabulary is how
+# you get a safety-shaped refusal back as a silent gap.
+#
+# Shared with `openrouter_batch.py`, which imports `_audience_clause` next to
+# `_SYSTEM` so register guidance cannot drift between the per-sentence and the
+# batched candidate.
+
+_AUDIENCE_CHILD = (
+    "\n\n"
+    "AUDIENCE — YOUNG CHILD (about 5-10 years old). The Armenian must be safe to "
+    "hear at that age AND must still say everything the source says. Soften the "
+    "WORDS, never the content. Specifically: "
+    "(1) profanity and crude insults become the mild things an Armenian child "
+    "actually hears — 'վա՜յ', 'ա՛յ քեզ բան', 'ի՜նչ հիմար բան', 'տո՛ բալես' — never "
+    "obscene, never scatological, never an anatomical or sexual curse; "
+    "(2) never reproduce a slur of any kind (ethnic, religious, disability, "
+    "sexual): translate its FORCE, not its content — the speaker still sounds "
+    "hostile and rude toward that person, in plain non-degrading words; "
+    "(3) sexual content stays non-explicit: attraction, kissing, flirting, "
+    "'սիրած' are fine; anything graphic becomes a short everyday euphemism an "
+    "adult recognizes and a child hears as grown-up business; "
+    "(4) violence keeps the fact and drops the gore — someone is hit, hurt or "
+    "killed, without describing wounds, blood, or how a body looks; threats stay "
+    "threatening but never relish the detail; "
+    "(5) alcohol, drugs, smoking and gambling are named as plainly as the plot "
+    "needs ('խմել ա', 'ծխում ա') and never made to sound appealing. "
+    "Do not moralize, do not add a warning, do not lecture, do not explain that "
+    "you softened something. Do not change who says what, the plot facts, the "
+    "names, or the numbers. "
+    "HARD RULE: every input line gets one real, speakable Armenian sentence. "
+    "Never delete a line, never return an empty or whitespace-only line, never "
+    "shorten a line to nothing, never bleep it, star it out, or mark it '[...]', "
+    "and never replace it with a refusal or a note about its content. If a line "
+    "is hard, write the gentlest TRUE version of it and move on — a missing line "
+    "is worse for this listener than a softened one."
+)
+
+_AUDIENCE_TEENAGER = (
+    "\n\n"
+    "AUDIENCE — TEENAGER (about 11-15 years old). Keep the edge, lose the "
+    "obscenity. Specifically: "
+    "(1) strong language lands as the sharp-but-clean Armenian a teenager would "
+    "actually use — 'գժվե՛լ ա', 'էշ բան ա', 'տո՛ լավ էլի', 'դժոխք' — insults may "
+    "bite, but no obscenities, no scatology, no sexual or anatomical curses; "
+    "(2) never reproduce a slur of any kind (ethnic, religious, disability, "
+    "sexual): keep the hostility, drop the epithet; "
+    "(3) sex may be acknowledged directly — attraction, a relationship, someone "
+    "sleeping with someone — but not described; keep it a fact of the plot, not "
+    "an image; "
+    "(4) violence may be tense and frightening, death included, without "
+    "lingering on gore or on how a body looks; "
+    "(5) alcohol, drugs and smoking may be named and discussed, consequences "
+    "included, with no instructions and no glamour. "
+    "Register stays teen-natural — neither childish nor sanitized. Do not "
+    "moralize, do not add a warning, do not explain that you softened something. "
+    "Do not change who says what, the plot facts, the names, or the numbers. "
+    "HARD RULE: every input line gets one real, speakable Armenian sentence. "
+    "Never delete a line, never return an empty or whitespace-only line, never "
+    "bleep it, star it out, or mark it '[...]', and never replace it with a "
+    "refusal — a missing line is worse for this listener than a softened one."
+)
+
+# "adult" is the historical behaviour: no clause at all.
+_AUDIENCE_CLAUSES: dict[str, str] = {
+    "child": _AUDIENCE_CHILD,
+    "teenager": _AUDIENCE_TEENAGER,
+    "adult": "",
+}
+
+
+def _audience_clause(level: str | None) -> str:
+    """Register clause for an audience level, or "" for adult/None/unknown.
+
+    Deliberately tolerant of an unknown value rather than raising: this module is
+    a Phase-0 candidate and stays isolated from the pipeline's data contracts.
+    Validation happens at the edges — the config loader, `JobSpec.__post_init__`,
+    and the HTTP handlers.
+    """
+    return _AUDIENCE_CLAUSES.get((level or "").strip().lower(), "")
+
 
 _BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -117,7 +212,13 @@ class OpenRouterTranslator:
         }
         self._client = httpx.Client(timeout=timeout_seconds)
 
-    def translate(self, text: str, source_lang: str, emotion: str | None = None) -> str:
+    def translate(
+        self,
+        text: str,
+        source_lang: str,
+        emotion: str | None = None,
+        audience: str | None = None,
+    ) -> str:
         src_name = _LANG_NAME.get(source_lang, source_lang)
         if emotion and emotion != "neutral":
             user_msg = (
@@ -136,7 +237,7 @@ class OpenRouterTranslator:
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": _SYSTEM},
+                {"role": "system", "content": _SYSTEM + _audience_clause(audience)},
                 {"role": "user", "content": user_msg},
             ],
             "max_tokens": self.max_tokens,

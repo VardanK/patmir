@@ -2,6 +2,71 @@
 
 One-click Eastern Armenian dub for YouTube videos, backed by your local Patmir server.
 
+## The button under the player
+
+On a YouTube watch page a full-width button appears under the video:
+
+- **Թարգմանել** — give me the Armenian. One word for both "run the pipeline" and
+  "play the dub you already have"; which one it is shows in the small line under
+  the label, as an Armenian-only percentage (no stage names — the viewer is
+  watching a video, not reading a pipeline).
+- **Չթարգմանել** — switch the Armenian off. The dub stops and the original audio
+  comes back; the **video keeps playing**, and is never paused or seeked. It also
+  remembers the choice for that video, so it will not auto-start next time.
+
+Where it appears: watch and `/live` pages get the inline button. **Shorts and
+embeds get a compact floating pill instead** — Shorts is a recycler that
+re-parents nodes as you scroll and an embed is someone else's layout, so neither
+can take a full-width block. On any other page there is no button and the popup
+does the job.
+
+The popup keeps working and the two always agree: on a YouTube tab the content
+script owns the only session and the popup is a window onto it, so pressing
+either flips both. Regenerate stays popup-only (and two-click-armed) — it deletes
+a finished dub and reruns a multi-minute pipeline.
+
+## Audience age guardrail
+
+The options page has an **Audience** selector: `child` (about 5-10), `teenager`
+(about 11-15, the default) or `adult`. It steers the translator toward age-appropriate
+Armenian wording — **nothing is ever cut, muted or bleeped**, every line is still
+spoken, in gentler words. `adult` is exactly the behaviour that existed before
+the selector.
+
+The level is sent on every lookup and submit (attached in `sw.js`, so the two can
+never disagree) and folded into the cache key, so **each level caches separately
+and switching re-translates the video once**. The extension's value overrides
+`[pipeline.options].audience` in `patmir.toml`, which is the default for
+`patmir dub` / `patmir submit`.
+
+## Ads
+
+Ads share the page's single `<video>` element, so the extension handles them
+explicitly:
+
+- The dub is **suspended** for the duration of an ad and resumes afterwards.
+  (Before this, a mid-roll ad ended the dub for the rest of the video — the
+  source swap read as "the viewer navigated away".)
+- **Auto-skip** (on by default) presses *Skip Ad* as soon as it goes live.
+- **Jumping to the end of an unskippable ad** is a *separate* setting and is
+  **off by default**. It is the only thing here that writes to the player's
+  position, so if ad detection is ever wrong it moves the video you are actually
+  watching — which is precisely what the first release did, on every video, via
+  a predicate that mistook YouTube's always-present empty ad containers for an
+  ad. It now needs YouTube's own player class, a clip short enough to be an ad,
+  and a length that does not match the video you opened.
+
+If ad handling misbehaves, paste `tools-ad-probe.js` into the YouTube tab's
+console and let an ad play: it logs what the detector can see once a second, so
+a selector that YouTube has renamed shows up as data rather than a guess. (That
+file is a developer tool, not part of the extension — it is not in the manifest
+and is never injected.)
+
+Ads are not *blocked* — that is out of scope, and deliberately so; see the ADR
+`docs/architecture/decisions/2026-08-28-inpage-toggle-and-ads.md`. If you run
+uBlock Origin or have Premium, none of the above ever fires and everything still
+works.
+
 ## Two dub modes (popup toggle)
 
 - **Quality** (default, D1) — runs the full batch pipeline → one cached `dub.wav`.
@@ -28,12 +93,17 @@ two modes cache independently.
 
 2. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select this `extension/` directory.
 
-3. Right-click the Patmir toolbar icon → **Options**. Paste the bearer token. Save.
+3. Right-click the Patmir toolbar icon → **Options**. Paste the bearer token,
+   pick an **Audience** level, and Save.
 
-4. Open a public YouTube video. Click the extension icon.
-   - First time: popup says **Translate this** → click. The pipeline runs (~7-8 min for a 5-min clip). Popup polls every 2 s.
-   - Done: popup says **Play dub** → click. Video mutes; Armenian dub plays in-page, synced to `<video>.currentTime`.
-   - Rewatch: cache hit; popup immediately shows **Play dub**.
+4. Open a public YouTube video. Press **Թարգմանել** under the player (or use the
+   toolbar popup — either works).
+   - First time: the pipeline runs (~7-8 min for a 5-min clip) with progress under
+     the label.
+   - Done: the dub starts by itself and the button reads **Չթարգմանել**. The
+     `<video>` element is held muted; the Armenian plays in-page, synced to
+     `<video>.currentTime`.
+   - Rewatch: cache hit, so it is immediate.
 
 ## What works
 
@@ -50,18 +120,43 @@ two modes cache independently.
   inaudible resampling nudge, and a hard re-anchor needs three agreeing samples
 - Loopback-only server with bearer-token auth
 - Local files via `patmir submit <file>` CLI
+- An in-page `Թարգմանել` / `Չթարգմանել` button on watch pages, a floating pill on
+  Shorts and embeds, in a shadow root so YouTube's CSS cannot reach it
+- Ad detection: the dub suspends and resumes across an ad break, and ads are
+  auto-skipped where the player allows it
+- A `child` / `teenager` / `adult` audience guardrail on the translator's register
 
 ## Tests
 
-Pure decision logic (volume/mute arbitration, drift policy, section selection) lives
-in `lib/sync.js` so it can be tested without a browser:
+Pure decision logic lives in `lib/` so it can be tested without a browser:
+
+- `lib/sync.js` — volume/mute arbitration, drift policy, section selection, and
+  the ad predicates (`classifyAd`, `adSkipPlan`).
+- `lib/session.js` — the whole job state machine and the button's view
+  derivation. No DOM, no timers, no `chrome.*`: the transport is injected, so the
+  tests drive it by hand with a fake clock.
 
 ```
 node --test extension/tests/
 ```
 
-No dependencies beyond Node itself. `lib/sync.js` is listed **before** `content.js` in
-the manifest's `content_scripts` and must stay that way.
+(On Node 26 the bare-directory form was dropped; use
+`node --test "extension/tests/*.test.js"`.)
+
+No dependencies beyond Node itself. **Manifest load order is load-bearing three
+times over** and each edge is asserted by `tests/bootstrap.test.js`:
+
+```
+lib/sync.js  <  content.js      (PatmirSync)
+lib/session.js  <  overlay.js   (PatmirSession)
+content.js   <  overlay.js      (PatmirPlayer, published at the end of content.js)
+```
+
+`content.js` deliberately touches **no** DOM-construction globals — all element
+creation is in `overlay.js`. A test boots `content.js` in a sandbox with no
+`createElement`, no `MutationObserver` and no `CSSStyleSheet` precisely to keep it
+that way, because that file owns the audio graph, the mute arbitration and the
+drift tick and should not also own a button.
 
 ## Not yet
 
@@ -76,4 +171,12 @@ the manifest's `content_scripts` and must stay that way.
 - **Mixed content**: YouTube is HTTPS; `http://127.0.0.1` fetches are routed through the service worker (`sw.js`) because the page context blocks them. Audio bytes come back as `Uint8Array` via `chrome.runtime.sendMessage`.
 - **Drift**: corrected automatically (2026-08-25). `lib/sync.js` owns the policy — a dead band below 40 ms, a ±0.5 % resampling nudge up to 250 ms, and a hard re-anchor above that only after three agreeing samples. The thresholds are wider than the ±80 ms the original spec asked for on purpose: `video.currentTime` is coarsely quantized, and a hard re-anchor is an audible cut, so a tight threshold re-anchors on noise. Toggling Stop / Play is no longer needed.
 - **Volume**: while a dub is playing the `<video>` element is held muted and the page's slider drives a GainNode on the dub instead. The player's UI will therefore show the video as muted — that is deliberate, and the mute button still works (it mutes the dub).
+- **The button is missing on a watch page**: nothing resolved among the five mount
+  points, which is deliberate — guessing a parent on someone else's page is worse
+  than showing no button, and the popup still works. `mountPlan` in
+  `lib/session.js` is where the probe order lives.
+- **A manifest change needs a full Reload** on `chrome://extensions`, not a page
+  refresh — and this release adds two files to `content_scripts`, so the first
+  load after updating must be a reload or the in-page button will log that
+  `lib/session.js` / `PatmirPlayer` is missing and disable itself.
 - **YouTube SPA navigation**: handled — `yt-navigate-finish` plus a 400 ms URL/element poll as a backstop for Shorts, which uses a recycler and swaps `<video>` elements without always firing the event.

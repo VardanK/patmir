@@ -786,6 +786,20 @@ min_ref_seconds        = 1.5     # shortest clean turn that qualifies as a (spea
 sentence_afade_seconds = 0.05    # per-sentence fade in/out on the AR voice (suppresses boundary bleed — quality issue #4)
 ref_min_rms_db         = -33.0   # loudness floor for ref-clip windows; quieter slices lose to louder eligible ones (quality issue #12)
 
+# Age register the translator is steered toward: "child" | "teenager" | "adult".
+# Prompt-only softening — gentler wording, never a dropped, blanked or bleeped
+# line (this dub is its listener's only audio track, so a silent gap is worse
+# than a gentle word). "adult" composes a byte-identical prompt to the one that
+# existed before the guardrail.
+#
+# This is the DEFAULT for `patmir dub` and for any client that omits the field;
+# the Chrome extension sends its own value on every submission and wins.
+#
+# The ONE key under [pipeline.options] that participates in the cache key — as a
+# `|audience=<level>` suffix, so "adult" keys are byte-identical to pre-guardrail
+# ones. ADR: 2026-08-28-audience-age-guardrail.
+audience               = "teenager"
+
 # Curated stand-in ref clips for speakers with NO usable ref of their own
 # (quality issue #12). Without this, such speakers cloned from nothing — an
 # anonymous default voice. With no pool configured, the TTS adapter instead

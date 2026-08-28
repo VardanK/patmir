@@ -213,3 +213,91 @@ class BatchTranslateE2E(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AudienceBatchPrompt(unittest.TestCase):
+    """The batch candidate is what watch-along runs, and it shares `_SYSTEM`
+    with the per-sentence one by import — so the register clause must reach it
+    through the same import rather than being duplicated."""
+
+    def setUp(self) -> None:
+        _set_env_key()
+
+    def _build(self, fake: FakeClient, **kwargs):
+        from patmir.eval.candidates.translation.openrouter_batch import OpenRouterBatchTranslator
+        t = OpenRouterBatchTranslator(
+            model="google/gemini-3.5-flash",
+            chunk_size=kwargs.pop("chunk_size", 3),
+            overlap=kwargs.pop("overlap", 1),
+            **kwargs,
+        )
+        t._client = fake
+        t._fallback._client = fake
+        return t
+
+    def _system_of(self, fake: FakeClient, i: int = 0) -> str:
+        return fake.requests[i]["json"]["messages"][0]["content"]
+
+    def test_adult_system_prompt_is_unchanged(self) -> None:
+        from patmir.eval.candidates.translation.openrouter import _SYSTEM
+        from patmir.eval.candidates.translation.openrouter_batch import (
+            _BATCH_SYSTEM_SUFFIX,
+        )
+        fake = FakeClient([_json_response_for([0, 1, 2])])
+        t = self._build(fake)
+        t.translate_batch(_items_from([0, 1, 2]), source_lang="ru")
+        self.assertEqual(
+            self._system_of(fake), _SYSTEM + "\n\n" + _BATCH_SYSTEM_SUFFIX,
+        )
+
+    def test_no_audience_argument_matches_adult(self) -> None:
+        """Callers that never heard of the guardrail (the eval harness) keep the
+        exact prompt they had."""
+        fake_a = FakeClient([_json_response_for([0, 1, 2])])
+        self._build(fake_a).translate_batch(_items_from([0, 1, 2]), source_lang="ru")
+        fake_b = FakeClient([_json_response_for([0, 1, 2])])
+        self._build(fake_b).translate_batch(
+            _items_from([0, 1, 2]), source_lang="ru", audience="adult",
+        )
+        self.assertEqual(self._system_of(fake_a), self._system_of(fake_b))
+
+    def test_child_clause_sits_between_system_and_batch_suffix(self) -> None:
+        """Order matters: register guidance belongs with `_SYSTEM`, and the
+        JSON-shape rules stay last where the model weights them most."""
+        from patmir.eval.candidates.translation.openrouter import (
+            _SYSTEM, _audience_clause,
+        )
+        from patmir.eval.candidates.translation.openrouter_batch import (
+            _BATCH_SYSTEM_SUFFIX,
+        )
+        fake = FakeClient([_json_response_for([0, 1, 2])])
+        t = self._build(fake)
+        t.translate_batch(_items_from([0, 1, 2]), source_lang="ru", audience="child")
+        content = self._system_of(fake)
+        clause = _audience_clause("child")
+        self.assertTrue(content.startswith(_SYSTEM))
+        self.assertIn(clause, content)
+        self.assertTrue(content.endswith(_BATCH_SYSTEM_SUFFIX))
+        self.assertLess(content.index(clause), content.index(_BATCH_SYSTEM_SUFFIX))
+
+    def test_fallback_chunk_carries_the_same_audience(self) -> None:
+        """A chunk whose response fails validation degrades to per-sentence.
+        If the level did not ride along, one malformed response would silently
+        revert those lines to the adult prompt — which on a child submission is
+        the whole failure this feature exists to prevent."""
+        from patmir.eval.candidates.translation.openrouter import _audience_clause
+        # First response has the wrong idx set -> _BatchError -> per-sentence.
+        fake = FakeClient([
+            _json_response_for([99]),
+            _ok("hy_0"), _ok("hy_1"), _ok("hy_2"),
+        ])
+        t = self._build(fake)
+        out = t.translate_batch(
+            _items_from([0, 1, 2]), source_lang="ru", audience="child",
+        )
+        self.assertEqual(out, {0: "hy_0", 1: "hy_1", 2: "hy_2"})
+        self.assertEqual(len(fake.requests), 4)
+        clause = _audience_clause("child")
+        for i in range(1, 4):  # the three per-sentence retries
+            self.assertIn(clause, self._system_of(fake, i), f"request {i}")
+

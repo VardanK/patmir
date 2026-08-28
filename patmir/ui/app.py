@@ -26,6 +26,7 @@ from starlette.requests import Request
 
 from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
+from patmir.pipeline.context import normalize_audience
 from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.runner import prewarm_stage_cache
 from patmir.pipeline.streaming import warmup
@@ -232,22 +233,36 @@ def _create_app(
         return candidate
 
     @app.get("/cache/lookup", dependencies=[Depends(require_token)])
-    def cache_lookup(url: str = Query(..., min_length=4), mode: str = Query("quality")):
+    def cache_lookup(
+        url: str = Query(..., min_length=4),
+        mode: str = Query("quality"),
+        audience: str | None = Query(None),
+    ):
+        # The lookup MUST use the same level a submission would, or the client
+        # is told "not dubbed" for a dub that exists (or worse, offered play for
+        # a key the submission will never write). The extension attaches the
+        # level in sw.js for both calls so they cannot drift.
+        try:
+            level = normalize_audience(audience) if audience else None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if mode == "watch-along":
-            manifest = streamer.lookup_cache_by_url(url)
+            manifest = streamer.lookup_cache_by_url(url, audience=level)
             return JSONResponse({
                 "cached": bool(manifest and manifest.get("complete")),
                 "partial": bool(manifest and not manifest.get("complete")),
-                "cache_key": streamer.cache_key_for_url(url),
+                "cache_key": streamer.cache_key_for_url(url, audience=level),
                 "mode": "watch-along",
+                "audience": streamer.resolved_audience(level),
                 "sections": len((manifest or {}).get("sections", [])),
             })
-        entry = manager.lookup_cache_by_url(url)
+        entry = manager.lookup_cache_by_url(url, audience=level)
         if entry is None:
             return JSONResponse({
                 "cached": False,
-                "cache_key": manager.cache_key_for_url(url),
+                "cache_key": manager.cache_key_for_url(url, audience=level),
                 "mode": "quality",
+                "audience": manager.resolved_audience(level),
             })
         return JSONResponse({
             "cached": True,
@@ -256,6 +271,7 @@ def _create_app(
             "created_at": entry.created_at,
             "source_url": entry.source_url,
             "mode": "quality",
+            "audience": manager.resolved_audience(level),
         })
 
     @app.post("/jobs", dependencies=[Depends(require_token)])
@@ -267,6 +283,7 @@ def _create_app(
                 source_lang=payload.get("source_lang"),
                 force=bool(payload.get("force", False)),
                 mode=payload.get("mode", "quality"),
+                audience=payload.get("audience"),
             )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
