@@ -10,6 +10,12 @@ this".
 Key derivation deliberately excludes audio-tuning options (music_bed_gain,
 voice_gain_db, sentence_afade_seconds) so ear-test tweaks don't bust the
 cache — only stage selectors + per-candidate config dicts contribute.
+
+The single exception is the audience age level, which changes the Armenian
+TEXT rather than its mix. It participates via an explicit `cache_key(...)`
+suffix rather than through `config_hash`, because `config_hash` hashes
+candidate ENTRIES and the level is not a model selection — putting it there
+would fragment the warm stage cache, which is keyed `(stage, candidate_id)`.
 """
 from __future__ import annotations
 
@@ -25,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 
 from patmir import paths
 from patmir.pipeline.config import PipelineConfig
+from patmir.pipeline.context import NEUTRAL_AUDIENCE
 from patmir.pipeline.stage import STAGE_ORDER
 
 log = logging.getLogger(__name__)
@@ -117,7 +124,9 @@ def config_hash(cfg: PipelineConfig) -> str:
     Hashes the candidate entry dict for each stage in `STAGE_ORDER`. The
     entry includes the candidate `id`, its `module`, and every model-id /
     voice / language knob the candidate exposes. Audio-tuning options under
-    `[pipeline.options]` are deliberately excluded.
+    `[pipeline.options]` are deliberately excluded — and so is the audience
+    level, which is a viewer preference rather than a model selection and rides
+    the `cache_key` suffix instead (keeping the warm stage cache un-fragmented).
     """
     payload = {
         "version": CACHE_VERSION,
@@ -143,11 +152,31 @@ def _stable_entry(entry: dict[str, Any]) -> dict[str, Any]:
 DEFAULT_MODE = "quality"
 
 
-def cache_key(source_id: str, cfg: PipelineConfig, mode: str = DEFAULT_MODE) -> str:
+def cache_key(
+    source_id: str,
+    cfg: PipelineConfig,
+    mode: str = DEFAULT_MODE,
+    audience: str = NEUTRAL_AUDIENCE,
+) -> str:
+    """Stable 16-hex key for (source, pipeline config, mode, audience level).
+
+    `audience` defaults to NEUTRAL_AUDIENCE ("adult") and NOT to the product
+    default ("teenager"), for the same reason `mode` defaults to "quality": this is
+    the value that appends nothing, and every key written before the guardrail
+    existed was written by an adult-prompt run. A caller that wants the
+    submission's level must pass it — `resolve_audience` is the one place it
+    comes from, and it must be resolved once and reused for both the key and the
+    run, or the popup polls one key while the pipeline writes another.
+
+    `|audience=<level>` rather than a bare `|<level>`, so a future reader cannot
+    confuse the field positionally with `mode`.
+    """
     cfg_hash = config_hash(cfg)
     payload = f"{source_id}|{cfg_hash}"
     if mode and mode != DEFAULT_MODE:
         payload += f"|{mode}"
+    if audience and audience != NEUTRAL_AUDIENCE:
+        payload += f"|audience={audience}"
     digest = hashlib.sha256(payload.encode()).hexdigest()
     return digest[:16]
 
@@ -175,7 +204,11 @@ def lookup(cache_root: Path, key: str) -> CacheEntry | None:
 
 
 def lookup_by_url(
-    cache_root: Path, url: str, cfg: PipelineConfig, mode: str = DEFAULT_MODE
+    cache_root: Path,
+    url: str,
+    cfg: PipelineConfig,
+    mode: str = DEFAULT_MODE,
+    audience: str = NEUTRAL_AUDIENCE,
 ) -> CacheEntry | None:
     """Resolve a URL to a cache entry under the current pipeline config + mode.
 
@@ -186,7 +219,7 @@ def lookup_by_url(
     """
     canonical = canonicalize_url(url)
     src_id = f"url:{canonical}"
-    expected_key = cache_key(src_id, cfg, mode)
+    expected_key = cache_key(src_id, cfg, mode, audience)
     return lookup(cache_root, expected_key)
 
 

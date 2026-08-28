@@ -34,13 +34,17 @@ import time
 from time import perf_counter
 import traceback
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from patmir.paths import StoragePaths
 from patmir.pipeline.config import PipelineConfig
-from patmir.pipeline.context import JobCancelled
+from patmir.pipeline.context import (
+    NEUTRAL_AUDIENCE,
+    JobCancelled,
+    resolve_audience,
+)
 from patmir.pipeline.streaming.prelude import run_prelude
 from patmir.pipeline.streaming.runner import source_duration
 from patmir.pipeline.streaming.scheduler import Playhead, StreamScheduler
@@ -70,6 +74,13 @@ class StreamRecord:
     status: StreamStatus
     submitted_at: float
     mode: str = MODE
+    # Resolved audience level this stream runs at. Folded into the cache key, so
+    # a level change is a new stream rather than a mid-flight switch; a running
+    # stream keeps the level it started with.
+    audience: str = NEUTRAL_AUDIENCE
+    # Audience-free key, used only to name the yt-dlp download dir — the source
+    # file is the same at every level.
+    download_key: str = ""
     started_at: float | None = None
     finished_at: float | None = None
     error: str | None = None
@@ -109,6 +120,7 @@ class StreamRecord:
             "source_url": self.source_url,
             "source_path": self.source_path,
             "source_lang": self.source_lang,
+            "audience": self.audience,
             "submitted_at": self.submitted_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -212,18 +224,47 @@ class StreamManager:
             self._cfg = streaming_config(self._config_path)
         return self._cfg
 
-    def cache_key_for_url(self, url: str) -> str:
-        return cache_mod.cache_key(cache_mod.source_id_for_url(url), self._streaming_cfg(), MODE)
+    def cache_key_for_url(self, url: str, audience: str | None = None) -> str:
+        return cache_mod.cache_key(
+            cache_mod.source_id_for_url(url), self._streaming_cfg(), MODE,
+            self.resolved_audience(audience),
+        )
 
-    def lookup_cache_by_url(self, url: str) -> dict[str, Any] | None:
-        ck = self.cache_key_for_url(url)
+    def lookup_cache_by_url(
+        self, url: str, audience: str | None = None,
+    ) -> dict[str, Any] | None:
+        ck = self.cache_key_for_url(url, audience)
         return cache_mod.read_stream_manifest(self._cache_root, ck)
+
+    def resolved_audience(self, requested: str | None) -> str:
+        """The level a submission with this `requested` value would run at."""
+        return resolve_audience(requested, self._streaming_cfg().options)
+
+    def _cfg_for(self, audience: str) -> PipelineConfig:
+        """Streaming config carrying this stream's audience level.
+
+        Options only — `entries` is shared by reference so the warm stage cache,
+        keyed `(stage, candidate_id)` and shared with JobManager, is untouched.
+        Same reasoning as `JobManager._cfg_for`; the prelude, the opening dub and
+        every `process_section` already take `cfg`, so deriving once here is the
+        whole of the watch-along wiring.
+        """
+        cfg = self._streaming_cfg()
+        if audience == cfg.options.audience:
+            return cfg
+        return replace(cfg, options=replace(cfg.options, audience=audience))
 
     # --- public API -----------------------------------------------------
 
     async def submit(self, spec: JobSpec) -> StreamRecord:
         source_id, source_url = self._jobs._resolve_source_id(spec)
-        ck = cache_mod.cache_key(source_id, self._streaming_cfg(), MODE)
+        # Resolved once and carried on the record; the key and the run must not
+        # be able to disagree.
+        audience = self.resolved_audience(spec.audience)
+        ck = cache_mod.cache_key(source_id, self._streaming_cfg(), MODE, audience)
+        dl_key = cache_mod.cache_key(
+            source_id, self._streaming_cfg(), MODE, NEUTRAL_AUDIENCE,
+        )
 
         async with self._lock:
             existing_id = self._by_cache_key.get(ck)
@@ -251,6 +292,7 @@ class StreamManager:
                     job_id=f"stream-cache-{ck}",
                     cache_key=ck, source_id=source_id, source_url=source_url,
                     source_path=spec.source_path, source_lang=spec.source_lang,
+                    audience=audience, download_key=dl_key,
                     status="done", submitted_at=time.time(),
                     started_at=manifest.get("created_at"),
                     finished_at=manifest.get("finalized_at"),
@@ -265,6 +307,7 @@ class StreamManager:
             rec = StreamRecord(
                 job_id=job_id, cache_key=ck, source_id=source_id, source_url=source_url,
                 source_path=spec.source_path, source_lang=spec.source_lang,
+                audience=audience, download_key=dl_key,
                 status="queued", submitted_at=time.time(),
             )
             self._record(rec)
@@ -408,7 +451,7 @@ class StreamManager:
                       cancel: threading.Event | None = None) -> None:
         """Prelude → opening dub → playhead-driven streaming. Runs on a worker
         thread; the heavy stages are synchronous."""
-        cfg = self._streaming_cfg()
+        cfg = self._cfg_for(rec.audience)
         ck = rec.cache_key
         t_start = perf_counter()
 
@@ -419,7 +462,9 @@ class StreamManager:
         # entire run.
         if rec.source_url:
             t_dl = perf_counter()
-            local_path = self._jobs._download_url(rec.source_url, ck, rec)
+            local_path = self._jobs._download_url(
+                rec.source_url, rec.download_key or ck, rec,
+            )
             rec.download_s = perf_counter() - t_dl
         else:
             local_path = Path(rec.source_path or "").expanduser().resolve()

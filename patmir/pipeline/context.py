@@ -31,6 +31,61 @@ class JobCancelled(Exception):
     """
 
 
+# --- Audience age guardrail --------------------------------------------------
+#
+# The age register the translator is steered toward. Prompt-only softening: the
+# candidate is asked to choose safer WORDING, and is explicitly forbidden from
+# dropping, blanking, bleeping or redacting a line. This dub is the only audio
+# track its listener has, so a silent gap is strictly worse than a gentler word.
+
+AUDIENCE_LEVELS: tuple[str, ...] = ("child", "teenager", "adult")
+
+# What a submission gets when it says nothing. `teenager` -- NOT the same as the
+# level that leaves the cache key alone. Keeping the two apart is deliberate; see
+# NEUTRAL_AUDIENCE.
+#
+# Was `child` when the guardrail shipped (2026-08-28); moved to `teenager` the
+# same day at the author's request. `child` remains one click away and is the
+# right choice for cartoons; `teenager` is the safer *default* because it is the
+# one that is wrong in the smaller direction across a mixed library -- too mild
+# for an adult drama costs a little bite, where too coarse for a young viewer
+# costs the thing this feature exists to prevent.
+DEFAULT_AUDIENCE = "teenager"
+
+# The level whose composed prompt is byte-identical to the pre-guardrail prompt,
+# and therefore the only one that appends nothing to the cache key. Every dub
+# cached before this feature existed was made with exactly this prompt, so its
+# key must keep pointing at it. The `mode` suffix in ui/cache.py folds in on the
+# *default*; here the two differ, which means shipping this re-dubs every video
+# once at the new default -- accepted, because the alternative is serving
+# adult-register audio under a child-labelled setting.
+NEUTRAL_AUDIENCE = "adult"
+
+
+def normalize_audience(value: str | None) -> str:
+    """Validate an audience level. `None`/empty -> DEFAULT_AUDIENCE."""
+    level = (value or DEFAULT_AUDIENCE).strip().lower()
+    if level not in AUDIENCE_LEVELS:
+        raise ValueError(
+            f"unknown audience: {value!r} "
+            f"(expected one of {', '.join(AUDIENCE_LEVELS)})"
+        )
+    return level
+
+
+def resolve_audience(requested: str | None, options: "PipelineOptions") -> str:
+    """The one place the precedence rule lives.
+
+    A per-submission value wins; absent one, the server's
+    `[pipeline.options].audience` applies. The resolved string drives BOTH the
+    prompt and the cache-key suffix, so the two can never disagree -- resolve
+    once per submission and reuse the result.
+    """
+    if requested:
+        return normalize_audience(requested)
+    return normalize_audience(getattr(options, "audience", None))
+
+
 @dataclass
 class PipelineOptions:
     stretch_cap: float = 0.20
@@ -119,6 +174,23 @@ class PipelineOptions:
     # ~10 GB with the current models — so set False on a memory-constrained box
     # or when the server is started just to browse finished runs.
     prewarm_stages: bool = True
+    # Age register the translator is steered toward: "child" | "teenager" |
+    # "adult". Prompt-only softening -- gentler wording, never a dropped,
+    # blanked or bleeped line.
+    #
+    # THE ONE EXCEPTION to "options never touch the cache key". Every other
+    # field here is audio tuning and is deliberately excluded (ui/cache.py:10-12)
+    # so an ear-test loop does not invalidate everything; this one changes the
+    # Armenian TEXT, so re-picking a level must not replay the previous level's
+    # audio. It stays out of `config_hash` (which hashes candidate ENTRIES, and
+    # this is not a model selection -- it must not fragment the warm stage cache,
+    # keyed `(stage, candidate_id)`) and is folded into `cache_key` as an
+    # explicit `|audience=<level>` suffix instead.
+    #
+    # This is the DEFAULT for `patmir dub` and for any client that omits the
+    # field. The Chrome extension sends its own value on every submission and
+    # wins. ADR: 2026-08-28-audience-age-guardrail.
+    audience: str = DEFAULT_AUDIENCE
     # NOTE (2026-08-24): `emotion_guidance` used to live here — a per-bin
     # OmniVoice `guidance_scale` lookup. Removed because it had been INERT
     # since 2026-06-20: the adapter only forwards it to candidates whose

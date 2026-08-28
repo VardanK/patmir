@@ -23,14 +23,21 @@ const SYNC = fs.readFileSync(path.join(__dirname, "..", "lib", "sync.js"), "utf8
 
 /** Evaluate content.js in a fresh sandbox, optionally loading lib/sync.js first
  *  (which is what the manifest's content_scripts order does in Chrome). */
-function boot({ withSync }) {
+function boot(opts) {
+  const { withSync } = opts;
   const state = { handler: null, errors: [], timers: [] };
   const sandbox = {
     console: { error: (...a) => state.errors.push(a.join(" ")), warn() {}, log() {} },
     setTimeout: (fn) => { state.timers.push(fn); return state.timers.length; },
     clearTimeout() {}, setInterval: () => 1, clearInterval() {},
     location: { href: "https://www.youtube.com/watch?v=abc" },
-    document: { querySelectorAll: () => [], addEventListener() {}, contains: () => true },
+    document: {
+      querySelectorAll: () => opts.videos || [],
+      // Deliberately absent by default (see the DOM-globals guard below); a
+      // caller opts in when it wants to drive the ad detector.
+      querySelector: opts.querySelector,
+      addEventListener() {}, contains: () => true,
+    },
     addEventListener() {},
     AudioContext: function () {},
     atob: (b) => Buffer.from(b, "base64").toString("binary"),
@@ -99,6 +106,68 @@ test("the manifest loads lib/sync.js before content.js", () => {
     `lib/sync.js must come first, got ${JSON.stringify(js)}`);
 });
 
+test("the manifest's load order satisfies all three dependencies", () => {
+  // Content scripts share one isolated world and load in order, so the manifest
+  // IS the dependency graph. Three edges, each of which produces a loud bail
+  // rather than a subtle failure if broken — but only if the order is right:
+  //   lib/sync.js    before content.js  (PatmirSync)
+  //   lib/session.js before overlay.js  (PatmirSession)
+  //   content.js     before overlay.js  (PatmirPlayer, published at the end)
+  const m = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
+  const js = m.content_scripts[0].js;
+  const at = (f) => {
+    const i = js.indexOf(f);
+    assert.ok(i >= 0, `${f} must be listed, got ${JSON.stringify(js)}`);
+    return i;
+  };
+  assert.ok(at("lib/sync.js") < at("content.js"));
+  assert.ok(at("lib/session.js") < at("overlay.js"));
+  assert.ok(at("content.js") < at("overlay.js"),
+    "overlay.js consumes the PatmirPlayer facade content.js publishes");
+});
+
+test("content.js publishes the PatmirPlayer facade, and only after full init", () => {
+  const { sandbox } = boot({ withSync: true });
+  const facade = sandbox.PatmirPlayer;
+  assert.ok(facade, "overlay.js depends on this being published");
+  for (const k of ["play", "playWatchAlong", "stop", "status", "findVideo",
+                   "canonicalUrl", "onUrlChange", "adState", "applyAdAction"]) {
+    assert.equal(typeof facade[k], "function", `PatmirPlayer.${k}`);
+  }
+});
+
+test("without lib/sync.js, no facade is published either", () => {
+  // Same reasoning as the listener: a facade over a half-initialized module
+  // would let overlay.js reach into the temporal dead zone.
+  const { sandbox } = boot({ withSync: false });
+  assert.equal(sandbox.PatmirPlayer, undefined);
+});
+
+test("content.js does not claim the channel for messages it does not own", () => {
+  // overlay.js registers its own listener in the same isolated world. This
+  // listener used to `return true` for EVERY message, including the
+  // patmir:session-* ones it never answers — leaving a response port open that
+  // nothing here closes.
+  const { state } = boot({ withSync: true });
+  assert.equal(state.handler({ type: "patmir:session-state" }, {}, () => {}), undefined);
+  assert.equal(state.handler({ type: "nonsense" }, {}, () => {}), undefined);
+  assert.equal(state.handler(null, {}, () => {}), undefined);
+  // ...but still does for its own.
+  assert.equal(state.handler({ type: "patmir:status" }, {}, () => {}), true);
+});
+
+test("content.js still touches NO DOM-construction globals at boot", () => {
+  // The regression guard that keeps button code out of this file. The sandbox
+  // above deliberately provides no createElement, no MutationObserver and no
+  // CSSStyleSheet; if someone moves the overlay's DOM work in here, this fails
+  // immediately and says why.
+  const { state, sandbox } = boot({ withSync: true });
+  assert.equal(state.errors.length, 0, state.errors.join(" | "));
+  assert.equal(typeof sandbox.document.createElement, "undefined");
+  assert.equal(typeof sandbox.MutationObserver, "undefined");
+  assert.equal(typeof sandbox.CSSStyleSheet, "undefined");
+});
+
 // --- the two injection paths must agree ------------------------------
 //
 // Content scripts reach a page two ways: the manifest's declarative
@@ -133,3 +202,136 @@ test("the fallback's hardcoded default still matches the manifest", () => {
   assert.deepEqual(JSON.parse(fallback[1].replace(/'/g, '"')), expected,
     "the fallback default must match manifest content_scripts[0].js");
 });
+
+
+// --- the ad facade ----------------------------------------------------
+//
+// Ads share the page's single <video> element, so during an ad `currentTime` is
+// the AD's timeline and the src swap looks like a navigation. Before this,
+// an unskippable mid-roll therefore killed the dub for the REST of the video —
+// the src-change guard tore it down and nothing brought it back. These pin the
+// two halves of the fix that content.js owns: reading the signal, and refusing
+// to act on a stale one.
+
+function bootWithPlayer(playerClass, extra) {
+  const nodes = Object.assign({ "#movie_player": { className: playerClass } }, extra || {});
+  return boot({ withSync: true, querySelector: (sel) => nodes[sel] || null });
+}
+
+test("adState reads ad-showing off the player", () => {
+  const { sandbox } = bootWithPlayer("html5-video-player ad-showing playing-mode");
+  assert.equal(sandbox.PatmirPlayer.adState().showing, true);
+});
+
+test("adState reports no ad on an ordinary player", () => {
+  const { sandbox } = bootWithPlayer("html5-video-player playing-mode");
+  assert.equal(sandbox.PatmirPlayer.adState().showing, false);
+});
+
+test("adState survives a DOM with no querySelector at all", () => {
+  // It runs from the sync tick on every page, including ones mid-teardown.
+  const { sandbox } = boot({ withSync: true });
+  assert.doesNotThrow(() => sandbox.PatmirPlayer.adState());
+  assert.equal(sandbox.PatmirPlayer.adState().showing, false);
+});
+
+test("adState sees a skip control only when it is actually clickable", () => {
+  const skip = { disabled: false, offsetParent: {}, click() {} };
+  const ready = bootWithPlayer("ad-showing", { ".ytp-skip-ad-button": skip });
+  assert.equal(ready.sandbox.PatmirPlayer.adState().skipReady, true);
+
+  skip.disabled = true;
+  const notYet = bootWithPlayer("ad-showing", { ".ytp-skip-ad-button": skip });
+  assert.equal(notYet.sandbox.PatmirPlayer.adState().skipReady, false);
+  assert.equal(notYet.sandbox.PatmirPlayer.adState().skippable, true,
+    "present-but-counting-down is still 'skippable'");
+});
+
+test("applyAdAction clicks a live skip control", () => {
+  let clicked = 0;
+  const skip = { disabled: false, offsetParent: {}, click() { clicked += 1; } };
+  const { sandbox } = bootWithPlayer("ad-showing", { ".ytp-skip-ad-button": skip });
+  assert.equal(sandbox.PatmirPlayer.applyAdAction("click"), true);
+  assert.equal(clicked, 1);
+});
+
+test("applyAdAction REFUSES to seek when no ad is on screen", () => {
+  // The single destructive failure available in this feature: a seek that lands
+  // on the content video. The guard is re-checked here, against live DOM,
+  // immediately before acting — not inherited from whatever the caller decided
+  // a tick ago.
+  const video = { duration: 100, currentTime: 5, currentSrc: "blob:x" };
+  const { sandbox } = boot({
+    withSync: true,
+    videos: [video],
+    querySelector: (sel) => (sel === "#movie_player" ? { className: "html5-video-player" } : null),
+  });
+  assert.equal(sandbox.PatmirPlayer.applyAdAction("seek"), false);
+  assert.equal(video.currentTime, 5, "the content video must not move");
+});
+
+test("applyAdAction seeks to the end of an ad that IS on screen", () => {
+  const video = { duration: 30, currentTime: 2, currentSrc: "blob:ad" };
+  const { sandbox } = boot({
+    withSync: true,
+    videos: [video],
+    querySelector: (sel) => (sel === "#movie_player" ? { className: "ad-showing" } : null),
+  });
+  assert.equal(sandbox.PatmirPlayer.applyAdAction("seek"), true);
+  assert.equal(video.currentTime, 30);
+});
+
+test("adState is false on an ordinary page carrying YouTube's empty ad containers", () => {
+  // The shipped bug, at the layer that produced it: `!!querySelector(...)` was
+  // true because YouTube leaves `.ytp-ad-module` in the DOM with no ad running,
+  // so the predicate said "ad" on every video and the seek moved every video.
+  // The container has to have CONTENT to count for anything now.
+  const empty = { children: [], textContent: "" };
+  const { sandbox } = boot({
+    withSync: true,
+    querySelector: (sel) => (sel === "#movie_player"
+      ? { className: "html5-video-player playing-mode" }
+      : empty),
+  });
+  const st = sandbox.PatmirPlayer.adState();
+  assert.equal(st.showing, false);
+  assert.equal(st.classConfirmed, false);
+});
+
+test("applyAdAction refuses to seek a clip too long to be an ad", () => {
+  // Backstop for a detector bug: if the class says "ad" but the element reports
+  // twenty minutes, the class is wrong and this is the viewer's video.
+  const video = { duration: 1200, currentTime: 10, currentSrc: "blob:x" };
+  const { sandbox } = boot({
+    withSync: true,
+    videos: [video],
+    querySelector: (sel) => (sel === "#movie_player" ? { className: "ad-showing" } : null),
+  });
+  assert.equal(sandbox.PatmirPlayer.applyAdAction("seek"), false);
+  assert.equal(video.currentTime, 10);
+});
+
+test("applyAdAction refuses to seek the duration it recorded as the content", () => {
+  // Last line of defence, and independent of the class: whatever we believe, an
+  // element reporting the length of the video the viewer opened is that video.
+  const video = { duration: 42, currentTime: 3, currentSrc: "blob:x" };
+  let ad = false;
+  const { sandbox } = boot({
+    withSync: true,
+    videos: [video],
+    querySelector: (sel) => (sel === "#movie_player"
+      ? { className: ad ? "ad-showing" : "html5-video-player" } : null),
+  });
+  sandbox.PatmirPlayer.adState();      // no ad yet -> records duration 42
+  ad = true;                            // now claim an ad, same element/duration
+  assert.equal(sandbox.PatmirPlayer.applyAdAction("seek"), false);
+  assert.equal(video.currentTime, 3);
+});
+
+test("applyAdAction ignores anything that is not a known action", () => {
+  const { sandbox } = bootWithPlayer("ad-showing");
+  for (const a of ["stop", "", null, undefined, "SEEK"]) {
+    assert.equal(sandbox.PatmirPlayer.applyAdAction(a), false, String(a));
+  }
+});
+

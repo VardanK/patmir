@@ -152,6 +152,26 @@ disk and marks the stage `cancelled` rather than `failed`, so the job stays
 resumable with `--resume-from`. ADR:
 `decisions/2026-08-25-cooperative-job-cancellation.md`.
 
+### The audience level rides `ctx.options`, not `extra` and not `entries`
+
+The age register the translator is steered toward (`child` / `teenager` /
+`adult`) is a *configuration* scalar, so it lives on `PipelineOptions` and
+reaches stages through `ctx.options` — the channel that already exists for
+exactly that. It is **not** in `ctx.extra` (the cross-stage data hand-off above)
+and **not** in `cfg.entries` (which selects models).
+
+That last exclusion is load-bearing rather than tidy. `stage_cache_key` is
+`(stage, candidate_id)` and the cache is process-lifetime and shared between
+`JobManager` and `StreamManager`, so a candidate that carried the level in its
+constructor would be handed to the next job at a different level; and
+`prewarm_stage_cache` builds translate at server boot, before any submission
+exists. So the server derives a per-job config replacing **options only**
+(`_cfg_for`), and the adapter forwards the level as a per-call `audience=` kwarg
+discovered by signature probe — the same mechanism `emotion` uses. One warm
+candidate serves every level, and watch-along needed no signature changes at all
+because `run_prelude`, `dub_prelude_window` and `process_section` already take
+`cfg`. ADR: `decisions/2026-08-28-audience-age-guardrail.md`.
+
 ## Post-stage runner steps
 
 Two operations run inside the runner, *not* as their own stages, because they bridge stages without independent value:

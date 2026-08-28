@@ -25,6 +25,7 @@ from patmir.env import load_dotenv
 from patmir.paths import StoragePaths
 from patmir.pipeline import config as config_mod
 from patmir.pipeline.config import load_pipeline_config
+from patmir.pipeline.context import AUDIENCE_LEVELS, normalize_audience
 from patmir.pipeline.manifest import Manifest
 from patmir.pipeline.runner import run_job
 from patmir.pipeline.stage import STAGE_ORDER
@@ -77,6 +78,11 @@ def main(argv: list[str] | None = None) -> int:
     p_dub.add_argument("--source-lang", type=str, default=None,
                        help="ISO source language hint (e.g. 'ru', 'en'). "
                             "Used by ASR as a fallback if it can't detect language.")
+    p_dub.add_argument(
+        "--audience", type=str, choices=list(AUDIENCE_LEVELS), default=None,
+        help="Age register for the Armenian (default: [pipeline.options].audience "
+             "in patmir.toml). Prompt-only softening — no line is ever dropped, "
+             "blanked or bleeped.")
     p_dub.add_argument("--profile", type=str, default=None,
                        help='Machine profile from [pipeline.profiles.<name>] in patmir.toml (e.g. "cuda"). Sugar for $PATMIR_PROFILE — it is exported into the environment so the watch-along path picks it up too.')
 
@@ -160,6 +166,10 @@ def main(argv: list[str] | None = None) -> int:
     p_submit.add_argument("--url", type=str, default=None,
                           help="Video URL (e.g. YouTube). Cannot be combined with a file path.")
     p_submit.add_argument("--source-lang", type=str, default=None)
+    p_submit.add_argument(
+        "--audience", type=str, choices=list(AUDIENCE_LEVELS), default=None,
+        help="Age register for the Armenian. Omitted = the server's "
+             "[pipeline.options].audience default.")
     p_submit.add_argument("--server", type=str, default="http://127.0.0.1:8765")
     p_submit.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                           help="Read the bearer token from this config's [storage].state_root.")
@@ -195,6 +205,11 @@ def cmd_dub(args: argparse.Namespace) -> int:
     if not _require_config(args.config):
         return 2
     cfg = load_pipeline_config(args.config, skip_before=args.resume_from)
+    # Mutating the freshly loaded local config is safe — cmd_dub owns it, and
+    # this is the same "options only, never entries" move the server makes per
+    # job (JobManager._cfg_for), so the warm-stage-cache key is untouched.
+    if args.audience:
+        cfg.options.audience = normalize_audience(args.audience)
     runs_root = cfg.storage.runs_root
 
     job_dir = args.resume_job
@@ -214,6 +229,9 @@ def cmd_dub(args: argparse.Namespace) -> int:
     print(f"patmir dub {args.video}", file=sys.stderr)
     print(f"  config: {args.config}", file=sys.stderr)
     print(f"  runs:   {runs_root}", file=sys.stderr)
+    # Printed unconditionally so an ear-test log records which register produced
+    # the output it is judging.
+    print(f"  audience: {cfg.options.audience}", file=sys.stderr)
     if cfg.storage.library_root:
         print(f"  library: {cfg.storage.library_root}", file=sys.stderr)
     if args.resume_from:
@@ -397,6 +415,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         body["source_url"] = args.url
     if args.source_lang:
         body["source_lang"] = args.source_lang
+    if args.audience:
+        body["audience"] = args.audience
 
     req = urllib.request.Request(
         f"{args.server.rstrip('/')}/jobs",

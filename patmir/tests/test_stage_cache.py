@@ -11,6 +11,8 @@ Three contracts:
   * `prewarm_stage_cache` fills the cache up front, is idempotent, and is
     best-effort: a stage that cannot be built is skipped rather than taking
     server startup down with it.
+  * The audience age level, which is a per-job value on `options`, does NOT
+    enter the key — the design depends on it.
 """
 from __future__ import annotations
 
@@ -119,3 +121,40 @@ class Prewarm(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AudienceDoesNotFragmentTheCache(unittest.TestCase):
+    """The audience level rides `cfg.options`, never `cfg.entries`, precisely so
+    the warm cache is untouched by it.
+
+    This is the test that would have caught the rejected design — injecting the
+    level into the translate candidate's ENTRY dict. That gets the cache key for
+    free via `config_hash`, but leaves `stage_cache_key` unchanged (the
+    candidate id does not move), so the first job's warm translator would be
+    handed to every later job regardless of level. And `prewarm_stage_cache`
+    runs at server boot, before any submission exists, so there would be nothing
+    to bake in. ADR: 2026-08-28-audience-age-guardrail.
+    """
+
+    def test_same_key_for_every_level(self) -> None:
+        keys = set()
+        for level in ("child", "teenager", "adult"):
+            cfg = _cfg()
+            cfg.options.audience = level
+            keys.add(stage_cache_key(cfg, "translate"))
+        self.assertEqual(len(keys), 1, keys)
+
+    def test_a_warm_translate_stage_is_reused_across_levels(self) -> None:
+        """Concretely: one built instance serves all three levels, which is only
+        safe because the level reaches the candidate as a per-CALL kwarg."""
+        from patmir.pipeline.runner import prewarm_stage_cache
+        cache: dict = {}
+        child = _cfg(); child.options.audience = "child"
+        prewarm_stage_cache(child, cache, stages=["translate"])
+        built_once = list(child.builds)
+
+        adult = _cfg(); adult.options.audience = "adult"
+        prewarm_stage_cache(adult, cache, stages=["translate"])
+        self.assertEqual(child.builds, built_once)
+        self.assertEqual(adult.builds, [], "second config must not rebuild")
+

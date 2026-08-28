@@ -9,12 +9,53 @@ timing to each entry, and writes `translated.json`.
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
+import logging
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from patmir.pipeline.context import JobContext
+from patmir.pipeline.context import (
+    NEUTRAL_AUDIENCE,
+    JobContext,
+    resolve_audience,
+)
+
+log = logging.getLogger(__name__)
+
+
+def _accepts(fn: Any, name: str) -> bool:
+    """Does `fn` take a keyword named `name`?
+
+    The pipeline's way of discovering optional candidate capabilities: the
+    candidates are Phase-0 objects with no shared base class, so the adapter
+    asks the signature rather than a registry.
+    """
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _warn_unsteerable(ctx: JobContext, inner: Any, audience: str) -> None:
+    """A non-adult level was asked for and the candidate has no prompt surface.
+
+    Warned, never silent, and never fatal. Not fatal because refusing would take
+    out the offline fallback entirely — NLLB / MADLAD / OPUS-MT are seq2seq and
+    TranslateGemma documents having no prompt surface at all, so on those the
+    guardrail genuinely cannot apply. Not silent because this repo has a scar
+    here: `emotion_guidance` sat INERT for two months for exactly this reason,
+    and the NOTE at pipeline/context.py explicitly says a restored version must
+    warn when the active candidate cannot accept it.
+    """
+    cid = getattr(inner, "id", type(inner).__name__)
+    msg = (
+        f"audience={audience} requested, but translate candidate {cid!r} takes "
+        f"no prompt — register is NOT steered for this run"
+    )
+    log.warning("%s", msg)
+    ctx.progress("translate", 0.0, msg)
 from patmir.pipeline.stage import (
     TranslatedSentence,
     TranslatedTranscript,
@@ -31,6 +72,12 @@ class SentenceTranslator:
     def translate(self, transcript: Transcript, ctx: JobContext) -> TranslatedTranscript:
         source_lang = ctx.source_lang or transcript.language
         total = len(transcript.sentences) or 1
+        # Resolved once, here, from the config the runner was handed. The server
+        # derives a per-job config carrying the submission's level (see
+        # JobManager._cfg_for), so by this point `ctx.options.audience` IS the
+        # level this job's cache key was computed with.
+        audience = resolve_audience(None, ctx.options)
+        steered = False
 
         # If the inner candidate exposes a batch API, prefer it: chunked
         # calls produce more coherent character voice + better discourse
@@ -40,10 +87,17 @@ class SentenceTranslator:
         if callable(translate_batch) and transcript.sentences:
             def _on_progress(done: int, total_: int, msg: str) -> None:
                 ctx.progress("translate", done / max(1, total_), msg)
+            batch_kwargs: dict[str, Any] = {}
+            if _accepts(translate_batch, "audience"):
+                batch_kwargs["audience"] = audience
+                steered = True
+            elif audience != NEUTRAL_AUDIENCE:
+                _warn_unsteerable(ctx, self.inner, audience)
             results = translate_batch(
                 transcript.sentences,
                 source_lang=source_lang,
                 progress=_on_progress,
+                **batch_kwargs,
             )
             sentences = [
                 TranslatedSentence(
@@ -65,13 +119,12 @@ class SentenceTranslator:
             # (each round-trip is ~1s TTFT-dominated; serial translate was
             # 12-15% of batch wall — performance.md roadmap #1). Local
             # candidates (NLLB on GPU) leave the attribute unset → serial.
-            import inspect
             import time
-            try:
-                inner_sig = inspect.signature(self.inner.translate)
-                inner_accepts_emotion = "emotion" in inner_sig.parameters
-            except (TypeError, ValueError):
-                inner_accepts_emotion = False
+            inner_accepts_emotion = _accepts(self.inner.translate, "emotion")
+            inner_accepts_audience = _accepts(self.inner.translate, "audience")
+            steered = inner_accepts_audience
+            if audience != NEUTRAL_AUDIENCE and not inner_accepts_audience:
+                _warn_unsteerable(ctx, self.inner, audience)
 
             bench = bool(ctx.extra.get("bench"))
             src = transcript.sentences
@@ -80,13 +133,13 @@ class SentenceTranslator:
 
             def _one(i: int) -> None:
                 s = src[i]
-                t0 = time.perf_counter()
+                kwargs: dict[str, Any] = {"source_lang": source_lang}
                 if inner_accepts_emotion:
-                    results[i] = self.inner.translate(
-                        s.text, source_lang=source_lang, emotion=s.emotion,
-                    )
-                else:
-                    results[i] = self.inner.translate(s.text, source_lang=source_lang)
+                    kwargs["emotion"] = s.emotion
+                if inner_accepts_audience:
+                    kwargs["audience"] = audience
+                t0 = time.perf_counter()
+                results[i] = self.inner.translate(s.text, **kwargs)
                 elapsed[i] = time.perf_counter() - t0
 
             concurrency = max(1, int(getattr(self.inner, "translate_concurrency", 1)))
@@ -132,14 +185,45 @@ class SentenceTranslator:
             target_lang="hy",
             sentences=sentences,
         )
-        _write_translated(ctx.job_dir, out)
+
+        # A blank line is the failure mode this guardrail exists to prevent, and
+        # it is the one a safety filter produces: a provider that declines a
+        # violent line under `audience="child"` returns `content: null`, which
+        # the candidate turns into "" and the TTS adapter then skips — a silent
+        # hole in the dub. The batch path already catches this per chunk
+        # ("empty translation for idx=" -> per-sentence fallback); the
+        # per-sentence path had nothing. Count and report; never fail the run,
+        # because the rest of the dub is good and the operator needs to know
+        # which lines to look at.
+        blank = sum(1 for s in sentences if not (s.target_text or "").strip())
+        if blank:
+            msg = (
+                f"{blank} of {len(sentences)} line(s) came back empty from the "
+                f"translator (audience={audience}) — those lines will be silent"
+            )
+            log.warning("%s", msg)
+            ctx.progress("translate", 1.0, msg)
+
+        _write_translated(ctx.job_dir, out, audience=audience, honored=steered)
         return out
 
 
-def _write_translated(job_dir: Path, t: TranslatedTranscript) -> None:
+def _write_translated(
+    job_dir: Path,
+    t: TranslatedTranscript,
+    *,
+    audience: str = NEUTRAL_AUDIENCE,
+    honored: bool = False,
+) -> None:
+    # `audience` / `audience_honored` are additive and both absent from files
+    # written before the guardrail existed — readers must treat them as
+    # optional. This file is copied into the cache as `transcript.json`, so a
+    # cached dub is self-describing about the register it was made at.
     payload = {
         "source_lang": t.source_lang,
         "target_lang": t.target_lang,
+        "audience": audience,
+        "audience_honored": honored,
         "sentences": [asdict(s) for s in t.sentences],
     }
     (job_dir / "translated.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))

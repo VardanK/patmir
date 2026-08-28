@@ -27,7 +27,11 @@ from typing import Any
 
 from patmir import paths as paths_mod
 from patmir.paths import StoragePaths, load_storage
-from patmir.pipeline.context import PipelineOptions
+from patmir.pipeline.context import (
+    DEFAULT_AUDIENCE,
+    PipelineOptions,
+    normalize_audience,
+)
 
 _STAGE_NAMESPACE: dict[str, tuple[str, str]] = {
     "ingest":    ("stages", "ingest"),
@@ -318,6 +322,11 @@ def load_pipeline_config(
         prelude_window_seconds=float(opts_raw.get("prelude_window_seconds", 40.0)),
         prewarm_stages=bool(opts_raw.get("prewarm_stages", True)),
         ref_min_rms_db=float(opts_raw.get("ref_min_rms_db", -33.0)),
+        # A bad value here is a hard load error, not a silent fall back to the
+        # default -- same stance as an unknown profile name. A config that says
+        # "child" and quietly runs "adult" is the failure this feature exists to
+        # prevent.
+        audience=normalize_audience(opts_raw.get("audience", DEFAULT_AUDIENCE)),
         # Top-level [[tts_ref_pool]] tables — a list
         # of curated stand-in ref clips, not a scalar option.
         tts_ref_pool=[e for e in (toml.get("tts_ref_pool") or []) if isinstance(e, dict) and e.get("path")],

@@ -188,6 +188,61 @@ relocating a root never orphans an existing dub.
 `Manifest` gained `published_dir: str | None` — the destination the deliverables were
 copied to, or `None` when publishing was skipped or failed.
 
+### `PipelineOptions.audience` (`patmir/pipeline/context.py`)
+
+The age register the translator is steered toward: `"child"` | `"teenager"` |
+`"adult"`. Default `"teenager"`. Prompt-only softening — gentler wording, never
+a dropped, blanked or bleeped line.
+
+**This is the one `[pipeline.options]` field that participates in the cache
+key**, and it does so by a different route from everything else. `config_hash`
+hashes `entries` only, so the level is *not* in it; instead
+`cache_key(source_id, cfg, mode, audience)` appends `|audience=<level>` when the
+level is not `NEUTRAL_AUDIENCE`. Two constants, deliberately different:
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `DEFAULT_AUDIENCE` | `"teenager"` | What a submission gets when it says nothing. Mirrored by `DEFAULT_AUDIENCE` in `extension/sw.js` and `extension/options.js`; a test asserts all three agree. |
+| `NEUTRAL_AUDIENCE` | `"adult"` | Composes a byte-identical prompt to the pre-guardrail one, so it appends nothing to the key |
+
+`resolve_audience(requested, options)` is the single place the precedence rule
+lives (per-submission wins, else `[pipeline.options].audience`); resolve once per
+submission and reuse the result for both the key and the run. `normalize_audience`
+raises `ValueError` on anything else.
+
+The level reaches the translate candidate as a **per-call `audience=` kwarg**,
+probed for by `SentenceTranslator` exactly as `emotion` is — never baked into the
+candidate's constructor, because `stage_cache_key` is `(stage, candidate_id)` and
+one warm instance serves every level. ADR:
+`decisions/2026-08-28-audience-age-guardrail.md`.
+
+### `JobSpec` / `JobRecord` / `StreamRecord` additions (2026-08-28)
+
+| Field | Where | Type | Meaning |
+| --- | --- | --- | --- |
+| `audience` | `JobSpec` | `str \| None` | Per-submission level. `None` = "the client did not choose", which is what lets the toml default apply to the CLI while the extension always wins. Normalized in `__post_init__`; a bad value raises `ValueError` → HTTP 400. |
+| `audience` | `JobRecord`, `StreamRecord` | `str` | The **resolved** level this job runs at. Echoed by `to_public()`. A plain string so `asdict` persistence keeps working. |
+| `download_key` | `JobRecord`, `StreamRecord` | `str` | Cache key computed at `NEUTRAL_AUDIENCE`, used only to name the yt-dlp download dir. The source file is identical at every level, so keying the download by the audience-bearing key would re-download the whole video on every level flip. |
+
+`POST /jobs` accepts `audience`; `GET /cache/lookup` accepts an `audience` query
+param and echoes the resolved level in its response body. A lookup that omits it
+resolves to the server default, which must match what a submission would use or
+the client is told "not dubbed" for a dub that exists — the extension attaches
+the level in `sw.js` for both calls so they cannot disagree.
+
+### `translated.json` additions (2026-08-28)
+
+Two additive keys, both **absent** in files written before the guardrail, so
+readers must treat them as optional:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `audience` | `str` | The level this transcript was translated at |
+| `audience_honored` | `bool` | Whether the active candidate actually accepted the level. `false` means it has no prompt surface (NLLB / MADLAD / OPUS-MT / TranslateGemma) and the register was **not** steered — the adapter also logs one warning per job in that case. |
+
+`translated.json` is copied into the cache as `transcript.json`, so a cached dub
+is self-describing about the register it was made at.
+
 ## Stage protocols
 
 `@runtime_checkable Protocol` — see `patmir/pipeline/stage.py:159+`.
