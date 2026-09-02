@@ -34,6 +34,7 @@ machine-readable `bench.json` (`--report`).
 from __future__ import annotations
 
 import json
+import resource
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -50,6 +51,7 @@ from patmir.pipeline.runner import (
 from patmir.pipeline.stage import STAGE_ORDER
 from patmir.pipeline.streaming import timing as timing_mod
 from patmir.pipeline.streaming.scheduler import Playhead, StreamScheduler
+from patmir.telemetry import GpuSampler
 
 # The two run_job halves the watch-along section path runs (see
 # streaming/section.py): analysis (ingest→asr) then dub (translate→mux).
@@ -165,7 +167,7 @@ def _gpu_peak_reset() -> None:
         pass
 
 
-def _resource_peaks() -> dict[str, Any]:
+def _resource_peaks(sampler: GpuSampler | None = None) -> dict[str, Any]:
     """Best-effort memory telemetry. Never raises: a four-minute benchmark must
     not die on an instrumentation call.
 
@@ -174,10 +176,12 @@ def _resource_peaks() -> dict[str, Any]:
     host RAM the margin is real (~14.5 GB resident, peaks ~18-21 GB). Whoever
     raises `max_batch` needs to read the headroom rather than re-derive it.
 
-    `peak_rss_gb` is process-lifetime, so across `--repeat` it is monotonic and
-    describes the whole invocation, not the last repeat. It is here because
-    host swap — not VRAM — is what produced the 1.71 -> 3.02 RTF regression
-    documented in performance.md.
+    `peak_rss_gb` is per-repeat when a `sampler` is given (it polls
+    /proc/self/status), else it falls back to `ru_maxrss`, which is
+    process-lifetime and therefore monotonic across `--repeat` — describing the
+    whole invocation rather than the repeat it is filed under. Either way it is
+    here because host swap, not VRAM, is what produced the 1.71 -> 3.02 RTF
+    regression documented in performance.md.
     """
     out: dict[str, Any] = {}
     try:
@@ -189,16 +193,104 @@ def _resource_peaks() -> dict[str, Any]:
             out["vram_free_gb"] = round(free_b / 1024 ** 3, 2)
     except Exception:
         pass
-    try:
-        import resource
-        import sys
-        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # ru_maxrss is KiB on Linux, bytes on Darwin.
-        unit = 1024 ** 3 if sys.platform == "darwin" else 1024 ** 2
-        out["peak_rss_gb"] = round(maxrss / unit, 2)
-    except Exception:
-        pass
+    if sampler is not None and sampler.peak_rss_gb is not None:
+        out["peak_rss_gb"] = sampler.peak_rss_gb
+        out["rss_scope"] = "repeat"
+    else:
+        try:
+            import sys
+            maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # ru_maxrss is KiB on Linux, bytes on Darwin.
+            unit = 1024 ** 3 if sys.platform == "darwin" else 1024 ** 2
+            out["peak_rss_gb"] = round(maxrss / unit, 2)
+            out["rss_scope"] = "process"
+        except Exception:
+            pass
     return out
+
+
+def _cpu_times() -> tuple[float, float, float, float]:
+    """(user, sys, children_user, children_sys) CPU seconds so far.
+
+    Children matter here and are not an afterthought: ingest, separate,
+    diarize and output each spawn ffmpeg, and the mux spawns the `rubberband`
+    CLI up to twice per sentence. That work is invisible to `RUSAGE_SELF` and
+    to every GPU counter, so without it a stage that is entirely subprocess
+    cost looks free.
+    """
+    me = resource.getrusage(resource.RUSAGE_SELF)
+    kids = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return me.ru_utime, me.ru_stime, kids.ru_utime, kids.ru_stime
+
+
+def _cpu_delta(before: tuple[float, float, float, float]) -> dict[str, float]:
+    u, sy, cu, cs = _cpu_times()
+    b = before
+    return {
+        "user": round(u - b[0], 2),
+        "sys": round(sy - b[1], 2),
+        "children_user": round(cu - b[2], 2),
+        "children_sys": round(cs - b[3], 2),
+        "total": round((u - b[0]) + (sy - b[1]) + (cu - b[2]) + (cs - b[3]), 2),
+    }
+
+
+def _stage_probes(job_dir: Path) -> dict[str, Any]:
+    """Collect every `<stage>/bench_probe.json` a stage candidate wrote.
+
+    Merged verbatim, so a candidate can add a span without touching the
+    reader — the whole point of the additive probe contract.
+    """
+    out: dict[str, Any] = {}
+    for stage in STAGE_ORDER:
+        f = job_dir / stage / "bench_probe.json"
+        if not f.exists():
+            continue
+        try:
+            out[stage] = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+    return out
+
+
+def _aggregate_probes(job_dirs: list[Path]) -> dict[str, Any]:
+    """Sum the per-stage probes of every job dir a watch-along run produced.
+
+    Watch-along runs one prelude plus N sections, each its own job dir, so a
+    single probe file describes one section and answers nothing about the
+    stream. Numeric fields add (spans, counters); strings take the last value
+    (they are identities like `engine`, identical across sections); `details`
+    rows concatenate so a per-chunk breakdown survives.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for jd in job_dirs:
+        for stage, data in _stage_probes(jd).items():
+            acc = out.setdefault(stage, {})
+            for k, v in data.items():
+                if k == "details":
+                    acc.setdefault("details", []).extend(v or [])
+                elif isinstance(v, bool) or not isinstance(v, (int, float)):
+                    acc[k] = v
+                else:
+                    acc[k] = round(acc.get(k, 0) + v, 4)
+    return out
+
+
+def bench_extra(*, probe_level: str | None = None,
+                trace_stage: str | None = None) -> dict[str, Any]:
+    """`ctx.extra` for a benchmark run.
+
+    `bench: True` is the flag the tts/translate JSONL traces have always keyed
+    off; the probe modules read it too, so every stage gets a chunk-level probe
+    with no extra plumbing. The optional keys only raise TTS to per-step
+    granularity or ask for a profiler trace.
+    """
+    extra: dict[str, Any] = {"bench": True}
+    if probe_level:
+        extra["tts_probe"] = probe_level
+    if trace_stage:
+        extra[f"{trace_stage}_trace"] = True
+    return extra
 
 
 def _tts_stats(job_dir: Path) -> dict[str, Any] | None:
@@ -248,13 +340,18 @@ def _tts_stats(job_dir: Path) -> dict[str, Any] | None:
 
 
 def _translate_stats(job_dir: Path) -> dict[str, Any] | None:
+    """Translate latency. A row is a sentence on the per-sentence path and a
+    CHUNK on the batched one (watch-along), so `unit` has to say which — the
+    same trap `_tts_stats` documents for batched decode."""
     rows = _read_jsonl(job_dir / "translate" / "timings.jsonl")
     if not rows:
         return None
     lat = [r["latency_ms"] for r in rows if r.get("latency_ms") is not None]
     if not lat:
         return None
-    return {
+    chunk_rows = [r for r in rows if r.get("kind") == "chunk"]
+    out = {
+        "unit": "chunk" if chunk_rows else "sentence",
         "count": len(lat),
         "total_s": round(sum(lat) / 1000, 2),
         "mean_ms": round(statistics.mean(lat), 1),
@@ -262,6 +359,10 @@ def _translate_stats(job_dir: Path) -> dict[str, Any] | None:
         "p90_ms": round(_pctile(lat, 0.9), 1),
         "max_ms": round(max(lat), 1),
     }
+    if chunk_rows:
+        out["chunks"] = len(chunk_rows)
+        out["chunk_sentences"] = sum(int(r.get("sentences") or 0) for r in chunk_rows)
+    return out
 
 
 def _models(cfg: PipelineConfig) -> dict[str, str]:
@@ -293,7 +394,9 @@ def _stage_timings(manifest: Manifest, source_s: float | None,
 # --------------------------------------------------------------------------- #
 def bench_batch(clip: Path, cfg: PipelineConfig, *, runs_root: Path,
                 repeat: int = 1, label: str | None = None,
-                warm_cache: bool = True) -> list[BenchResult]:
+                warm_cache: bool = True,
+                probe_level: str | None = None,
+                trace_stage: str | None = None) -> list[BenchResult]:
     """Run `clip` through the batch pipeline `repeat` times.
 
     With `warm_cache` (the default) all repeats share ONE `stage_cache`, so
@@ -322,20 +425,45 @@ def bench_batch(clip: Path, cfg: PipelineConfig, *, runs_root: Path,
     try:
         for r in range(repeat):
             _gpu_peak_reset()
-            manifest = run_job(
-                clip, cfg,
-                runs_root=runs_root,
-                extra={"bench": True},
-                stage_cache=stage_cache,
-            )
+            sampler = GpuSampler()
+            sampler.start()
+            cpu0 = _cpu_times()
+            wall_t0 = time.perf_counter()
+            try:
+                manifest = run_job(
+                    clip, cfg,
+                    runs_root=runs_root,
+                    extra=bench_extra(probe_level=probe_level, trace_stage=trace_stage),
+                    stage_cache=stage_cache,
+                )
+            finally:
+                real_wall = time.perf_counter() - wall_t0
+                gpu = sampler.stop()
+            cpu = _cpu_delta(cpu0)
             job_dir = runs_root / manifest.job_id
             source_s = _source_seconds(job_dir)
             stages, total = _stage_timings(manifest, source_s)
             build_total = _build_total(stages)
             notes: dict[str, Any] = {
                 "build_pct_of_wall": round(100 * build_total / total, 1) if total else None,
+                # `total_wall_s` is the SUM OF STAGE WALLS, so everything
+                # between stages has always been invisible to it: nine
+                # `_free_accelerator_cache()` calls (gc + empty_cache), nine
+                # manifest rewrites, artifact recording, and the publish step.
+                # Watch-along has had `other_s` for exactly this since
+                # 2026-08-25; batch had no equivalent, so an optimization that
+                # removed inter-stage overhead could not show up in `agg_rtf`.
+                "real_wall_s": round(real_wall, 2),
+                "other_s": round(max(0.0, real_wall - total), 2),
+                "agg_rtf_real": round(real_wall / source_s, 3) if source_s else None,
+                "cpu_s": cpu,
             }
-            notes.update(_resource_peaks())
+            probes = _stage_probes(job_dir)
+            if probes:
+                notes["probes"] = probes
+            if gpu:
+                notes["gpu"] = gpu
+            notes.update(_resource_peaks(sampler))
             results.append(BenchResult(
                 clip=str(clip),
                 mode="batch",
@@ -473,6 +601,10 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
         duration = source_duration(clip)
 
         sections: list[dict[str, Any]] = []
+        # Probe files live in each section's own job dir. Tracked here rather
+        # than added to the shared section record, which is serialized into the
+        # client-visible sections.json and must not carry local paths.
+        probe_dirs: list[Path] = []
         # Same warm-model cache the production stream loop uses (ui/stream.py)
         # — bench must measure the warm path, not the legacy rebuild path.
         stage_cache: dict[str, Any] | None = {} if warm_cache else None
@@ -485,6 +617,9 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
             prewarm_stage_cache(cfg, stage_cache)
             prewarm_s = time.perf_counter() - pt
         _gpu_peak_reset()
+        sampler = GpuSampler()
+        sampler.start()
+        cpu0 = _cpu_times()
         run_t0 = time.perf_counter()
         t0 = time.perf_counter()
         prelude = run_prelude(
@@ -501,6 +636,7 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                                   stage_cache=stage_cache, bench=traces)
         sec0_wall = time.perf_counter() - t0
         sections.append(_section_record(0, sec0, sec0_wall, runs_root))
+        probe_dirs.append(sec0.job_dir)
         # The author-facing number: nothing plays before this.
         time_to_first_audio_s = time.perf_counter() - run_t0
 
@@ -521,6 +657,7 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
             )
             sections.append(_section_record(counter["n"], sec,
                                             time.perf_counter() - s0, runs_root))
+            probe_dirs.append(sec.job_dir)
             return sec
 
         if scheduler:
@@ -555,6 +692,9 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                 if max_sections is not None and idx > max_sections:
                     break
 
+        gpu = sampler.stop()
+        cpu = _cpu_delta(cpu0)
+        wa_probes = _aggregate_probes([prelude.job_dir, *probe_dirs])
         dubbed_audio_s = sum(s["section_s"] for s in sections)
         sections_wall = sum(s["wall_s"] for s in sections)
         total_wall = prelude_wall + sections_wall
@@ -626,7 +766,12 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                 # 301.1); they were 4.9% apart before the pad-dubbing fix.
                 "rtf_denominator": "dubbed_audio_s",
                 "agg_rtf_source": round(total_wall / duration, 3) if duration else None,
-                **_resource_peaks(),
+                "cpu_s": cpu,
+                # Summed over the prelude and every section — one probe file
+                # describes one section and says nothing about the stream.
+                **({"probes": wa_probes} if wa_probes else {}),
+                **({"gpu": gpu} if gpu else {}),
+                **_resource_peaks(sampler),
             },
             profile=cfg.profile,
             warm_cache=warm_cache,
@@ -695,6 +840,69 @@ def _summary_line(results: list[BenchResult]) -> list[str]:
     return out
 
 
+def _probe_line(probe: dict[str, Any]) -> str:
+    """One-line rendering of a stage's `bench_probe.json`.
+
+    Deliberately generic: spans and counters are printed in the order the
+    candidate recorded them, so adding a span needs no change here. Only
+    `details` (per-chunk rows) is held back — it belongs in the JSON.
+    """
+    parts: list[str] = []
+    for k, v in probe.items():
+        if k == "details":
+            parts.append(f"{len(v)} rows")
+        elif isinstance(v, float):
+            parts.append(f"{k} {v:.2f}")
+        else:
+            parts.append(f"{k} {v}")
+    return "  ".join(parts) if parts else "(empty)"
+
+
+def _gpu_lines(res: BenchResult) -> list[str]:
+    """Power / clock / thermal state during the run.
+
+    Printed for every run because its absence is what made the pre-2026-09-02
+    CUDA numbers unusable: the card had been power-limited to 280 W for thermal
+    reasons and no report recorded it, so nothing distinguished a throttled run
+    from a clean one.
+    """
+    g = res.notes.get("gpu")
+    if not g:
+        return []
+    bits: list[str] = []
+    if g.get("power_w"):
+        bits.append(f"power {g['power_w']['avg']}W avg / {g['power_w']['max']}W max"
+                    + (f" of {g['power_limit_w']}W" if g.get("power_limit_w") else ""))
+    if g.get("sm_mhz"):
+        bits.append(f"sm {g['sm_mhz']['avg']:.0f}MHz avg / {g['sm_mhz']['max']:.0f} max")
+    if g.get("temp_c"):
+        bits.append(f"temp {g['temp_c']['max']:.0f}C max")
+    if g.get("util_pct"):
+        bits.append(f"util {g['util_pct']['avg']:.0f}%")
+    out = [f"  gpu: {' · '.join(bits)}"] if bits else []
+    n = g.get("samples")
+    if g.get("capped_below_stock"):
+        # The condition that made a month of CUDA numbers incomparable.
+        out.append(f"  gpu: CAPPED BELOW STOCK — enforced {g.get('power_limit_w')}W "
+                   f"of {g.get('power_limit_default_w')}W. Not comparable with a "
+                   f"stock-limit run.")
+    if g.get("thermal_slowdown"):
+        out.append(f"  gpu: THERMAL SLOWDOWN in {n} samples — the card was hot "
+                   f"enough to drop clocks.")
+    ceiling = g.get("at_power_ceiling_samples") or 0
+    if ceiling:
+        # Not a defect: a 350 W card under a bandwidth-bound decode is meant to
+        # sit at its ceiling. Reported so a reader can see the card was working.
+        out.append(f"  gpu: at its {g.get('power_limit_w')}W stock ceiling in "
+                   f"{ceiling}/{n} samples (expected under load)")
+    if not g.get("throttled") and not ceiling:
+        out.append(f"  gpu: never power- or thermally-limited in {n} samples")
+    if g.get("idle_pct") is not None:
+        out.append(f"  gpu: idle in {g['idle_pct']}% of samples "
+                   f"(cloud translate + ffmpeg + host-side work)")
+    return out
+
+
 def format_report(results: list[BenchResult]) -> str:
     lines: list[str] = []
     for res in results:
@@ -723,9 +931,14 @@ def format_report(results: list[BenchResult]) -> str:
         lines.append("")
         lines.append(f"  {'stage':<10} {'wall':>8} {'build':>8} {'rtf':>7} {'%':>6}")
         lines.append(f"  {'-'*10} {'-'*8} {'-'*8} {'-'*7} {'-'*6}")
+        probes = res.notes.get("probes") or {}
         for s in res.stages:
             lines.append(f"  {s.name:<10} {_fmt(s.wall_s):>8} {_fmt(s.build_s):>8} "
                          f"{_fmt(s.rtf):>7} {_fmt(s.pct):>6}")
+            # The stage's own breakdown, directly under its row: a stage wall
+            # says where time went between stages, never inside one.
+            if s.name in probes:
+                lines.append(f"             └ {_probe_line(probes[s.name])}")
         if res.tts:
             t = res.tts
             unit = t.get("unit", "sentence")
@@ -745,10 +958,29 @@ def format_report(results: list[BenchResult]) -> str:
                          f"max {_fmt(t.get('max_s'), 's')}{per}, "
                          f"tts_rtf {_fmt(t.get('tts_rtf'))}, "
                          f"overflows {t.get('overflows', '?')}")
+        cpu = res.notes.get("cpu_s")
+        if cpu:
+            lines.append("")
+            lines.append(f"  cpu: {cpu['total']}s total "
+                         f"(self {cpu['user']}u/{cpu['sys']}s, "
+                         f"children {cpu['children_user']}u/{cpu['children_sys']}s)")
+        if res.notes.get("real_wall_s") is not None:
+            lines.append(f"  wall: {res.notes['real_wall_s']}s real vs "
+                         f"{res.total_wall_s}s of stages "
+                         f"(other {res.notes.get('other_s')}s, "
+                         f"agg RTF real {_fmt(res.notes.get('agg_rtf_real'))})")
+        lines.extend(_gpu_lines(res))
         if res.translate:
             tr = res.translate
-            lines.append(f"  translate: {tr['count']} sent, mean {_fmt(tr['mean_ms'], 'ms')}, "
-                         f"p90 {_fmt(tr['p90_ms'], 'ms')}, total {_fmt(tr['total_s'], 's')} (serial)")
+            if tr.get("unit") == "chunk":
+                lines.append(f"  translate: {tr.get('chunks')} chunks over "
+                             f"{tr.get('chunk_sentences')} sentences, "
+                             f"mean {_fmt(tr['mean_ms'], 'ms')}/chunk, "
+                             f"total {_fmt(tr['total_s'], 's')}")
+            else:
+                lines.append(f"  translate: {tr['count']} sent, mean {_fmt(tr['mean_ms'], 'ms')}, "
+                             f"p90 {_fmt(tr['p90_ms'], 'ms')}, total {_fmt(tr['total_s'], 's')} "
+                             f"(sum of per-call latency; wall is lower at concurrency>1)")
         if res.sections is not None:
             n = res.notes
             lines.append("")

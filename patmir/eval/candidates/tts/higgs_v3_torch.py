@@ -74,6 +74,8 @@ from typing import Any
 
 import numpy as np
 
+from patmir.pipeline.probe import Probe
+
 REPO_DEFAULT = "multimodalart/higgs-audio-v3-tts-4b-transformers"
 
 # Output sample rate, fixed by the checkpoint's codec.
@@ -302,6 +304,26 @@ class HiggsV3Torch:
     # Thread concurrency stays 1 — batching is the parallelism here, and the two
     # would fight over one CUDA stream. The adapter prefers `synthesize_batch`.
     tts_concurrency = 1
+    # Lazily created per instance (see `probe`). A None class attribute rather
+    # than an `__init__` assignment because the equivalence tests build this
+    # class with `object.__new__` — and the decode loop reads `self.probe`.
+    _probe: Probe | None = None
+
+    @property
+    def probe(self) -> Probe:
+        """Intra-stage timing, armed only under `patmir bench` (the adapter
+        calls `probe.start()` per job).
+
+        The numbers that showed this decode running 4-5x off its
+        memory-bandwidth bound came from instrumentation that was then
+        reverted, leaving `tts/bench_probe.json` files on disk with no code
+        left in the tree to regenerate them. This is that instrumentation, and
+        it is disabled — and free — outside a benchmark.
+        """
+        pr = self._probe
+        if pr is None:
+            pr = self._probe = Probe()
+        return pr
 
     def __init__(
         self,
@@ -502,6 +524,7 @@ class HiggsV3Torch:
         B = len(requests)
 
         # ---- per-row prefill, then left-pad into one batch ---- #
+        probe = self.probe
         per_row: list[Any] = []
         for req in requests:
             delayed = None
@@ -530,13 +553,14 @@ class HiggsV3Torch:
         position_ids = (mask.cumsum(-1) - 1).clamp(min=0)
 
         with torch.no_grad():
-            out = model.model(
-                inputs_embeds=embeds,
-                attention_mask=mask,
-                position_ids=position_ids,
-                use_cache=True,
-                cache_position=torch.arange(seq, device=device),
-            )
+            with probe.section("prefill_s"):
+                out = model.model(
+                    inputs_embeds=embeds,
+                    attention_mask=mask,
+                    position_ids=position_ids,
+                    use_cache=True,
+                    cache_position=torch.arange(seq, device=device),
+                )
             past = out.past_key_values
             hidden = out.last_hidden_state[:, -1, :]          # [B, D]
             next_pos = position_ids[:, -1] + 1                 # [B]
@@ -558,69 +582,152 @@ class HiggsV3Torch:
             overflowed = [False] * B
             codes = torch.zeros(B, N, dtype=torch.long, device=device)
 
-            for step in range(max(r.cap for r in requests)):
-                logits = model.audio_head(hidden).to(torch.float32)   # [B, N, V]
-                for b in range(B):
-                    if done[b]:
-                        # Keep feeding this row's last codes so the batch shape
-                        # holds; its outputs are no longer read. Attention is
-                        # per-sequence, so this cannot affect the other rows.
-                        continue
-                    # Draw from this row's own stream, then let upstream's state
-                    # machine run on the result: a one-hot at temperature 0 sends
-                    # `_sampler_step` down its argmax path, so it returns exactly
-                    # these codes and then applies its delay ramp-up / EOC
-                    # bookkeeping unchanged. See `_sample_codes`.
-                    drawn_N = _sample_codes(
-                        logits[b],
-                        temperature=self.temperature, top_p=self.top_p,
-                        top_k=self.top_k, generator=gens[b],
-                    )
-                    if onehot is None:
-                        onehot = torch.zeros_like(logits[b])
-                    onehot.zero_()
-                    onehot.scatter_(-1, drawn_N.unsqueeze(-1).to(torch.long), 1.0)
-                    codes_N = up._sampler_step(
-                        onehot, states[b],
-                        temperature=0.0, top_p=None, top_k=None,
-                    )
-                    if states[b].generation_done:
-                        done[b] = True
-                        continue
-                    codes[b] = codes_N
-                    rows[b].append(codes_N.cpu())
-                    if len(rows[b]) >= requests[b].cap:
-                        # Ran to its own cap without emitting a stop. Owning the
-                        # loop means this is an exact signal, not an inference
-                        # from the output's length.
-                        done[b] = True
-                        overflowed[b] = True
-                if all(done):
-                    break
+            steps_run = 0
+            with probe.section("decode_s"):
+                for step in range(max(r.cap for r in requests)):
+                    steps_run = step + 1
+                    # `sample_s` / `forward_s` split only under
+                    # `--tts-probe step`: it needs a device sync per step, which
+                    # inflates the very total it explains. `decode_s` above is
+                    # the number to quote.
+                    with probe.step_section("sample_s"):
+                        logits = model.audio_head(hidden).to(torch.float32)   # [B, N, V]
+                        for b in range(B):
+                            if done[b]:
+                                # Keep feeding this row's last codes so the batch
+                                # shape holds; its outputs are no longer read.
+                                # Attention is per-sequence, so this cannot affect
+                                # the other rows.
+                                continue
+                            # Draw from this row's own stream, then let upstream's
+                            # state machine run on the result: a one-hot at
+                            # temperature 0 sends `_sampler_step` down its argmax
+                            # path, so it returns exactly these codes and then
+                            # applies its delay ramp-up / EOC bookkeeping
+                            # unchanged. See `_sample_codes`.
+                            drawn_N = _sample_codes(
+                                logits[b],
+                                temperature=self.temperature, top_p=self.top_p,
+                                top_k=self.top_k, generator=gens[b],
+                            )
+                            if onehot is None:
+                                onehot = torch.zeros_like(logits[b])
+                            onehot.zero_()
+                            onehot.scatter_(-1, drawn_N.unsqueeze(-1).to(torch.long), 1.0)
+                            codes_N = up._sampler_step(
+                                onehot, states[b],
+                                temperature=0.0, top_p=None, top_k=None,
+                            )
+                            if states[b].generation_done:
+                                done[b] = True
+                                continue
+                            codes[b] = codes_N
+                            rows[b].append(codes_N.cpu())
+                            if len(rows[b]) >= requests[b].cap:
+                                # Ran to its own cap without emitting a stop.
+                                # Owning the loop means this is an exact signal,
+                                # not an inference from the output's length.
+                                done[b] = True
+                                overflowed[b] = True
+                    if all(done):
+                        break
 
-                step_embed = model.audio_embedding(codes).unsqueeze(1).to(embeds.dtype)
-                mask = torch.cat([mask, torch.ones(B, 1, dtype=mask.dtype, device=device)], dim=1)
-                out = model.model(
-                    inputs_embeds=step_embed,
-                    attention_mask=mask,
-                    position_ids=next_pos.unsqueeze(1),
-                    past_key_values=past,
-                    use_cache=True,
-                    cache_position=torch.tensor([seq + step], device=device),
-                )
-                past = out.past_key_values
-                hidden = out.last_hidden_state[:, -1, :]
-                next_pos = next_pos + 1
+                    with probe.step_section("forward_s"):
+                        step_embed = model.audio_embedding(codes).unsqueeze(1).to(embeds.dtype)
+                        mask = torch.cat(
+                            [mask, torch.ones(B, 1, dtype=mask.dtype, device=device)], dim=1)
+                        out = model.model(
+                            inputs_embeds=step_embed,
+                            attention_mask=mask,
+                            position_ids=next_pos.unsqueeze(1),
+                            past_key_values=past,
+                            use_cache=True,
+                            cache_position=torch.tensor([seq + step], device=device),
+                        )
+                    past = out.past_key_values
+                    hidden = out.last_hidden_state[:, -1, :]
+                    next_pos = next_pos + 1
 
             results: list[tuple[Any, bool]] = []
-            for b in range(B):
-                if len(rows[b]) < N:
-                    results.append((None, overflowed[b]))
-                    continue
-                delayed_LN = torch.stack(rows[b], dim=0)
-                codes_TN = up.reverse_delay_pattern(delayed_LN)
-                results.append((model._decode_codes(codes_TN), overflowed[b]))
+            with probe.section("codec_s"):
+                for b in range(B):
+                    if len(rows[b]) < N:
+                        results.append((None, overflowed[b]))
+                        continue
+                    delayed_LN = torch.stack(rows[b], dim=0)
+                    codes_TN = up.reverse_delay_pattern(delayed_LN)
+                    results.append((model._decode_codes(codes_TN), overflowed[b]))
+            # `live_row_steps` vs `total_row_steps` answers whether compacting
+            # finished rows out of the batch mid-flight would be worth it: a
+            # retired row still occupies its slot and still pays its KV read
+            # until the whole chunk drains.
+            probe.bump("steps", steps_run)
+            probe.bump("chunks", 1)
+            probe.bump("live_row_steps", sum(len(r) for r in rows))
+            probe.bump("total_row_steps", B * steps_run)
+            probe.detail({
+                "B": B, "seq": seq, "steps": steps_run,
+                "caps": [r.cap for r in requests],
+                "lengths": [len(r) for r in rows],
+                "attempt": attempt,
+            })
             return results
+
+    def _decode_chunk_traced(self, requests: list[_Request],
+                             attempt: int = 0) -> list[tuple[Any, bool]]:
+        """`_decode_chunk` under `torch.profiler`, written as a chrome trace.
+
+        Separate method so the hot path carries no profiler branch, and so a
+        profiler that fails to initialize degrades to an ordinary decode rather
+        than failing the stage.
+        """
+        try:
+            import torch
+            from torch.profiler import ProfilerActivity, profile
+        except Exception:  # noqa: BLE001
+            return self._decode_chunk(requests, attempt)
+        acts = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            acts.append(ProfilerActivity.CUDA)
+        path = self.probe.trace_path
+        try:
+            with profile(activities=acts) as prof:
+                out = self._decode_chunk(requests, attempt)
+            if path is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                prof.export_chrome_trace(str(path))
+                self.probe.set("trace", str(path))
+        except Exception as exc:  # noqa: BLE001
+            print(f"tts: profiler trace failed ({type(exc).__name__}: {exc})")
+            return self._decode_chunk(requests, attempt)
+        return out
+
+    def _probe_finalize(self) -> None:
+        """Derive the per-step rates and stamp the run's identity.
+
+        `ms_per_step_decode` is the headline: the whole loop's wall over the
+        steps it actually ran, with no per-step syncs in it. The forward/sample
+        split beside it exists only at `--tts-probe step` and is inflated by
+        its own instrumentation — attribute with it, quote the other.
+        """
+        pr = self.probe
+        if not pr.enabled:
+            return
+        steps = pr.counters.get("steps", 0)
+        if steps:
+            for span, name in (("decode_s", "ms_per_step_decode"),
+                               ("forward_s", "ms_per_step_forward"),
+                               ("sample_s", "ms_per_step_sample")):
+                if span in pr.spans:
+                    pr.set(name, round(1000 * pr.spans[span] / steps, 2))
+        total_rows = pr.counters.get("total_row_steps", 0)
+        if total_rows:
+            pr.set("live_row_fraction",
+                   round(pr.counters.get("live_row_steps", 0) / total_rows, 3))
+        pr.set("attn_impl", self.attn_implementation)
+        pr.set("max_batch", self.tts_max_batch)
+        pr.set("dtype", self.dtype_name)
+        pr.set("device", self.device)
 
     # ---- public API (driven by SentenceTTS adapter) ---- #
     def synthesize_batch(
@@ -654,14 +761,20 @@ class HiggsV3Torch:
         # Sort by cap before chunking: a chunk costs max(steps), not mean, so
         # grouping similar lengths is what makes batching pay.
         order = sorted(range(len(prepared)), key=lambda i: prepared[i].cap)
-        for chunk in _balanced_chunks(order, self.tts_max_batch):
+        for chunk_i, chunk in enumerate(_balanced_chunks(order, self.tts_max_batch)):
             started = time.perf_counter()
             pending = list(chunk)
             for attempt in range(self.max_retries + 1):
                 if not pending:
                     break
                 self._summary["batches"] += 1
-                outs = self._decode_chunk([prepared[i] for i in pending], attempt)
+                # A profiler trace covers the FIRST chunk only: tracing a whole
+                # job writes hundreds of MB, and every chunk runs the same loop.
+                if chunk_i == 0 and attempt == 0 and self.probe.trace_path is not None:
+                    outs = self._decode_chunk_traced(
+                        [prepared[i] for i in pending], attempt)
+                else:
+                    outs = self._decode_chunk([prepared[i] for i in pending], attempt)
                 retry: list[int] = []
                 for slot, (wav, over) in zip(pending, outs):
                     if wav is not None and not over:
@@ -677,6 +790,7 @@ class HiggsV3Torch:
                 on_chunk(list(chunk), time.perf_counter() - started)
 
         self._summary["sentences"] += len(prepared)
+        self._probe_finalize()
         out: list[bytes] = []
         for wav in audio:
             if wav is None:

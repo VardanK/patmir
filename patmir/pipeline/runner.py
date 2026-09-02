@@ -162,6 +162,11 @@ def run_job(
         # Seed cross-stage hand-offs (e.g. streaming voice_assignments) before
         # any stage runs. See JobContext.extra.
         ctx.extra.update(extra)
+    # Intra-stage probes, armed only under `patmir bench` — which is the only
+    # caller that sets extra["bench"], the same flag the tts/translate JSONL
+    # traces have always keyed off. Off, the probe is a no-op on every hot path.
+    if ctx.extra.get("bench"):
+        ctx.probe.start()
 
     start_idx = STAGE_ORDER.index(resume_from) if resume_from else 0
 
@@ -180,6 +185,11 @@ def run_job(
         # the LONGEST stage (tts, ~77s on CUDA / 55% of wall), which is why the
         # TTS adapter checks again at each decode chunk (~8s).
         ctx.raise_if_cancelled()
+        # One probe per job, partitioned per stage by resetting here and dumping
+        # below — so spans need no stage prefix and the runner's own post-stage
+        # work (speaker tagging, ref picking) lands in the file of the stage it
+        # belongs to.
+        ctx.probe.reset()
         st.state = "running"
         st.started_at = time.time()
         manifest.to_path(manifest_path)
@@ -231,6 +241,7 @@ def run_job(
             ctx.progress(name, 1.0, f"failed: {exc}")
             raise
         finally:
+            ctx.probe.dump(job_dir / name / "bench_probe.json")
             stage_obj = None  # noqa — drop reference
             # ALWAYS reclaim, including on a cache hit. Skipping it on hits was
             # tried 2026-08-23 on the theory that a hit has no build scratch to
@@ -349,23 +360,26 @@ def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobCont
         predictions = stage_obj.detect(sep, diar, ctx)  # type: ignore[arg-type]
         ctx.extra["emotion_predictions"] = predictions
 
-        # Now slice per-(speaker, emotion) reference clips.
-        from patmir.pipeline.stages.diarize.ref_picker import pick_refs
-        refs_dir = ctx.job_dir / "diarize" / "refs"
-        speech_for_refs = sep.speech_vocals or sep.vocals
-        diar.refs = pick_refs(
-            turns=diar.turns,
-            overlaps=diar.overlaps,
-            predictions=predictions,
-            speech_vocals=speech_for_refs,
-            refs_dir=refs_dir,
-            min_ref_seconds=ctx.options.min_ref_seconds,
-            min_rms_db=getattr(ctx.options, "ref_min_rms_db", -33.0),
-        )
-        # Persist the now-filled refs (text empty for now — backfilled post-ASR).
-        _write_refs_json(ctx, diar)
-        # Rewrite turns.json so each turn carries its assigned emotion bin.
-        _write_turns_json(ctx, diar)
+        # Now slice per-(speaker, emotion) reference clips. This is runner work
+        # folded into the emotion stage's wall, so it needs its own span or it
+        # reads as model time.
+        with ctx.probe.section("pick_refs_s"):
+            from patmir.pipeline.stages.diarize.ref_picker import pick_refs
+            refs_dir = ctx.job_dir / "diarize" / "refs"
+            speech_for_refs = sep.speech_vocals or sep.vocals
+            diar.refs = pick_refs(
+                turns=diar.turns,
+                overlaps=diar.overlaps,
+                predictions=predictions,
+                speech_vocals=speech_for_refs,
+                refs_dir=refs_dir,
+                min_ref_seconds=ctx.options.min_ref_seconds,
+                min_rms_db=getattr(ctx.options, "ref_min_rms_db", -33.0),
+            )
+            # Persist the now-filled refs (text empty for now — backfilled post-ASR).
+            _write_refs_json(ctx, diar)
+            # Rewrite turns.json so each turn carries its assigned emotion bin.
+            _write_turns_json(ctx, diar)
         return predictions
     if name == "asr":
         # Transcribe the FULL vocal stem (not the VAD-masked speech stem) —
@@ -391,43 +405,49 @@ def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobCont
         if isinstance(diar, Diarization):
             ctx.extra["diarization"] = diar
         transcript = stage_obj.transcribe(audio_for_asr, ctx)
-        if isinstance(diar, Diarization):
-            from patmir.pipeline.stages.asr._sentence import write_transcript
-            from patmir.pipeline.stages.asr.emotion_tag import apply_emotion_tags
-            from patmir.pipeline.stages.asr.gap_filler import fill_gaps
-            from patmir.pipeline.stages.asr.speaker_tag import (
-                apply_speaker_tags,
-                backfill_ref_text,
-            )
-            transcript = apply_speaker_tags(transcript, diar)
-            # Second-pass ASR over diarization turns the first pass missed
-            # (e.g. dialogue lost inside a long sustained-noise region).
-            # Only run if the active ASR exposes a slice-transcription helper.
-            transcribe_slice = getattr(stage_obj, "transcribe_slice", None)
-            if callable(transcribe_slice) and isinstance(sep, SeparatedAudio):
-                before = len(transcript.sentences)
-                transcript = fill_gaps(
-                    transcript,
-                    diar,
-                    sep,
-                    asr_fn=transcribe_slice,
-                    progress=lambda msg: ctx.progress("asr", 1.0, f"gap-fill {msg}"),
+        # Everything below is runner work inside the asr stage's wall: speaker
+        # attribution, the optional gap-fill second pass, emotion tagging and
+        # the transcript rewrite. On a 16 s warm stage there was no way to tell
+        # this Python from model compute.
+        with ctx.probe.section("tag_s"):
+            if isinstance(diar, Diarization):
+                from patmir.pipeline.stages.asr._sentence import write_transcript
+                from patmir.pipeline.stages.asr.emotion_tag import apply_emotion_tags
+                from patmir.pipeline.stages.asr.gap_filler import fill_gaps
+                from patmir.pipeline.stages.asr.speaker_tag import (
+                    apply_speaker_tags,
+                    backfill_ref_text,
                 )
-                added = len(transcript.sentences) - before
-                if added > 0:
-                    transcript = apply_speaker_tags(transcript, diar)
-            # Tag each sentence with its dominant emotion bin from the
-            # per-turn predictions emitted by the emotion stage. No-op when
-            # the emotion stage didn't run (e.g. resume from a pre-Phase-2.x
-            # job).
-            predictions = ctx.extra.get("emotion_predictions")
-            if predictions:
-                transcript = apply_emotion_tags(transcript, predictions)
-            backfill_ref_text(diar, transcript)
-            _write_refs_json(ctx, diar)
-            # Persist the speaker-tagged + re-indexed transcript (overrides the
-            # candidate's first write that lacked speaker_id and didn't have splits).
-            write_transcript(ctx.job_dir, transcript)
+                transcript = apply_speaker_tags(transcript, diar)
+                # Second-pass ASR over diarization turns the first pass missed
+                # (e.g. dialogue lost inside a long sustained-noise region).
+                # Only run if the active ASR exposes a slice-transcription helper.
+                transcribe_slice = getattr(stage_obj, "transcribe_slice", None)
+                if callable(transcribe_slice) and isinstance(sep, SeparatedAudio):
+                    before = len(transcript.sentences)
+                    transcript = fill_gaps(
+                        transcript,
+                        diar,
+                        sep,
+                        asr_fn=transcribe_slice,
+                        progress=lambda msg: ctx.progress("asr", 1.0, f"gap-fill {msg}"),
+                    )
+                    added = len(transcript.sentences) - before
+                    if added > 0:
+                        transcript = apply_speaker_tags(transcript, diar)
+                # Tag each sentence with its dominant emotion bin from the
+                # per-turn predictions emitted by the emotion stage. No-op when
+                # the emotion stage didn't run (e.g. resume from a pre-Phase-2.x
+                # job).
+                predictions = ctx.extra.get("emotion_predictions")
+                if predictions:
+                    transcript = apply_emotion_tags(transcript, predictions)
+                backfill_ref_text(diar, transcript)
+                _write_refs_json(ctx, diar)
+                # Persist the speaker-tagged + re-indexed transcript (overrides the
+                # candidate's first write that lacked speaker_id and didn't have splits).
+                write_transcript(ctx.job_dir, transcript)
+        ctx.probe.set("n_sentences", len(transcript.sentences))
         return transcript
     if name == "translate":
         return stage_obj.translate(state["asr"], ctx)  # type: ignore[arg-type]

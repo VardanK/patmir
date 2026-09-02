@@ -123,11 +123,13 @@ class FFmpegPadStretch:
         total = len(synth.sentences) or 1
 
         for i, s in enumerate(synth.sentences):
-            audio, file_sr = sf.read(str(s.wav_path), dtype="float32", always_2d=False)
+            with ctx.probe.section("read_s"):
+                audio, file_sr = sf.read(str(s.wav_path), dtype="float32",
+                                         always_2d=False)
             if file_sr != sr:
                 audio = _simple_resample(audio, file_sr, sr)
             window = max(0.0, s.source_end - s.source_start)
-            audio = _stretch_to_window(audio, sr, window, cap)
+            audio = _stretch_to_window(audio, sr, window, cap, probe=ctx.probe)
 
             start_sample = _placement_start(
                 int(s.source_start * sr), voice_cursor, overlap_gap, no_overlap
@@ -141,7 +143,7 @@ class FFmpegPadStretch:
                 if available > 0 and len(audio) > available:
                     ratio = min(len(audio) / available, max_compress)
                     if ratio > 1.02:
-                        audio = _stretch_audio(audio, sr, ratio)
+                        audio = _stretch_audio(audio, sr, ratio, probe=ctx.probe)
             end_sample = start_sample + len(audio)
             if start_sample >= n_samples:
                 ctx.progress("mux", (i + 1) / total, f"sentence {i+1}/{total} (past end)")
@@ -240,7 +242,8 @@ class FFmpegPadStretch:
                 out_audio = out_audio * (target / peak)
 
         out_path = ctx.job_dir / "dub.wav"
-        sf.write(str(out_path), out_audio, sr, subtype="PCM_16")
+        with ctx.probe.section("write_s"):
+            sf.write(str(out_path), out_audio, sr, subtype="PCM_16")
         _write_meta(ctx.job_dir, out_path, sr, n_channels)
         # Sidecar for inspection/debugging: where each line actually landed
         # (post compress + ripple) and how far it drifted from its source time.
@@ -264,6 +267,7 @@ def _stretch_to_window(
     sr: int,
     window: float,
     cap: float,
+    probe: Any = None,
 ) -> np.ndarray:
     if window <= 0:
         return audio
@@ -274,16 +278,28 @@ def _stretch_to_window(
     clamped = max(1 - cap, min(1 + cap, desired_ratio))
     if _NO_STRETCH_BAND[0] <= clamped <= _NO_STRETCH_BAND[1]:
         return audio
-    return _stretch_audio(audio, sr, clamped)
+    return _stretch_audio(audio, sr, clamped, probe=probe)
 
 
-def _stretch_audio(audio: np.ndarray, sr: int, ratio: float) -> np.ndarray:
+def _stretch_audio(audio: np.ndarray, sr: int, ratio: float,
+                   probe: Any = None) -> np.ndarray:
     """Pitch-preserving time-stretch by `ratio` (>1 = faster/shorter). No-op on
-    a near-1 ratio or if rubberband isn't available (returns the input)."""
+    a near-1 ratio or if rubberband isn't available (returns the input).
+
+    Each real stretch writes a temp WAV, spawns the `rubberband` CLI and reads
+    the result back, and a line can be stretched twice (to its window, then to
+    fit before the next). `n_stretch_calls` beside `stretch_s` is what separates
+    process-spawn cost from the stretch itself. Note the bare `except` also
+    means a MISSING `rubberband` binary silently disables stretching, so a
+    probe reporting 0 calls on dense dialogue is a finding, not noise."""
     if _NO_STRETCH_BAND[0] <= ratio <= _NO_STRETCH_BAND[1]:
         return audio
     try:
         import pyrubberband as pyrb  # lazy import
+        if probe is not None:
+            probe.bump("n_stretch_calls")
+            with probe.section("stretch_s"):
+                return pyrb.time_stretch(audio, sr, ratio)
         return pyrb.time_stretch(audio, sr, ratio)
     except Exception:
         return audio

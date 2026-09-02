@@ -97,6 +97,17 @@ cuda = [
   # than `KeyError: 'qwen3_asr'`.
   "transformers>=5.13",
   "nemo_toolkit[asr]>=2.0",  # `sortformer_nemo` (NVIDIA's own Sortformer runtime)
+  # GPU telemetry for `patmir bench` (patmir/telemetry.py). Optional at
+  # runtime — the sampler falls back to spawning `nvidia-smi` and then to
+  # nothing — but without it every benchmark on this box charges one
+  # subprocess per second to its own CPU accounting. Under WSL2 it loads
+  # /usr/lib/wsl/lib/libnvidia-ml.so.1 and works normally.
+  #
+  # It is here because the alternative was worse than a missing dependency:
+  # the 3090 ran power-limited to 280 W for thermal reasons through every
+  # CUDA measurement in performance.md and nothing recorded it, so a
+  # throttled run could not be told from a clean one after the fact.
+  "nvidia-ml-py>=12",
 ]
 # Local FastAPI progress UI (Phase 1).
 ui = [

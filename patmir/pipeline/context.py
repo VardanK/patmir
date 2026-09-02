@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from patmir.pipeline.probe import Probe
+
 
 class JobCancelled(Exception):
     """Raised at a checkpoint when the job's cancel token has been set.
@@ -218,6 +220,12 @@ class JobContext:
     # (vad_intervals, diarization, emotion_predictions — see pipeline.md), and a
     # control signal is not that.
     cancel: threading.Event | None = None
+    # Intra-stage timing, armed by `run_job` only when `extra["bench"]` is set
+    # and reset+dumped per stage by the runner. A separate field for the same
+    # reason `cancel` is: `extra` is the cross-stage DATA hand-off channel, and
+    # an instrument is not data. Disabled by default and free on the hot path —
+    # `section()` returns a shared no-op context manager.
+    probe: Probe = field(default_factory=Probe)
 
     def cancelled(self) -> bool:
         return self.cancel is not None and self.cancel.is_set()

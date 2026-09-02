@@ -151,6 +151,17 @@ def main(argv: list[str] | None = None) -> int:
                          action="store_false", default=True,
                          help="watch-along only: skip the per-sentence tts/translate "
                               "timings.jsonl traces.")
+    p_bench.add_argument("--tts-probe", choices=["chunk", "step"], default="chunk",
+                         help="Granularity of the TTS intra-stage probe. chunk (default) "
+                              "times prefill / decode / codec once per decode chunk. step "
+                              "additionally splits forward vs sample per decode step, "
+                              "which needs a device sync per step and so inflates the "
+                              "very total it explains — use it to attribute, not to "
+                              "quote a wall.")
+    p_bench.add_argument("--tts-trace", action="store_true", default=False,
+                         help="Write a torch.profiler chrome trace for the FIRST TTS "
+                              "decode chunk to <job>/tts/trace_tts.json. One chunk only: "
+                              "a whole-job trace is hundreds of MB.")
     p_bench.add_argument("--report", type=Path, default=None,
                          help="Write machine-readable bench.json to this path.")
     p_bench.add_argument("--label", type=str, default=None)
@@ -370,6 +381,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
             args.clip, cfg, runs_root=runs_root,
             repeat=args.repeat, label=args.label,
             warm_cache=args.warm_cache,
+            probe_level=args.tts_probe,
+            trace_stage="tts" if args.tts_trace else None,
         )
     else:
         results = benchmod.bench_watch_along(

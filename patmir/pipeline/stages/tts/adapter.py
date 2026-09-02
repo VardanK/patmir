@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from patmir.pipeline.context import JobContext
+from patmir.pipeline.probe import probe_from_ctx
 from patmir.pipeline.stage import (
     Diarization,
     SpeakerRef,
@@ -230,6 +231,7 @@ class SentenceTTS:
         reset = getattr(self.inner, "reset_summary", None)
         if callable(reset):
             reset()
+        _maybe_arm_probe(ctx, self.inner)
         sentences: list[SynthesizedSentence] = []
         sample_rate = 0
 
@@ -392,6 +394,7 @@ class SentenceTTS:
         out = SynthesizedAudio(sentences=sentences, sample_rate=sample_rate)
         _write_index(ctx.job_dir, out)
         _maybe_write_cloning_summary(out_dir, self.inner)
+        _maybe_dump_probe(out_dir, self.inner)
         # Per-sentence latency trace — only when running under `patmir bench`
         # (ctx.extra["bench"]); a normal `patmir dub` leaves no timings file.
         if ctx.extra.get("bench") and bench_rows:
@@ -424,6 +427,31 @@ def _write_index(job_dir: Path, synth: SynthesizedAudio) -> None:
         ],
     }
     (job_dir / "synthesized.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _maybe_arm_probe(ctx: Any, inner: Any) -> None:
+    """Arm the candidate's intra-stage probe when running under `patmir bench`.
+
+    Duck-typed on a `probe` attribute, like `summarize()` next door: a candidate
+    without one is simply not instrumented. The probe lives on the candidate,
+    which lives in the warm `stage_cache` across jobs, so it must be re-armed
+    (and reset) per job rather than at construction.
+    """
+    probe = getattr(inner, "probe", None)
+    if probe is None:
+        return
+    try:
+        probe_from_ctx(ctx, probe, stage="tts")
+    except Exception as exc:  # noqa: BLE001
+        print(f"tts: probe arm failed ({type(exc).__name__}: {exc})")
+
+
+def _maybe_dump_probe(tts_dir: Path, inner: Any) -> None:
+    """Write `tts/bench_probe.json` if the candidate carries an armed probe."""
+    probe = getattr(inner, "probe", None)
+    if probe is None:
+        return
+    probe.dump(tts_dir / "bench_probe.json")
 
 
 def _maybe_write_cloning_summary(tts_dir: Path, inner: Any) -> None:

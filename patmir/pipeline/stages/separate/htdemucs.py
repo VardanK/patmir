@@ -73,15 +73,16 @@ class HTDemucs:
         # we don't need any resampling step in the Python path.
         full_audio = ctx.job_dir / "full_audio.wav"
         if not full_audio.exists():
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", str(source_video),
-                "-vn",
-                "-ac", str(self.channels),
-                "-ar", str(self.sample_rate),
-                "-c:a", "pcm_s16le",
-                str(full_audio),
-            ], check=True, capture_output=True)
+            with ctx.probe.section("extract_s"):
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-i", str(source_video),
+                    "-vn",
+                    "-ac", str(self.channels),
+                    "-ar", str(self.sample_rate),
+                    "-c:a", "pcm_s16le",
+                    str(full_audio),
+                ], check=True, capture_output=True)
         ctx.progress("separate", 0.05, "extracted full-quality audio")
 
         # soundfile returns (samples, channels); demucs wants (batch, channels, samples).
@@ -92,7 +93,7 @@ class HTDemucs:
         wav = wav.unsqueeze(0).to(self.device)
         ctx.progress("separate", 0.10, f"running demucs ({self.model_name}) on {self.device}")
 
-        with torch.no_grad():
+        with torch.no_grad(), ctx.probe.section("model_s"):
             sources = apply_model(
                 self.model,
                 wav,
@@ -148,12 +149,15 @@ class HTDemucs:
         vad_intervals: list[tuple[float, float]] | None = None
         if vocals is not None:
             ctx.progress("separate", 0.9, "running Silero VAD on vocals")
-            speech_path, non_speech_path, vad_intervals = _split_vocals_with_vad(
-                vocals_path=vocals_path,
-                accompaniment_shape=accompaniment.shape,
-                sample_rate=self.sample_rate,
-                job_dir=ctx.job_dir,
-            )
+            with ctx.probe.section("vad_s"):
+                speech_path, non_speech_path, vad_intervals = _split_vocals_with_vad(
+                    vocals_path=vocals_path,
+                    accompaniment_shape=accompaniment.shape,
+                    sample_rate=self.sample_rate,
+                    job_dir=ctx.job_dir,
+                    probe=ctx.probe,
+                )
+            ctx.probe.set("n_vad_intervals", len(vad_intervals or []))
 
         meta = {
             "accompaniment": str(accomp_path),
@@ -186,6 +190,7 @@ def _split_vocals_with_vad(
     accompaniment_shape: tuple[int, int],
     sample_rate: int,
     job_dir: Path,
+    probe: Any = None,
 ) -> tuple[Path, Path, list[tuple[float, float]]]:
     """Run Silero VAD on `vocals_path` and write speech-only / non-speech-only stems.
 
@@ -203,7 +208,13 @@ def _split_vocals_with_vad(
     import torch  # type: ignore[import-not-found]
     from silero_vad import get_speech_timestamps, load_silero_vad
 
-    model = load_silero_vad(onnx=False)
+    from patmir.pipeline.probe import Probe
+    probe = probe if probe is not None else Probe()
+
+    # Loaded per call and never cached: it is not part of `stage_cache`, so a
+    # warm run still pays this. Measured separately for exactly that reason.
+    with probe.section("vad_load_s"):
+        model = load_silero_vad(onnx=False)
 
     # 1) Load the vocals at the original SR via soundfile (no torchaudio).
     vocals_np, sr = sf.read(str(vocals_path), dtype="float32", always_2d=True)
@@ -225,16 +236,17 @@ def _split_vocals_with_vad(
     # vocal stem retains some background energy and Silero misses most
     # utterances at 0.3. 0.2 is the floor below which background music
     # starts firing as speech.
-    intervals = get_speech_timestamps(
-        wav16,
-        model,
-        sampling_rate=16000,
-        return_seconds=True,
-        threshold=0.2,
-        min_speech_duration_ms=100,
-        min_silence_duration_ms=200,
-        speech_pad_ms=500,
-    )
+    with probe.section("vad_infer_s"):
+        intervals = get_speech_timestamps(
+            wav16,
+            model,
+            sampling_rate=16000,
+            return_seconds=True,
+            threshold=0.2,
+            min_speech_duration_ms=100,
+            min_silence_duration_ms=200,
+            speech_pad_ms=500,
+        )
 
     # 3) Build a per-sample float32 speech mask at the original (Demucs) sample rate.
     vocals = vocals_np
@@ -259,8 +271,9 @@ def _split_vocals_with_vad(
 
     speech_path = job_dir / "speech_vocals.wav"
     non_speech_path = job_dir / "non_speech_vocals.wav"
-    sf.write(str(speech_path), speech, sr, subtype="PCM_16")
-    sf.write(str(non_speech_path), non_speech, sr, subtype="PCM_16")
+    with probe.section("stem_write_s"):
+        sf.write(str(speech_path), speech, sr, subtype="PCM_16")
+        sf.write(str(non_speech_path), non_speech, sr, subtype="PCM_16")
     interval_list = [(float(iv["start"]), float(iv["end"])) for iv in intervals]
     return speech_path, non_speech_path, interval_list
 

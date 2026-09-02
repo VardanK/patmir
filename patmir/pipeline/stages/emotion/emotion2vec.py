@@ -128,21 +128,25 @@ class Emotion2VecCandidate:
 
         # Read the full vocal stem once, mono-downmix in memory. emotion2vec
         # was trained on 16 kHz mono; resample on the fly.
-        audio_full, src_sr = sf.read(str(separated.vocals), dtype="float32", always_2d=True)
+        with ctx.probe.section("read_s"):
+            audio_full, src_sr = sf.read(str(separated.vocals), dtype="float32",
+                                         always_2d=True)
         mono_full = audio_full.mean(axis=1)
 
-        if src_sr != 16_000:
-            n_target = int(len(mono_full) * 16_000 / src_sr)
-            if n_target > 0:
-                x_old = np.linspace(0, 1, len(mono_full), endpoint=False)
-                x_new = np.linspace(0, 1, n_target, endpoint=False)
-                mono_16k = np.interp(x_new, x_old, mono_full).astype("float32")
+        # A linear np.interp over the whole stem (~13 M samples at 44.1 kHz).
+        with ctx.probe.section("resample_s"):
+            if src_sr != 16_000:
+                n_target = int(len(mono_full) * 16_000 / src_sr)
+                if n_target > 0:
+                    x_old = np.linspace(0, 1, len(mono_full), endpoint=False)
+                    x_new = np.linspace(0, 1, n_target, endpoint=False)
+                    mono_16k = np.interp(x_new, x_old, mono_full).astype("float32")
+                else:
+                    mono_16k = np.zeros(0, dtype="float32")
+                scale = 16_000 / src_sr
             else:
-                mono_16k = np.zeros(0, dtype="float32")
-            scale = 16_000 / src_sr
-        else:
-            mono_16k = mono_full.astype("float32", copy=False)
-            scale = 1.0
+                mono_16k = mono_full.astype("float32", copy=False)
+                scale = 1.0
 
         # Convert turn time windows to 16 kHz indices via the scale factor —
         # turn timestamps are in seconds, independent of the source SR.
@@ -150,6 +154,7 @@ class Emotion2VecCandidate:
 
         predictions: list[EmotionPrediction] = []
         n_turns = max(1, len(diarization.turns))
+        ctx.probe.set("n_turns", len(diarization.turns))
         for i, turn in enumerate(diarization.turns):
             clip = _slice_mono(mono_16k, 16_000, turn.start, turn.end)
             if len(clip) < int(0.2 * 16_000):
@@ -159,7 +164,14 @@ class Emotion2VecCandidate:
                 ))
                 continue
 
-            raw = self.model.generate(clip, granularity="utterance", extract_embedding=False)
+            # One forward per turn, batch 1 — ~108 calls on a 5-minute clip.
+            # `n_scored` beside `infer_s` is what makes the per-call cost
+            # visible, since funasr's `generate` accepts a list and this does
+            # not use it.
+            with ctx.probe.section("infer_s"):
+                raw = self.model.generate(clip, granularity="utterance",
+                                          extract_embedding=False)
+            ctx.probe.bump("n_scored")
             label, conf = _top_label(raw)
             if conf < self.min_confidence:
                 emo: Emotion = "neutral"

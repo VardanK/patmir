@@ -311,6 +311,7 @@ class Qwen3ASRTorch:
 
         vad: list[tuple[float, float]] | None = ctx.extra.get("vad_intervals")
         chunks = build_chunks(audio.duration, vad, self.chunk_seconds)
+        ctx.probe.set("n_chunks", len(chunks))
         if not chunks:
             return Transcript(language=ctx.source_lang or "en", words=[], sentences=[])
 
@@ -327,7 +328,8 @@ class Qwen3ASRTorch:
         language = ctx.source_lang
         if not language:
             longest = max(range(len(clips)), key=lambda i: len(clips[i]))
-            probe = self._transcribe_batch([clips[longest]], None)
+            with ctx.probe.section("probe_s"):
+                probe = self._transcribe_batch([clips[longest]], None)
             language = _to_iso(probe[0].get("language") if probe else None) or "en"
             ctx.progress("asr", 0.08, f"detected {language}")
         ctx.source_lang = language
@@ -335,7 +337,9 @@ class Qwen3ASRTorch:
         results: list[dict[str, Any]] = []
         for offset in range(0, len(clips), self.batch_size):
             batch = clips[offset:offset + self.batch_size]
-            results.extend(self._transcribe_batch(batch, language))
+            with ctx.probe.section("generate_s"):
+                results.extend(self._transcribe_batch(batch, language))
+            ctx.probe.bump("n_generate_batches")
             done = min(len(clips), offset + self.batch_size)
             ctx.progress("asr", 0.08 + 0.62 * done / len(clips), f"decoded {done}/{len(clips)}")
 
@@ -351,9 +355,11 @@ class Qwen3ASRTorch:
             for offset in range(0, len(indices), self.batch_size):
                 group = indices[offset:offset + self.batch_size]
                 try:
-                    aligned = self._align_batch(
-                        [clips[i] for i in group], [texts[i] for i in group], language,
-                    )
+                    with ctx.probe.section("align_s"):
+                        aligned = self._align_batch(
+                            [clips[i] for i in group], [texts[i] for i in group], language,
+                        )
+                    ctx.probe.bump("n_align_batches")
                 except ImportError as exc:
                     # ja/ko word splitting needs an optional tokenizer package.
                     ctx.progress("asr", 0.8, f"aligner unavailable ({exc}) — chunk-level timings")

@@ -39,10 +39,14 @@ SOURCE_S = 300.0
 
 def _write_job(runs_root: Path, job_id: str, *, build_s: float,
                tts_rows: list[dict[str, Any]] | None = None,
-               sentences: int = 24) -> Manifest:
+               sentences: int = 24,
+               probes: dict[str, dict[str, Any]] | None = None) -> Manifest:
     """Materialize the on-disk artifacts bench reads back."""
     job_dir = runs_root / job_id
     (job_dir / "tts").mkdir(parents=True, exist_ok=True)
+    for stage, payload in (probes or {}).items():
+        (job_dir / stage).mkdir(parents=True, exist_ok=True)
+        (job_dir / stage / "bench_probe.json").write_text(json.dumps(payload))
     (job_dir / "audio.meta.json").write_text(json.dumps({"duration": SOURCE_S}))
     (job_dir / "transcript.json").write_text(json.dumps({
         "sentences": [{"idx": i, "text": f"s{i}"} for i in range(sentences)],
@@ -74,9 +78,14 @@ class _FakeConfig:
     entries = {name: {"id": f"cand_{name}"} for name in STAGE_ORDER}
 
 
-def _run_job_stub(captured: list[Any], runs_root: Path):
+def _run_job_stub(captured: list[Any], runs_root: Path,
+                  probes: dict[str, dict[str, Any]] | None = None):
     """A `run_job` that respects the stage_cache contract: a stage already in
-    the dict costs nothing to build, otherwise it builds and is inserted."""
+    the dict costs nothing to build, otherwise it builds and is inserted.
+
+    `probes` writes `<stage>/bench_probe.json` files the way an instrumented
+    candidate would, so the collection path is exercised without models.
+    """
     calls = {"n": 0}
 
     def _run_job(clip, cfg, *, extra=None, stage_cache=None, **kw):
@@ -89,7 +98,7 @@ def _run_job_stub(captured: list[Any], runs_root: Path):
             build = 0.0 if all(n in stage_cache for n in STAGE_ORDER) else BUILD_S
             for n in STAGE_ORDER:
                 stage_cache[n] = object()
-        return _write_job(runs_root, job_id, build_s=build)
+        return _write_job(runs_root, job_id, build_s=build, probes=probes)
 
     return _run_job
 
@@ -189,6 +198,11 @@ class BenchResultCompatTest(unittest.TestCase):
         roots = [
             Path("agent-os/specs/2026-06-20-1656-pipeline-benchmark-perf/results"),
             Path("runs/bench"),
+            # `runs/` is gitignored, and that is how the 2026-08-24 CUDA
+            # reports were lost. The 2026-09-01 pre-350W baselines are
+            # preserved in the spec folder, so they are checked here too.
+            Path("agent-os/specs/2026-09-02-2123-cuda-perf-rebaseline-and-optimization"
+                 "/measurements"),
         ]
         files = [f for root in roots if root.is_dir() for f in sorted(root.glob("*.json"))]
         if not files:
@@ -378,3 +392,193 @@ class CliWiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstrumentationNotesTest(unittest.TestCase):
+    """The measurement gaps closed on 2026-09-02.
+
+    `total_wall_s` is the SUM OF STAGE WALLS, so everything between stages —
+    nine `_free_accelerator_cache()` calls, nine manifest rewrites, artifact
+    recording, publish — was invisible to it, and an optimization that removed
+    inter-stage overhead could not show up in `agg_rtf`. Watch-along had
+    `other_s` for exactly this since 2026-08-25; batch had no equivalent.
+    """
+
+    def _run(self, **kw):
+        captured: list[Any] = []
+        with TemporaryDirectory() as td:
+            runs_root = Path(td)
+            with mock.patch.object(
+                bench, "run_job", _run_job_stub(captured, runs_root, **kw)
+            ):
+                return bench_batch(Path("clip.mkv"), _FakeConfig(),
+                                   runs_root=runs_root, repeat=1)
+
+    def test_real_wall_and_other_s_are_reported(self):
+        notes = self._run()[0].notes
+        self.assertIn("real_wall_s", notes)
+        self.assertIn("other_s", notes)
+        self.assertIn("agg_rtf_real", notes)
+
+    def test_other_s_is_never_negative(self):
+        # The stub's stage walls sum to more than the (instant) real wall, so
+        # this is the case that would go negative without the clamp — and a
+        # negative "unaccounted time" is worse than useless, it is misleading.
+        notes = self._run()[0].notes
+        self.assertGreaterEqual(notes["other_s"], 0.0)
+
+    def test_cpu_time_counts_children(self):
+        # ingest/separate/diarize/output each spawn ffmpeg and the mux spawns
+        # `rubberband` up to twice per sentence; that work is invisible to
+        # RUSAGE_SELF and to every GPU counter.
+        cpu = self._run()[0].notes["cpu_s"]
+        for key in ("user", "sys", "children_user", "children_sys", "total"):
+            self.assertIn(key, cpu)
+            self.assertGreaterEqual(cpu[key], 0.0)
+
+    def test_stage_probes_are_collected_when_present(self):
+        res = self._run(probes={"tts": {"decode_s": 60.7, "steps": 1293},
+                                "asr": {"probe_s": 4.58}})
+        probes = res[0].notes["probes"]
+        self.assertEqual(probes["tts"]["steps"], 1293)
+        self.assertEqual(probes["asr"]["probe_s"], 4.58)
+
+    def test_probes_key_is_absent_when_no_stage_wrote_one(self):
+        self.assertNotIn("probes", self._run()[0].notes)
+
+    def test_gpu_key_is_absent_without_a_gpu(self):
+        # CI and the Mac have no NVML; the key must be missing rather than an
+        # empty shell that reads like a measurement.
+        with mock.patch("patmir.telemetry._reader", return_value=None):
+            self.assertNotIn("gpu", self._run()[0].notes)
+
+    def test_gpu_summary_lands_in_notes(self):
+        fake = {"source": "fake", "throttled": False, "samples": 3,
+                "power_w": {"avg": 300.0, "min": 280.0, "max": 320.0}}
+        with mock.patch("patmir.bench.GpuSampler") as G:
+            G.return_value.stop.return_value = fake
+            G.return_value.peak_rss_gb = 9.5
+            res = self._run()
+        self.assertEqual(res[0].notes["gpu"], fake)
+        self.assertEqual(res[0].notes["peak_rss_gb"], 9.5)
+        self.assertEqual(res[0].notes["rss_scope"], "repeat")
+
+    def test_bench_extra_flags(self):
+        self.assertEqual(bench.bench_extra(), {"bench": True})
+        self.assertEqual(bench.bench_extra(probe_level="step"),
+                         {"bench": True, "tts_probe": "step"})
+        self.assertEqual(bench.bench_extra(trace_stage="tts"),
+                         {"bench": True, "tts_trace": True})
+
+    def test_probe_level_reaches_run_job_extra(self):
+        seen: dict[str, Any] = {}
+        with TemporaryDirectory() as td:
+            runs_root = Path(td)
+
+            def _rj(clip, cfg, *, extra=None, stage_cache=None, **kw):
+                seen.update(extra or {})
+                return _write_job(runs_root, "j0", build_s=0.0)
+
+            with mock.patch.object(bench, "run_job", _rj):
+                bench_batch(Path("clip.mkv"), _FakeConfig(), runs_root=runs_root,
+                            repeat=1, probe_level="step", trace_stage="tts")
+        self.assertEqual(seen["tts_probe"], "step")
+        self.assertTrue(seen["tts_trace"])
+
+
+class ProbeAggregationTest(unittest.TestCase):
+    """Watch-along runs one prelude plus N sections, each its own job dir, so a
+    single probe file describes one section and answers nothing about the
+    stream."""
+
+    def test_numeric_fields_add_and_identities_survive(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            for i, payload in enumerate([
+                {"decode_s": 10.0, "steps": 100, "engine": "higgs"},
+                {"decode_s": 5.0, "steps": 50, "engine": "higgs"},
+            ]):
+                d = root / f"job{i}" / "tts"
+                d.mkdir(parents=True)
+                (d / "bench_probe.json").write_text(json.dumps(payload))
+            out = bench._aggregate_probes([root / "job0", root / "job1"])
+        self.assertEqual(out["tts"]["decode_s"], 15.0)
+        self.assertEqual(out["tts"]["steps"], 150)
+        self.assertEqual(out["tts"]["engine"], "higgs")
+
+    def test_detail_rows_concatenate(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            for i, rows in enumerate([[{"B": 8}], [{"B": 4}, {"B": 2}]]):
+                d = root / f"job{i}" / "tts"
+                d.mkdir(parents=True)
+                (d / "bench_probe.json").write_text(json.dumps({"details": rows}))
+            out = bench._aggregate_probes([root / "job0", root / "job1"])
+        self.assertEqual([r["B"] for r in out["tts"]["details"]], [8, 4, 2])
+
+    def test_missing_dirs_are_ignored(self):
+        self.assertEqual(bench._aggregate_probes([Path("/nope/at/all")]), {})
+
+
+class GpuAndProbeReportingTest(unittest.TestCase):
+    def _res(self, notes):
+        return BenchResult(
+            clip="c.mkv", mode="batch", label=None, repeat_index=0, job_id="j",
+            source_s=SOURCE_S, total_wall_s=100.0, agg_rtf=0.33,
+            stages=[StageTiming(name="tts", state="done", wall_s=60.0,
+                                build_s=0.0, rtf=0.2, pct=60.0)],
+            sentence_count=10, tts=None, translate=None, models={},
+            notes=notes, warm_cache=True, warm=True, build_total_s=0.0,
+        )
+
+    def test_clean_gpu_run_says_so(self):
+        out = format_report([self._res({
+            "gpu": {"samples": 120, "throttle_reasons": {}, "idle_pct": 4.0,
+                    "power_limit_w": 350.0, "throttled": False,
+                    "at_power_ceiling_samples": 0,
+                    "power_w": {"avg": 300.0, "min": 30.0, "max": 340.0}}})])
+        self.assertIn("never power- or thermally-limited in 120 samples", out)
+        self.assertIn("of 350.0W", out)
+
+    def test_a_cap_below_stock_is_shouted(self):
+        out = format_report([self._res({
+            "gpu": {"samples": 120, "throttled": True, "capped_below_stock": True,
+                    "power_limit_w": 280.0, "power_limit_default_w": 350.0,
+                    "throttle_reasons": {"sw_power_cap": 90},
+                    "at_power_ceiling_samples": 90}})])
+        self.assertIn("CAPPED BELOW STOCK", out)
+        self.assertIn("Not comparable", out)
+
+    def test_stock_ceiling_is_reported_as_expected_not_as_a_fault(self):
+        out = format_report([self._res({
+            "gpu": {"samples": 146, "throttled": False,
+                    "capped_below_stock": False, "power_limit_w": 350.0,
+                    "throttle_reasons": {"sw_power_cap": 15},
+                    "at_power_ceiling_samples": 15}})])
+        self.assertIn("at its 350.0W stock ceiling in 15/146 samples", out)
+        self.assertNotIn("CAPPED", out)
+
+    def test_thermal_slowdown_is_shouted_at_any_limit(self):
+        out = format_report([self._res({
+            "gpu": {"samples": 100, "throttled": True, "thermal_slowdown": True,
+                    "power_limit_w": 350.0, "capped_below_stock": False,
+                    "throttle_reasons": {"sw_thermal_slowdown": 7},
+                    "at_power_ceiling_samples": 0}})])
+        self.assertIn("THERMAL SLOWDOWN", out)
+
+    def test_probe_prints_under_its_stage_row(self):
+        out = format_report([self._res({
+            "probes": {"tts": {"decode_s": 60.7, "steps": 1293}}})]).splitlines()
+        i = next(i for i, l in enumerate(out) if l.strip().startswith("tts "))
+        self.assertIn("decode_s 60.70", out[i + 1])
+        self.assertIn("steps 1293", out[i + 1])
+
+    def test_batched_translate_rows_are_labelled_chunks(self):
+        res = self._res({})
+        res.translate = {"unit": "chunk", "count": 4, "chunks": 4,
+                         "chunk_sentences": 77, "total_s": 12.0,
+                         "mean_ms": 3000.0, "median_ms": 3000.0,
+                         "p90_ms": 3200.0, "max_ms": 3300.0}
+        out = format_report([res])
+        self.assertIn("4 chunks over 77 sentences", out)
+        self.assertNotIn("77 sent,", out)
