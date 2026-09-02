@@ -447,7 +447,7 @@ def _run_stage(name: str, stage_obj: Any, state: dict[str, object], ctx: JobCont
                 # Persist the speaker-tagged + re-indexed transcript (overrides the
                 # candidate's first write that lacked speaker_id and didn't have splits).
                 write_transcript(ctx.job_dir, transcript)
-        ctx.probe.set("n_sentences", len(transcript.sentences))
+        ctx.probe.bump("n_sentences", len(transcript.sentences))
         return transcript
     if name == "translate":
         return stage_obj.translate(state["asr"], ctx)  # type: ignore[arg-type]

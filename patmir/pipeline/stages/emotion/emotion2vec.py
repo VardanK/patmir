@@ -154,7 +154,7 @@ class Emotion2VecCandidate:
 
         predictions: list[EmotionPrediction] = []
         n_turns = max(1, len(diarization.turns))
-        ctx.probe.set("n_turns", len(diarization.turns))
+        ctx.probe.bump("n_turns", len(diarization.turns))
         for i, turn in enumerate(diarization.turns):
             clip = _slice_mono(mono_16k, 16_000, turn.start, turn.end)
             if len(clip) < int(0.2 * 16_000):

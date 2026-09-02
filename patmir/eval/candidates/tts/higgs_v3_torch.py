@@ -180,41 +180,140 @@ def _request_seed(prompt_text: str, ref_text: str | None) -> int:
     return int.from_bytes(h.digest(), "big") & ((1 << 62) - 1)
 
 
-def _sample_codes(logits_NV: Any, *, temperature: float, top_p: float | None,
-                  top_k: int | None, generator: Any) -> Any:
-    """The checkpoint's `_sample`, plus a `generator` it does not accept.
+def _filter_probs(logits: Any, *, temperature: float, top_p: float | None,
+                  top_k: int | None) -> Any:
+    """Temperature / top-k / top-p filtering, then softmax -> probabilities.
 
-    A faithful copy — top-k mask, top-p nucleus mask, multinomial — kept in step
-    with the upstream function, whose only difference is that its `multinomial`
-    draws from the GLOBAL RNG. That is what made a sentence's audio depend on its
-    batch-mates, so the draw has to come from a per-row generator instead.
+    Rank-agnostic (`...` indexing), so ONE implementation serves a single row's
+    `[N, V]` and a whole chunk's `[B, N, V]`. Every operation is independent
+    along the last dim, which is why filtering the chunk in one call gives each
+    row bitwise the same probabilities as filtering it alone — verified on fp32
+    and on the tie-heavy logits a bf16 audio head actually produces, and pinned
+    by `BatchedFilterEquivalenceTest`.
 
-    Only the draw is reimplemented. The delay ramp-up and end-of-codebook state
-    machine stay upstream's: the caller hands the sampled codes back to
-    `_sampler_step` as a one-hot with `temperature=0`, which takes its argmax
-    path and returns them unchanged, then runs its own bookkeeping. Copying the
-    12 lines of a sampler is cheap; forking a state machine is not.
+    Kept in step with the checkpoint's own `_sample`. The ONLY divergence is
+    that upstream's `multinomial` draws from the global RNG, which is what made
+    a sentence's audio depend on its batch-mates; the draw therefore stays with
+    the caller, one `multinomial` per row from that row's own generator.
     """
     import torch
 
-    if temperature <= 1e-5:
-        return logits_NV.argmax(dim=-1)
-    logits = logits_NV / temperature
+    out = logits / temperature
     if top_k is not None and top_k > 0:
-        k = min(top_k, logits.size(-1))
-        kth = logits.topk(k, dim=-1).values[:, -1:]
-        logits = torch.where(logits < kth, float("-inf"), logits)
+        k = min(top_k, out.size(-1))
+        kth = out.topk(k, dim=-1).values[..., -1:]
+        out = torch.where(out < kth, float("-inf"), out)
     if top_p is not None and top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        sorted_logits, sorted_idx = torch.sort(out, descending=True, dim=-1)
         cum = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
         remove = cum > top_p
         remove[..., 1:] = remove[..., :-1].clone()
         remove[..., 0] = False
         scatter = torch.zeros_like(remove)
         scatter.scatter_(-1, sorted_idx, remove)
-        logits = torch.where(scatter, float("-inf"), logits)
-    return logits.softmax(dim=-1).multinomial(
-        num_samples=1, generator=generator).squeeze(-1)
+        out = torch.where(scatter, float("-inf"), out)
+    return out.softmax(dim=-1)
+
+
+def _sample_codes(logits_NV: Any, *, temperature: float, top_p: float | None,
+                  top_k: int | None, generator: Any) -> Any:
+    """One row's draw. Delegates filtering to `_filter_probs` so the single-row
+    and batched paths cannot drift apart."""
+    if temperature <= 1e-5:
+        return logits_NV.argmax(dim=-1)
+    probs = _filter_probs(logits_NV, temperature=temperature, top_p=top_p,
+                          top_k=top_k)
+    return probs.multinomial(num_samples=1, generator=generator).squeeze(-1)
+
+
+class _DelayState:
+    """Upstream's per-row delay/EOC sampler state machine, over a `[B]` state.
+
+    The decode loop used to call the checkpoint's own `_sampler_step` once per
+    row per step. That function mutates one `_SamplerState` and reads
+    `codes_N[0].item()` — a device->host sync per row per step, ~8 on every one
+    of ~1300 steps.
+
+    Forking a state machine is more expensive than copying a sampler, which is
+    why the module docstring used to say the machine stays upstream's. So this
+    is ONE implementation, exercised by the decode loop and driven directly by
+    `SamplerStateVectorizationTest` against upstream's `_sampler_step` as an
+    oracle — random code streams, EOC injected at random steps including inside
+    the delay ramp where upstream ignores it, and random caps. A checkpoint
+    that changes the machine fails that test.
+
+    Upstream's control flow, reproduced exactly:
+
+      delay_count < N   mask codebooks past the ramp position; NO end-of-codebook
+                        check on this branch
+      countdown armed   decrement; retire at <= 0, BEFORE emitting the frame
+      else EOC drawn    arm the countdown at N-2 (retire at once when N <= 2);
+                        this frame IS still emitted
+
+    `delay_count == step` holds for every row because all rows start together
+    and the delay branch can never retire one, so no row is retired while
+    `step < N`.
+    """
+
+    def __init__(self, *, batch: int, num_codebooks: int, caps: Any,
+                 boc_id: int, eoc_id: int, device: Any) -> None:
+        import torch
+
+        self.N = int(num_codebooks)
+        self.BOC = int(boc_id)
+        self.EOC = int(eoc_id)
+        self.caps = caps
+        self.length = torch.zeros(batch, dtype=torch.long, device=device)
+        self.done = torch.zeros(batch, dtype=torch.bool, device=device)
+        self.overflowed = torch.zeros(batch, dtype=torch.bool, device=device)
+        # -1 stands for upstream's `eoc_countdown is None`.
+        self.countdown = torch.full((batch,), -1, dtype=torch.long, device=device)
+        self._eoc_fill = torch.full((batch,), self.N - 2, dtype=torch.long,
+                                    device=device)
+
+    def step(self, codes: Any, step: int) -> Any:
+        """Advance one decode step. Mutates `codes` in place on the delay ramp
+        and returns the `[B]` bool mask of rows that emitted this frame."""
+        import torch
+
+        N = self.N
+        alive = ~self.done
+        if step < N:
+            if step + 1 < N:
+                codes[:, step + 1:] = self.BOC
+            newly_done = torch.zeros_like(self.done)
+        else:
+            counting = alive & (self.countdown >= 0)
+            self.countdown = torch.where(counting, self.countdown - 1,
+                                         self.countdown)
+            newly_done = counting & (self.countdown <= 0)
+            eoc = alive & ~counting & (codes[:, 0] == self.EOC)
+            if N <= 2:
+                newly_done = newly_done | eoc
+            else:
+                self.countdown = torch.where(eoc, self._eoc_fill, self.countdown)
+
+        emitting = alive & ~newly_done
+        self.length = torch.where(emitting, step + 1, self.length)
+        # Ran to its own cap without emitting a stop. Owning the loop makes this
+        # an exact signal, not an inference from the output's length.
+        capped = emitting & (self.caps <= step + 1)
+        self.overflowed |= capped
+        self.done = self.done | newly_done | capped
+        return emitting
+
+    def all_done(self) -> bool:
+        """Costs one device->host read; the loop asks every `_SYNC_EVERY` steps."""
+        return bool(self.done.all())
+
+
+# How often the decode loop asks whether every row has finished. The question
+# costs a device->host read, and asking it per step is what the per-row `.cpu()`
+# used to hide the cost of. At 4, a chunk runs at most 3 forwards past the point
+# every row is done — nothing about the emitted frames changes, since a retired
+# row stops emitting. Each row's own cap and the loop's `range(max_cap)` bound
+# are still exact.
+_SYNC_EVERY = 4
 
 
 def _balanced_chunks(items: list[int], size: int) -> list[list[int]]:
@@ -539,14 +638,20 @@ class HiggsV3Torch:
 
         seq = max(e.shape[1] for e in per_row)
         hidden_dim = per_row[0].shape[2]
+        max_cap = max(r.cap for r in requests)
         embeds = torch.zeros(B, seq, hidden_dim, dtype=per_row[0].dtype, device=device)
-        mask = torch.zeros(B, seq, dtype=torch.long, device=device)
+        # Allocated once at its final width and filled one column at a time. The
+        # loop used to `torch.cat` a column onto the mask every step, which
+        # reallocated and copied a [B, seq+step] tensor ~1300 times per chunk;
+        # a stable address is also a precondition for capturing the step.
+        mask_full = torch.zeros(B, seq + max_cap, dtype=torch.long, device=device)
         for b, e in enumerate(per_row):
-            s = e.shape[1]
+            s_b = e.shape[1]
             # LEFT padding: the last position is then a real token for every
             # row, so one `last_hidden_state[:, -1]` is correct for the batch.
-            embeds[b, seq - s:] = e[0]
-            mask[b, seq - s:] = 1
+            embeds[b, seq - s_b:] = e[0]
+            mask_full[b, seq - s_b:seq] = 1
+        mask = mask_full[:, :seq]
 
         # Derived from the mask, not from cache_position: with left padding the
         # two disagree, and RoPE has to see each row's own token positions.
@@ -572,103 +677,108 @@ class HiggsV3Torch:
                 g = torch.Generator(device=device)
                 g.manual_seed((self.base_seed + attempt + req.seed) & ((1 << 62) - 1))
                 gens.append(g)
-            # Reused across rows and steps: `_sampler_step` takes an argmax of it
-            # and returns a fresh tensor, so nothing retains a reference.
-            onehot = None
 
-            states = [up._SamplerState(num_codebooks=N) for _ in range(B)]
-            rows: list[list[Any]] = [[] for _ in range(B)]
-            done = [False] * B
-            overflowed = [False] * B
-            codes = torch.zeros(B, N, dtype=torch.long, device=device)
+            caps = torch.tensor([r.cap for r in requests], dtype=torch.long,
+                                device=device)
+            state = _DelayState(batch=B, num_codebooks=N, caps=caps,
+                                boc_id=up.BOC_ID, eoc_id=up.EOC_ID, device=device)
+            # `emitted[b, s]` is row b's s-th emitted frame. A row emits on every
+            # step from 0 until it retires, so its s-th frame IS step s and no
+            # index bookkeeping is needed. This replaces a `list[list[Tensor]]`
+            # appended to with `codes_N.cpu()` — a device->host sync per row per
+            # step, which is most of the gap between this loop's ~46 ms/step and
+            # the few ms of kernel time it actually issues.
+            emitted = torch.zeros(B, max_cap, N, dtype=torch.long, device=device)
+            fed = torch.zeros(B, N, dtype=torch.long, device=device)
+            cache_pos = torch.arange(seq, seq + max_cap, device=device)
 
             steps_run = 0
             with probe.section("decode_s"):
-                for step in range(max(r.cap for r in requests)):
+                for step in range(max_cap):
                     steps_run = step + 1
                     # `sample_s` / `forward_s` split only under
                     # `--tts-probe step`: it needs a device sync per step, which
-                    # inflates the very total it explains. `decode_s` above is
-                    # the number to quote.
+                    # inflates the very total it explains. `decode_s` is the
+                    # number to quote.
                     with probe.step_section("sample_s"):
                         logits = model.audio_head(hidden).to(torch.float32)   # [B, N, V]
-                        for b in range(B):
-                            if done[b]:
-                                # Keep feeding this row's last codes so the batch
-                                # shape holds; its outputs are no longer read.
-                                # Attention is per-sequence, so this cannot affect
-                                # the other rows.
-                                continue
-                            # Draw from this row's own stream, then let upstream's
-                            # state machine run on the result: a one-hot at
-                            # temperature 0 sends `_sampler_step` down its argmax
-                            # path, so it returns exactly these codes and then
-                            # applies its delay ramp-up / EOC bookkeeping
-                            # unchanged. See `_sample_codes`.
-                            drawn_N = _sample_codes(
-                                logits[b],
-                                temperature=self.temperature, top_p=self.top_p,
-                                top_k=self.top_k, generator=gens[b],
-                            )
-                            if onehot is None:
-                                onehot = torch.zeros_like(logits[b])
-                            onehot.zero_()
-                            onehot.scatter_(-1, drawn_N.unsqueeze(-1).to(torch.long), 1.0)
-                            codes_N = up._sampler_step(
-                                onehot, states[b],
-                                temperature=0.0, top_p=None, top_k=None,
-                            )
-                            if states[b].generation_done:
-                                done[b] = True
-                                continue
-                            codes[b] = codes_N
-                            rows[b].append(codes_N.cpu())
-                            if len(rows[b]) >= requests[b].cap:
-                                # Ran to its own cap without emitting a stop.
-                                # Owning the loop means this is an exact signal,
-                                # not an inference from the output's length.
-                                done[b] = True
-                                overflowed[b] = True
-                    if all(done):
+                        if self.temperature <= 1e-5:
+                            # Upstream's argmax path consumes no randomness, so
+                            # neither does this one — which is what lets the
+                            # equivalence test compare batched against
+                            # standalone rows at temperature 0.
+                            codes = logits.argmax(dim=-1).to(torch.long)
+                        else:
+                            probs = _filter_probs(
+                                logits, temperature=self.temperature,
+                                top_p=self.top_p, top_k=self.top_k)
+                            # Filtering is batched; the DRAW stays per row, from
+                            # that row's own generator, in slot order. Retired
+                            # rows are drawn for as well: their generators are
+                            # never read again, and drawing unconditionally
+                            # keeps this one `stack` rather than a branch per row.
+                            codes = torch.stack([
+                                probs[b].multinomial(num_samples=1, generator=gens[b])
+                                .squeeze(-1)
+                                for b in range(B)
+                            ]).to(torch.long)                                 # [B, N]
+
+                        emitting = state.step(codes, step)
+                        emitted[:, step] = codes
+                        # A retired row keeps being fed its last emitted frame so
+                        # the batch shape holds. Attention is per-sequence, so
+                        # this cannot affect the other rows.
+                        fed = torch.where(emitting.unsqueeze(1), codes, fed)
+
+                    if step + 1 >= max_cap:
+                        break
+                    if (step + 1) % _SYNC_EVERY == 0 and state.all_done():
                         break
 
                     with probe.step_section("forward_s"):
-                        step_embed = model.audio_embedding(codes).unsqueeze(1).to(embeds.dtype)
-                        mask = torch.cat(
-                            [mask, torch.ones(B, 1, dtype=mask.dtype, device=device)], dim=1)
+                        step_embed = model.audio_embedding(fed).unsqueeze(1).to(embeds.dtype)
+                        mask_full[:, seq + step] = 1
                         out = model.model(
                             inputs_embeds=step_embed,
-                            attention_mask=mask,
+                            attention_mask=mask_full[:, :seq + step + 1],
                             position_ids=next_pos.unsqueeze(1),
                             past_key_values=past,
                             use_cache=True,
-                            cache_position=torch.tensor([seq + step], device=device),
+                            cache_position=cache_pos[step:step + 1],
                         )
                     past = out.past_key_values
                     hidden = out.last_hidden_state[:, -1, :]
                     next_pos = next_pos + 1
 
+            # The one device->host read of the whole chunk.
+            lengths = state.length.tolist()
+            overflow_flags = state.overflowed.tolist()
+            emitted_host = emitted.cpu()
+
             results: list[tuple[Any, bool]] = []
             with probe.section("codec_s"):
                 for b in range(B):
-                    if len(rows[b]) < N:
-                        results.append((None, overflowed[b]))
+                    if lengths[b] < N:
+                        results.append((None, bool(overflow_flags[b])))
                         continue
-                    delayed_LN = torch.stack(rows[b], dim=0)
+                    delayed_LN = emitted_host[b, :lengths[b]]
                     codes_TN = up.reverse_delay_pattern(delayed_LN)
-                    results.append((model._decode_codes(codes_TN), overflowed[b]))
+                    # `_decode_codes` moves its input to the device itself, and
+                    # the pre-2026-09-02 path handed it a CPU tensor. Unchanged.
+                    results.append((model._decode_codes(codes_TN),
+                                    bool(overflow_flags[b])))
             # `live_row_steps` vs `total_row_steps` answers whether compacting
-            # finished rows out of the batch mid-flight would be worth it: a
-            # retired row still occupies its slot and still pays its KV read
-            # until the whole chunk drains.
+            # retired rows out of the batch mid-flight would be worth it: such a
+            # row still occupies its slot and still pays its KV read until the
+            # whole chunk drains.
             probe.bump("steps", steps_run)
             probe.bump("chunks", 1)
-            probe.bump("live_row_steps", sum(len(r) for r in rows))
+            probe.bump("live_row_steps", sum(lengths))
             probe.bump("total_row_steps", B * steps_run)
             probe.detail({
                 "B": B, "seq": seq, "steps": steps_run,
                 "caps": [r.cap for r in requests],
-                "lengths": [len(r) for r in rows],
+                "lengths": lengths,
                 "attempt": attempt,
             })
             return results

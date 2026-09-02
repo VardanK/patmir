@@ -311,7 +311,7 @@ class Qwen3ASRTorch:
 
         vad: list[tuple[float, float]] | None = ctx.extra.get("vad_intervals")
         chunks = build_chunks(audio.duration, vad, self.chunk_seconds)
-        ctx.probe.set("n_chunks", len(chunks))
+        ctx.probe.bump("n_chunks", len(chunks))
         if not chunks:
             return Transcript(language=ctx.source_lang or "en", words=[], sentences=[])
 

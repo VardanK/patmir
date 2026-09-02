@@ -275,11 +275,39 @@ def _aggregate_probes(job_dirs: list[Path]) -> dict[str, Any]:
             for k, v in data.items():
                 if k == "details":
                     acc.setdefault("details", []).extend(v or [])
+                elif k == "values":
+                    # Identities and derived ratios: last wins. They are equal
+                    # across sections (dtype, max_batch) or recomputed below.
+                    acc.setdefault("values", {}).update(v or {})
                 elif isinstance(v, bool) or not isinstance(v, (int, float)):
                     acc[k] = v
                 else:
                     acc[k] = round(acc.get(k, 0) + v, 4)
+    for stage, acc in out.items():
+        _recompute_derived(acc)
     return out
+
+
+def _recompute_derived(acc: dict[str, Any]) -> None:
+    """Re-derive a stage's ratios from the SUMMED spans and counters.
+
+    A per-section `ms_per_step_decode` cannot be averaged by summing it, and
+    carrying one section's value forward would silently label the stream with a
+    sample. Recomputing from the totals gives the stream-level number, which is
+    the only one that means anything here.
+    """
+    steps = acc.get("steps")
+    if steps:
+        for span, name in (("decode_s", "ms_per_step_decode"),
+                           ("forward_s", "ms_per_step_forward"),
+                           ("sample_s", "ms_per_step_sample")):
+            if span in acc:
+                acc.setdefault("values", {})[name] = round(
+                    1000 * acc[span] / steps, 2)
+    total_rows = acc.get("total_row_steps")
+    if total_rows:
+        acc.setdefault("values", {})["live_row_fraction"] = round(
+            acc.get("live_row_steps", 0) / total_rows, 3)
 
 
 def bench_extra(*, probe_level: str | None = None,
@@ -887,14 +915,14 @@ def _probe_line(probe: dict[str, Any]) -> str:
     candidate recorded them, so adding a span needs no change here. Only
     `details` (per-chunk rows) is held back — it belongs in the JSON.
     """
+    flat: dict[str, Any] = {k: v for k, v in probe.items()
+                            if k not in ("details", "values")}
+    flat.update(probe.get("values") or {})
     parts: list[str] = []
-    for k, v in probe.items():
-        if k == "details":
-            parts.append(f"{len(v)} rows")
-        elif isinstance(v, float):
-            parts.append(f"{k} {v:.2f}")
-        else:
-            parts.append(f"{k} {v}")
+    for k, v in flat.items():
+        parts.append(f"{k} {v:.2f}" if isinstance(v, float) else f"{k} {v}")
+    if probe.get("details"):
+        parts.append(f"{len(probe['details'])} rows")
     return "  ".join(parts) if parts else "(empty)"
 
 

@@ -491,12 +491,12 @@ class ProbeAggregationTest(unittest.TestCase):
     single probe file describes one section and answers nothing about the
     stream."""
 
-    def test_numeric_fields_add_and_identities_survive(self):
+    def test_spans_and_counters_add(self):
         with TemporaryDirectory() as td:
             root = Path(td)
             for i, payload in enumerate([
-                {"decode_s": 10.0, "steps": 100, "engine": "higgs"},
-                {"decode_s": 5.0, "steps": 50, "engine": "higgs"},
+                {"decode_s": 10.0, "steps": 100, "values": {"max_batch": 8}},
+                {"decode_s": 5.0, "steps": 50, "values": {"max_batch": 8}},
             ]):
                 d = root / f"job{i}" / "tts"
                 d.mkdir(parents=True)
@@ -504,7 +504,32 @@ class ProbeAggregationTest(unittest.TestCase):
             out = bench._aggregate_probes([root / "job0", root / "job1"])
         self.assertEqual(out["tts"]["decode_s"], 15.0)
         self.assertEqual(out["tts"]["steps"], 150)
-        self.assertEqual(out["tts"]["engine"], "higgs")
+
+    def test_identities_are_not_summed(self):
+        # The bug this exists for: the first watch-along report aggregated 11
+        # job dirs and published `max_batch 88`, `ms_per_step_decode 476.83`
+        # and `live_row_fraction 7.03`.
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            for i in range(11):
+                d = root / f"job{i}" / "tts"
+                d.mkdir(parents=True)
+                (d / "bench_probe.json").write_text(json.dumps({
+                    "decode_s": 8.0, "steps": 180,
+                    "live_row_steps": 600, "total_row_steps": 1000,
+                    "values": {"max_batch": 8, "dtype": "bfloat16",
+                               "ms_per_step_decode": 44.4,
+                               "live_row_fraction": 0.6},
+                }))
+            out = bench._aggregate_probes([root / f"job{i}" for i in range(11)])
+        v = out["tts"]["values"]
+        self.assertEqual(v["max_batch"], 8)
+        self.assertEqual(v["dtype"], "bfloat16")
+        # Derived ratios are RECOMPUTED from the summed totals, not carried
+        # forward from one section and not added up.
+        self.assertAlmostEqual(v["ms_per_step_decode"],
+                               1000 * (8.0 * 11) / (180 * 11), places=2)
+        self.assertAlmostEqual(v["live_row_fraction"], 0.6, places=3)
 
     def test_detail_rows_concatenate(self):
         with TemporaryDirectory() as td:

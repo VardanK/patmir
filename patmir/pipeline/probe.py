@@ -118,10 +118,15 @@ class Probe:
             self.spans[name] = self.spans.get(name, 0.0) + (perf_counter() - t0)
 
     def bump(self, name: str, n: int = 1) -> None:
+        """An ADDITIVE count. Use this for anything that should sum when a
+        stream's sections are aggregated: batches run, turns scored, steps."""
         if self.enabled:
             self.counters[name] = self.counters.get(name, 0) + n
 
     def set(self, name: str, value: Any) -> None:
+        """A NON-additive value: an identity (`dtype`, `max_batch`) or a derived
+        ratio (`ms_per_step_decode`). Summing these across sections is what
+        produced a reported `max_batch` of 88, so they are kept apart."""
         if self.enabled:
             self.values[name] = value
 
@@ -132,9 +137,23 @@ class Probe:
 
     # -- output -- #
     def summary(self) -> dict[str, Any]:
+        """Spans and counters flat; everything else under `values`.
+
+        The split is not cosmetic. Watch-along aggregates one probe file per
+        section, and spans and counters ADD across sections while identities
+        (`max_batch`, `dtype`) and derived ratios (`ms_per_step_decode`) must
+        not: summing them produced `max_batch 88` and a 476 ms step in the
+        first watch-along report. Keeping the two kinds apart in the file makes
+        that unrepresentable rather than a rule the reader has to remember.
+
+        Spans and counters stay at the top level so the six keys the 2026-09-01
+        TTS probe wrote (`prefill_s, forward_s, sample_s, codec_s, steps,
+        chunks`) are still there, unchanged, for comparison.
+        """
         out: dict[str, Any] = {k: round(v, 4) for k, v in self.spans.items()}
         out.update(self.counters)
-        out.update(self.values)
+        if self.values:
+            out["values"] = dict(self.values)
         if self.details:
             out["details"] = self.details
         return out

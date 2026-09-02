@@ -75,6 +75,28 @@ def _snapshot() -> Path | None:
     return None
 
 
+def _upstream_module():
+    """The checkpoint's own `modeling_higgs_multimodal_qwen3` module.
+
+    Resolved through transformers' dynamic-module machinery — the same path the
+    candidate takes (`sys.modules[type(self.model).__module__]`) — so the state
+    machine used below as an oracle is the one the model would actually run,
+    not a second transcription of it.
+    """
+    import sys
+
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    snap = _snapshot()
+    if snap is None:
+        raise RuntimeError("Higgs checkpoint snapshot not in the HF cache")
+    cls = get_class_from_dynamic_module(
+        "modeling_higgs_multimodal_qwen3.HiggsMultimodalQwen3ForConditionalGeneration",
+        str(snap),
+    )
+    return sys.modules[cls.__module__]
+
+
 def _tiny_model(snapshot: str):
     """A 2-layer randomly-initialized HiggsMultimodalQwen3 on CPU in float32.
 
@@ -1010,3 +1032,236 @@ class ChunkLoopCancellationTest(unittest.TestCase):
                                     on_chunk=lambda idx, w: None)
         self.assertEqual(len(out), 8)
         self.assertEqual(len(calls), 4)
+
+
+class BatchedFilterEquivalenceTest(unittest.TestCase):
+    """`_filter_probs` over a chunk must equal it applied to each row alone.
+
+    This is the load-bearing claim behind vectorizing the sampler. The DRAW
+    stays per row from that row's own generator, so if the filtering is
+    identical then the whole sampling path is, and no line's audio can move.
+    Every operation involved is independent along the last dim; these tests pin
+    that it stays true, including on the tie-heavy logits a bf16 audio head
+    actually produces, where a sort's tie-break order is the thing that could
+    in principle depend on batch shape.
+    """
+
+    def _check(self, logits, *, temperature, top_p, top_k):
+        import torch
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import _filter_probs
+        batched = _filter_probs(logits, temperature=temperature, top_p=top_p,
+                                top_k=top_k)
+        for b in range(logits.shape[0]):
+            alone = _filter_probs(logits[b], temperature=temperature,
+                                  top_p=top_p, top_k=top_k)
+            self.assertTrue(torch.equal(batched[b], alone),
+                            f"row {b} diverged batched vs alone")
+
+    def test_top_p_only_matches_per_row(self):
+        import torch
+        for seed in range(20):
+            torch.manual_seed(seed)
+            self._check(torch.randn(8, 8, 1026), temperature=0.8, top_p=0.95,
+                        top_k=None)
+
+    def test_top_k_and_top_p_match_per_row(self):
+        import torch
+        for seed in range(10):
+            torch.manual_seed(100 + seed)
+            self._check(torch.randn(8, 8, 1026), temperature=0.8, top_p=0.95,
+                        top_k=50)
+
+    def test_bf16_valued_logits_with_many_ties_match(self):
+        import torch
+        for seed in range(10):
+            torch.manual_seed(200 + seed)
+            logits = torch.randn(8, 8, 1026).to(torch.bfloat16).to(torch.float32)
+            self._check(logits, temperature=0.8, top_p=0.95, top_k=None)
+
+    def test_single_row_batch_matches_unbatched(self):
+        import torch
+        torch.manual_seed(7)
+        self._check(torch.randn(1, 8, 1026), temperature=0.8, top_p=0.95,
+                    top_k=None)
+
+    def test_sample_codes_delegates_to_the_same_filter(self):
+        import torch
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import (
+            _filter_probs,
+            _sample_codes,
+        )
+        torch.manual_seed(0)
+        logits = torch.randn(8, 1026)
+        probs = _filter_probs(logits, temperature=0.8, top_p=0.95, top_k=None)
+        g1 = torch.Generator().manual_seed(11)
+        g2 = torch.Generator().manual_seed(11)
+        via_helper = _sample_codes(logits, temperature=0.8, top_p=0.95,
+                                   top_k=None, generator=g1)
+        direct = probs.multinomial(num_samples=1, generator=g2).squeeze(-1)
+        self.assertTrue(torch.equal(via_helper, direct))
+
+    def test_zero_temperature_is_argmax_and_consumes_no_randomness(self):
+        # The equivalence test compares batched against standalone rows at
+        # temperature 0, which only works if the argmax path leaves the
+        # generator untouched — as upstream's does.
+        import torch
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import _sample_codes
+        torch.manual_seed(0)
+        logits = torch.randn(8, 1026)
+        g = torch.Generator().manual_seed(5)
+        before = g.get_state()
+        out = _sample_codes(logits, temperature=0.0, top_p=0.95, top_k=None,
+                            generator=g)
+        self.assertTrue(torch.equal(out, logits.argmax(dim=-1)))
+        self.assertTrue(torch.equal(g.get_state(), before))
+
+
+class SamplerStateVectorizationTest(unittest.TestCase):
+    """`_DelayState` must match the checkpoint's `_sampler_step`, exactly.
+
+    The decode loop used to call upstream's function once per row per step. It
+    mutates a `_SamplerState` and reads `codes_N[0].item()` — a device->host
+    sync per row per step, ~8 on each of ~1300 steps.
+
+    Forking a state machine costs more than copying a sampler, which is why the
+    module docstring used to say the machine stays upstream's. So `_DelayState`
+    is the ONE implementation the decode loop runs, and it is driven here
+    against upstream's own function as an oracle: random code streams, EOC
+    injected at random steps INCLUDING inside the delay ramp where upstream
+    ignores it, and random caps. A checkpoint that changes the machine fails
+    this test rather than silently changing every dub.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.up = _upstream_module()
+        except Exception as exc:  # noqa: BLE001
+            raise unittest.SkipTest(f"checkpoint snapshot unavailable: {exc}")
+
+    def _oracle(self, streams, caps, N):
+        """Upstream's machine, driven row by row exactly as the old loop did."""
+        import torch
+
+        rows, overflow = [], []
+        for stream, cap in zip(streams, caps):
+            state = self.up._SamplerState(num_codebooks=N)
+            emitted, over = [], False
+            for step in range(len(stream)):
+                # A one-hot at temperature 0 sends `_sampler_step` down its
+                # argmax path, so it returns exactly these codes and then runs
+                # its own bookkeeping — which is how the old loop drove it.
+                onehot = torch.zeros(N, 1026)
+                onehot.scatter_(-1, stream[step].unsqueeze(-1).long(), 1.0)
+                out = self.up._sampler_step(onehot, state, temperature=0.0,
+                                            top_p=None, top_k=None)
+                if state.generation_done:
+                    break
+                emitted.append(out.clone())
+                if len(emitted) >= cap:
+                    over = True
+                    break
+            rows.append(emitted)
+            overflow.append(over)
+        return rows, overflow
+
+    def _vectorized(self, streams, caps, N):
+        """`_DelayState` as `_decode_chunk` drives it."""
+        import torch
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import _DelayState
+        B = len(streams)
+        max_cap = max(caps)
+        state = _DelayState(
+            batch=B, num_codebooks=N,
+            caps=torch.tensor(caps, dtype=torch.long),
+            boc_id=self.up.BOC_ID, eoc_id=self.up.EOC_ID, device=None)
+        emitted = torch.zeros(B, max_cap, N, dtype=torch.long)
+        for step in range(max_cap):
+            codes = torch.stack([s[step].long() for s in streams])
+            state.step(codes, step)
+            emitted[:, step] = codes
+            if state.all_done():
+                break
+        return emitted, state.length.tolist(), state.overflowed.tolist()
+
+    def _compare(self, streams, caps, N):
+        import torch
+        ref_rows, ref_over = self._oracle(streams, caps, N)
+        emitted, lengths, over = self._vectorized(streams, caps, N)
+        for b, ref in enumerate(ref_rows):
+            self.assertEqual(lengths[b], len(ref),
+                             f"row {b}: emitted {lengths[b]}, upstream {len(ref)}")
+            for s, frame in enumerate(ref):
+                self.assertTrue(torch.equal(emitted[b, s], frame),
+                                f"row {b} frame {s} differs from upstream")
+        self.assertEqual(over, ref_over)
+
+    def test_random_streams_with_eoc_anywhere(self):
+        import torch
+        N = 8
+        for seed in range(60):
+            torch.manual_seed(seed)
+            B = int(torch.randint(1, 5, (1,)).item())
+            caps = [int(torch.randint(N + 2, 40, (1,)).item()) for _ in range(B)]
+            width = max(caps) + 2
+            streams = []
+            for cap in caps:
+                st = torch.randint(0, 1000, (width, N))
+                if bool(torch.rand(1) < 0.8):
+                    at = int(torch.randint(0, cap, (1,)).item())
+                    st[at, 0] = self.up.EOC_ID
+                streams.append(st)
+            self._compare(streams, caps, N)
+
+    def test_eoc_during_the_delay_ramp_is_ignored(self):
+        import torch
+        N = 8
+        st = torch.randint(0, 1000, (32, N))
+        st[2, 0] = self.up.EOC_ID          # inside the ramp
+        self._compare([st], [30], N)
+        _e, lengths, over = self._vectorized([st], [30], N)
+        self.assertEqual(lengths[0], 30)   # ran to its cap, did not stop at 8
+        self.assertTrue(over[0])
+
+    def test_eoc_after_the_ramp_retires_the_row_six_steps_later(self):
+        import torch
+        N = 8
+        st = torch.randint(0, 1000, (40, N))
+        st[10, 0] = self.up.EOC_ID
+        self._compare([st], [35], N)
+        _e, lengths, over = self._vectorized([st], [35], N)
+        # Detected at step 10 and still emitted, then five more, retiring at 16.
+        self.assertEqual(lengths[0], 16)
+        self.assertFalse(over[0])
+
+    def test_boc_masking_matches_the_ramp_position(self):
+        import torch
+        N = 8
+        st = torch.randint(0, 1000, (12, N))
+        emitted, lengths, _ = self._vectorized([st], [12], N)
+        for step in range(N - 1):
+            self.assertTrue(
+                bool((emitted[0, step, step + 1:] == self.up.BOC_ID).all()),
+                f"step {step} did not mask codebooks past the ramp position")
+        self.assertEqual(lengths[0], 12)
+
+    def test_rows_retire_independently(self):
+        import torch
+        N = 8
+        a = torch.randint(0, 1000, (40, N))
+        b = torch.randint(0, 1000, (40, N))
+        a[9, 0] = self.up.EOC_ID
+        self._compare([a, b], [35, 35], N)
+
+    def test_cap_is_exact_not_inferred_from_length(self):
+        import torch
+        N = 8
+        st = torch.randint(0, 1000, (40, N))   # no EOC at all
+        self._compare([st], [N + 3], N)
+        _e, lengths, over = self._vectorized([st], [N + 3], N)
+        self.assertEqual(lengths[0], N + 3)
+        self.assertTrue(over[0])

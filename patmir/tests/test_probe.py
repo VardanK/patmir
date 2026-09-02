@@ -66,17 +66,33 @@ class EnabledProbeRecordsTest(unittest.TestCase):
         self.assertIn("decode_s", p.spans)
         self.assertGreaterEqual(p.spans["decode_s"], 0.0)
 
-    def test_counters_and_values_and_details(self):
+    def test_counters_are_flat_and_values_are_nested(self):
+        # The split is load-bearing for watch-along: spans and counters ADD
+        # across a stream's sections, identities and derived ratios must not.
+        # Summing them is what produced a reported `max_batch` of 88.
         p = Probe()
         p.start()
         p.bump("steps", 5)
         p.bump("steps")
         p.set("engine", "higgs")
+        p.set("max_batch", 8)
         p.detail({"B": 8})
-        s = p.summary()
-        self.assertEqual(s["steps"], 6)
-        self.assertEqual(s["engine"], "higgs")
-        self.assertEqual(s["details"], [{"B": 8}])
+        out = p.summary()
+        self.assertEqual(out["steps"], 6)
+        self.assertEqual(out["values"], {"engine": "higgs", "max_batch": 8})
+        self.assertEqual(out["details"], [{"B": 8}])
+        self.assertNotIn("engine", out)      # not at the top level
+
+    def test_spans_stay_at_the_top_level(self):
+        # So the six keys the 2026-09-01 TTS probe wrote are still comparable.
+        p = Probe()
+        p.start()
+        with p.section("prefill_s"):
+            pass
+        p.bump("chunks")
+        out = p.summary()
+        self.assertIn("prefill_s", out)
+        self.assertIn("chunks", out)
 
     def test_step_spans_need_step_level(self):
         p = Probe()
@@ -103,12 +119,12 @@ class DumpMergesTest(unittest.TestCase):
             out = Path(td) / "asr" / "bench_probe.json"
             candidate = Probe()
             candidate.start()
-            candidate.set("generate_s", 10.5)
+            candidate.spans["generate_s"] = 10.5
             candidate.dump(out)
 
             runner = Probe()
             runner.start()
-            runner.set("tag_s", 1.25)
+            runner.spans["tag_s"] = 1.25
             runner.dump(out)
 
             data = json.loads(out.read_text())
@@ -121,7 +137,7 @@ class DumpMergesTest(unittest.TestCase):
             out.write_text("{not json")
             p = Probe()
             p.start()
-            p.set("x", 1)
+            p.bump("x", 1)
             p.dump(out)
             self.assertEqual(json.loads(out.read_text()), {"x": 1})
 
@@ -130,7 +146,7 @@ class DumpMergesTest(unittest.TestCase):
             out = Path(td) / "bench_probe.json"
             p = Probe()
             p.start()
-            p.set("keep", 1)
+            p.bump("keep", 1)
             p.dump(out)
             Probe.start(other := Probe())   # armed but recorded nothing
             other.dump(out)

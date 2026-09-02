@@ -157,7 +157,7 @@ class HTDemucs:
                     job_dir=ctx.job_dir,
                     probe=ctx.probe,
                 )
-            ctx.probe.set("n_vad_intervals", len(vad_intervals or []))
+            ctx.probe.bump("n_vad_intervals", len(vad_intervals or []))
 
         meta = {
             "accompaniment": str(accomp_path),
