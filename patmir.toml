@@ -489,7 +489,24 @@ temperature   = 0.8
 top_p         = 0.95
 seed          = 0
 max_retries   = 2
-max_batch     = 8
+# Swept 8/12/16 on the 3090 2026-09-02 (warm, sample_1, with the decode graph;
+# the sweep was meaningless before it, since a launch-bound step barely cares
+# how wide the batch is):
+#
+#   B    ms/step   tts wall   capture   chunks   steps   live rows   ovf   agg RTF
+#   8      17.19     29.14s     7.34s       10    1160       0.647     0     0.234
+#   12     18.11     23.84s     5.96s        7     888       0.592     0     0.218
+#   16     19.14     27.03s     5.31s        6    1032       0.468     1     0.228
+#
+# 12 wins, and 16 LOSES — which is the interesting part. Per-step cost rises
+# monotonically with B (more KV to read, more attention), so the gain has to
+# come from fewer chunks. But a chunk costs `max(steps)` over its rows, so a
+# wider batch also widens the token-cap spread inside each chunk: at 16 total
+# steps went UP (888 -> 1032) despite one fewer chunk, over half the row-steps
+# were spent on already-retired rows (live 0.468), and it produced the first
+# overflow measured in this work. VRAM was never the binding constraint
+# (16.5-17.4 GB peak, ~7.5 GB free throughout).
+max_batch     = 12
 # Grouped-query kernel for the single-token decode step (2026-09-02). Skips
 # transformers' `repeat_kv`, which expands 8 KV heads to 32 on every layer of
 # every step because `use_gqa_in_sdpa` is False whenever an attention mask is

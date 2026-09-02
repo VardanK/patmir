@@ -158,12 +158,28 @@ reaches first audio in 27.8 s and produces at 0.62 of realtime.
 ### The finding that changes the ranking
 
 **Translate is the second-largest stage in watch-along, at 46.6 s of a 205.8 s
-wall (23 %)** — against 14 % in batch. The reason is in the code, not the
-network: watch-along forces `openrouter_gemini_flash_batch`, and
-`translate_batch` walks its chunks **serially** with no `translate_concurrency`
-at all, while the per-sentence path used by batch fires 6 at a time. So the
-mode with the tighter latency budget uses the slower translator. That raises
-plan Task 7's watch-along half from a nicety to the second-best lever here.
+wall (23 %)** — against 14 % in batch.
+
+**Correction (2026-09-02, after checking the per-section traces).** My first
+reading of this was wrong. I attributed it to `translate_batch` walking its
+chunks serially with no `translate_concurrency`, and concluded that
+parallelizing chunks was the second-best lever here. The traces say otherwise:
+sections carry 3-16 sentences against `chunk_size = 20`, so **every section is
+a single chunk and makes exactly one call**. There is no serial chunk walk to
+parallelize. The cost is one structured, JSON-schema-constrained round-trip per
+section at 1.9-3.8 s.
+
+Two consequences. Chunk concurrency would buy nothing here, so it is not
+implemented. And the remaining lever is **overlapping a section's translate
+with the previous section's TTS** — cross-stage pipelining, which this spec
+deliberately excludes. Note also that the serial walk is not a bug even where
+it does run: each chunk's prompt carries the previous chunk's translated
+`overlap` pairs, which is the cross-chunk coherence the batched candidate
+exists to provide. Parallelizing it would trade translation quality for
+latency, not win for free.
+
+Translate is 23 % of watch-along wall mostly because everything around it got
+faster.
 
 Per-stage, watch-along: tts 81.4 s (40 %), translate 46.6 (23 %), asr 29.1
 (14 %), separate 10.9 (5 %), the rest under 3 s each. ASR's language probe is
@@ -179,3 +195,94 @@ derived ratios, so the greedy report shows `max_batch 88` (8 x 11 job dirs),
 are correct — `decode_s 82.33` over `steps 1866` is a true **44.1 ms/step**,
 consistent with batch's 45.4-45.7 — and every per-section probe file is intact
 on disk, so the aggregate is recoverable without re-running. Fixed below.
+
+## After the optimizations (2026-09-02)
+
+Batch, warm, `sample_1`, cuda profile. Each row is the change on top of the one
+above it, measured separately so nothing is attributed to the wrong lever.
+
+| step | ms/step | tts | asr | translate | wall | agg RTF |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline at 350 W | 45.55 | 60.55 | 15.24 | 16.02 | 113.3 | 0.377 |
+| decode sync/sampler/state-machine | 45.88 | 61.38 | — | — | — | 0.377 |
+| **+ CUDA graph** | 27.15 | 39.51 | — | — | — | 0.309 |
+| **+ gqa attention** | 17.33 | 29.27 | 15.97 | 15.99 | 83.4 | 0.277 |
+| **+ ASR language probe** | — | 27.80 | **11.32** | 16.53 | 77.5 | 0.257 |
+| **+ translate concurrency 12** | — | — | — | **8.22** | **70.5** | **0.234** |
+
+**38 % off the pipeline.** The plan targeted 20-25 %.
+
+### What each lever actually cost or bought
+
+- **Sync removal, batched sampling, vectorized state machine: 0 ms.** Kept
+  because CUDA graph capture requires exactly what they provide. Recorded in
+  full rather than quietly folded into the next commit, because the reason it
+  bought nothing is the useful part: a 36-layer model with negligible widths
+  already costs 42.9 ms/step here, so the step was ~93 % kernel-launch cost and
+  the syncs were never the constraint.
+- **CUDA graph: 45.55 -> 27.15 ms/step, byte-identical.** The plan classified
+  this as a numerics change needing an ear-test; measurement said otherwise
+  (`StaticCache` ≡ `DynamicCache`, graph replay ≡ eager stepping, both verified
+  bitwise with ragged left-padded prompts). It shipped with no quality question
+  attached.
+- **gqa attention: -> 17.33 ms/step, re-rolls every line.** Ear-tested and
+  approved (`runs/20260902-230429-sample_1`), enabled in `patmir.toml` so the
+  cache key moves (2cc3dd87 -> 4a56ed45) and cached dubs regenerate once.
+- **ASR probe: 4.63 -> 0.71 s, 0 fallbacks.** It was transcribing up to 28 s at
+  a 256-token budget to read a tag that precedes the transcription.
+- **Translate concurrency 6 -> 12: 16.53 -> 8.22 s.** Mean per-call latency
+  unchanged (1196.6 -> 1197.8 ms), so nothing was rate limited.
+
+### Ordering was load-bearing, and not obvious
+
+CPU launch (~43 ms) and GPU execution (~33 ms) **pipeline**, so the step sits at
+the max of the two. Swapping the attention kernel first would therefore have
+measured ~0, exactly as the sync removal did — it lowers a floor that is not
+binding. The graph had to land first to expose the GPU floor. Any future work
+here should check which of the two is binding before optimizing either.
+
+### The largest remaining TTS inefficiency is now graph capture
+
+At `max_batch = 8` capture costs **7.34 s of a 29.14 s TTS stage — 25 %**, or
+~0.73 s per chunk, three times the original estimate. It still pays for itself
+(it buys ~28 ms on each of ~1160 steps) but it is now the biggest single piece
+of waste in the stage. Reusing a captured graph across chunks with matching
+`(B, seq + max_cap)` would recover most of it; a larger `max_batch` reduces it
+for free by cutting the chunk count.
+
+### `max_batch` sweep (2026-09-02)
+
+Only meaningful after the graph: while the step was launch-bound, batch width
+barely mattered. Warm repeat each, `sample_1`, with the graph and gqa kernel.
+
+| B | ms/step | tts wall | capture | chunks | steps | live rows | ovf | VRAM | agg RTF |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 17.19 | 29.14 s | 7.34 s | 10 | 1160 | 0.647 | 0 | 16.50 GB | 0.234 |
+| **12** | 18.11 | **23.84 s** | 5.96 s | 7 | 888 | 0.592 | 0 | 16.62 GB | **0.218** |
+| 16 | 19.14 | 27.03 s | 5.31 s | 6 | 1032 | 0.468 | **1** | 17.38 GB | 0.228 |
+
+**12 wins and 16 loses**, which is the informative part. Per-step cost rises
+monotonically with B (more KV to read, more attention work), so every gain has
+to come from needing fewer chunks. But **a chunk costs `max(steps)` over its
+rows**, so widening the batch also widens the token-cap spread inside each
+chunk. At 16 that dominates: total steps went *up* (888 -> 1032) despite one
+fewer chunk, more than half of all row-steps were spent on already-retired rows
+(live 0.468 vs 0.647 at B=8), and it produced the only TTS overflow measured
+anywhere in this spec.
+
+VRAM was never the binding constraint — 16.5-17.4 GB peak with ~7.5 GB free
+throughout, against the 21 GB budget. The plan expected memory to decide this;
+chunk shape decided it instead.
+
+Caveat: one warm repeat per setting, and Sortformer non-determinism gave
+79/81/80 sentences across the three, so step counts are not perfectly
+comparable. The 12-vs-16 gap (23.84 vs 27.03 s) is far larger than that noise;
+a reader wanting to split 8 from 12 more finely should repeat both.
+
+`max_batch = 12` set. It changes the audio (batching is not bitwise-invariant
+across shapes), so `config_hash` moves **4a56ed45 -> 3f421293**. Sequenced
+deliberately *before* any re-dub of the library: the gqa change had already
+moved the key, so folding this in now costs one regeneration instead of two.
+
+Ear check available at `runs/20260902-233655-sample_1/out.mkv` (the mb12 warm run) against
+`runs/20260902-230429-sample_1/out.mkv` (the approved gqa rendering at B=8).
