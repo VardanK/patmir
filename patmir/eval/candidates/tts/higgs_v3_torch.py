@@ -1264,8 +1264,13 @@ def build(config: dict[str, Any]) -> HiggsV3Torch:
         top_k=config.get("top_k"),
         seed=int(config.get("seed", 0)),
         max_retries=int(config.get("max_retries", 2)),
-        max_batch=int(config.get("max_batch", 8)),
-        # Bench-only override so the max_batch sweep needs no patmir.toml edit.
+        # Bench-only override so the sweep needs no `patmir.toml` edit. Unlike
+        # the two below, `max_batch` DOES belong in the cache key when set for
+        # real: batching is not bitwise-invariant across shapes, so changing it
+        # changes the audio.
+        max_batch=int(os.environ.get("PATMIR_TTS_MAX_BATCH",
+                                     config.get("max_batch", 8))),
+        # Bench-only override so a perf A/B needs no patmir.toml edit.
         cuda_graphs=_env_flag("PATMIR_TTS_CUDA_GRAPHS",
                               bool(config.get("cuda_graphs", True))),
         decode_attention=os.environ.get(

@@ -340,3 +340,78 @@ def test_capped_sentences_keep_their_words_and_bounds():
     for s in out:
         assert s.start == s.words[0].start
         assert s.end == s.words[-1].end
+
+
+# --------------------------------------------------------------------------- #
+# language detection (2026-09-02)
+# --------------------------------------------------------------------------- #
+class _ProbeSpy:
+    """A candidate with `_transcribe_batch` replaced, so the probe's calls can
+    be inspected without loading 5 GB of weights."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+        self.max_new_tokens = 256
+
+    def _transcribe_batch(self, clips, language, max_new_tokens=None):
+        self.calls.append({
+            "samples": int(clips[0].size),
+            "language": language,
+            "max_new_tokens": max_new_tokens or self.max_new_tokens,
+        })
+        return self.replies.pop(0) if self.replies else [{}]
+
+    _detect_language = qwen3_asr.Qwen3ASRTorch._detect_language
+
+
+def _clip(seconds: float):
+    import numpy as np
+    return np.zeros(int(seconds * qwen3_asr.SAMPLE_RATE), dtype="float32")
+
+
+class TestLanguageProbe:
+    """The probe used to be a FULL transcription of the longest chunk — up to
+    28 s at `max_new_tokens=256` — whose text was then thrown away; only the
+    language tag was read. Measured 4.4-4.7 s of a 15.2 s warm stage.
+
+    The model's output format is `language <LANG><asr_text>...`, so the tag
+    precedes the transcription and neither truncation can hide it.
+    """
+
+    def test_probe_truncates_the_audio_and_the_token_budget(self):
+        spy = _ProbeSpy([[{"language": "Russian"}]])
+        assert spy._detect_language(_clip(28.0)) == "ru"
+        call = spy.calls[0]
+        assert call["samples"] == int(
+            qwen3_asr.LANG_PROBE_SECONDS * qwen3_asr.SAMPLE_RATE)
+        assert call["max_new_tokens"] == qwen3_asr.LANG_PROBE_TOKENS
+        assert call["max_new_tokens"] < 256
+        assert call["language"] is None       # detection, not forced
+
+    def test_a_short_clip_is_not_padded(self):
+        spy = _ProbeSpy([[{"language": "English"}]])
+        assert spy._detect_language(_clip(3.0)) == "en"
+        assert spy.calls[0]["samples"] == int(3.0 * qwen3_asr.SAMPLE_RATE)
+
+    def test_missing_tag_returns_none_rather_than_guessing(self):
+        # A truncated output parses to `language: None`, which would otherwise
+        # fall through to "en" and mislabel a Russian soundtrack.
+        spy = _ProbeSpy([[{"language": None, "transcription": "привет"}]])
+        assert spy._detect_language(_clip(28.0)) is None
+
+    def test_empty_audio_probes_nothing(self):
+        spy = _ProbeSpy([])
+        assert spy._detect_language(_clip(0.0)) is None
+        assert spy.calls == []
+
+    def test_full_name_is_normalized_to_iso(self):
+        for name, iso in (("Russian", "ru"), ("English", "en"), ("ru", "ru")):
+            spy = _ProbeSpy([[{"language": name}]])
+            assert spy._detect_language(_clip(10.0)) == iso
+
+    def test_budgets_are_sane(self):
+        # Enough tokens for `language <LANG><asr_text>` and enough audio to
+        # hear speech, without being the 28 s / 256 tokens it replaced.
+        assert 8 <= qwen3_asr.LANG_PROBE_TOKENS <= 64
+        assert 4.0 <= qwen3_asr.LANG_PROBE_SECONDS <= 12.0

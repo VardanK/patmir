@@ -104,6 +104,17 @@ timeout_seconds = 60.0
 # `effort=minimal` keeps reasoning_tokens at 0, halves latency (~2s vs ~4s
 # per sentence), and drops per-call cost ~30×. Verified 2026-05-26.
 reasoning   = { effort = "minimal" }
+# Sentences are independent round-trips (~1.1 s each, TTFT-dominated), so the
+# only thing bounding this stage is how many are in flight. At 6 it was ~16 s
+# of a ~108 s warm batch wall with the GPU idle throughout. Retries below cover
+# the 429s a higher number risks.
+#
+# `concurrency`, `max_attempts` and `retry_backoff_s` are deliberately EXCLUDED
+# from `ui.cache.config_hash` (see `_NON_OUTPUT_KEYS`): they cannot change a
+# sample, so tuning throughput must not re-dub a finished library.
+concurrency     = 12
+max_attempts    = 3
+retry_backoff_s = 0.5
 
 # Batched + structured-output variant of the same Gemini Flash backend.
 # Translates N sentences per call (default 20) with a 2-sentence sliding

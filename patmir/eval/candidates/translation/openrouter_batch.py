@@ -44,6 +44,9 @@ from patmir.eval.candidates.translation.openrouter import (
     _strip_thinking,
 )
 
+# Shared with the per-sentence candidate so one retry policy governs both.
+_RETRYABLE = OpenRouterTranslator._RETRYABLE
+
 _BASE_URL = "https://openrouter.ai/api/v1"
 
 # JSON schema we send via `response_format`. OpenRouter forwards this to the
@@ -123,6 +126,8 @@ class OpenRouterBatchTranslator:
         base_url: str = _BASE_URL,
         chunk_size: int = 20,
         overlap: int = 2,
+        max_attempts: int = 3,
+        retry_backoff_s: float = 0.5,
         reasoning: dict | None = None,
         thinking: dict | None = None,
         referer: str = "https://github.com/patmir-dub",
@@ -141,6 +146,8 @@ class OpenRouterBatchTranslator:
             )
         self.api_key = api_key
         self.model = model
+        self.max_attempts = max(1, int(max_attempts))
+        self.retry_backoff_s = float(retry_backoff_s)
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
@@ -283,16 +290,35 @@ class OpenRouterBatchTranslator:
         if self.thinking is not None:
             payload["thinking"] = self.thinking
 
-        try:
-            resp = self._client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self.headers,
-                json=payload,
-            )
-        except httpx.HTTPError as exc:
-            raise _BatchError(f"transport: {type(exc).__name__}: {exc}") from exc
-        if resp.status_code != 200:
-            raise _BatchError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+        # Retry transient failures before giving up on the chunk. Falling
+        # back is expensive here: one 429 turns a single batched round-trip
+        # into `chunk_size` per-sentence ones (20 by default), which is the
+        # opposite of what a rate limiter wants.
+        import time as _time
+
+        resp = None
+        last = ""
+        for attempt in range(self.max_attempts):
+            try:
+                resp = self._client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    json=payload,
+                )
+            except httpx.HTTPError as exc:
+                last = f"transport: {type(exc).__name__}: {exc}"
+                resp = None
+            else:
+                if resp.status_code == 200:
+                    break
+                last = f"HTTP {resp.status_code}: {resp.text[:300]}"
+                if resp.status_code not in _RETRYABLE:
+                    raise _BatchError(last)
+                resp = None
+            if attempt + 1 < self.max_attempts:
+                _time.sleep(self.retry_backoff_s * (2 ** attempt))
+        if resp is None:
+            raise _BatchError(last)
 
         try:
             content = _extract_message_content(resp.json())
@@ -320,15 +346,41 @@ class OpenRouterBatchTranslator:
     def _fallback_chunk(
         self, chunk: list[_Item], *, source_lang: str, audience: str | None = None,
     ) -> dict[int, str]:
+        """Per-sentence translation for a chunk whose batched call failed.
+
+        Fired concurrently: these calls are independent (each carries only its
+        own text and emotion), so the output does not depend on the order, and
+        this path only ever runs when a section is already late. It was serial,
+        which made the recovery from one failed round-trip cost `chunk_size`
+        sequential ones.
+
+        A sentence that still fails yields "" — the empty-translation case the
+        adapter counts and reports, rather than a silent gap.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
         out: dict[int, str] = {}
-        for it in chunk:
+
+        def _one(it: _Item) -> tuple[int, str]:
             try:
-                out[it.idx] = self._fallback.translate(
+                return it.idx, self._fallback.translate(
                     it.text, source_lang=source_lang, emotion=it.emotion,
                     audience=audience,
                 )
             except Exception:  # noqa: BLE001
-                out[it.idx] = ""
+                return it.idx, ""
+
+        workers = max(1, min(len(chunk),
+                             int(getattr(self._fallback,
+                                         "translate_concurrency", 1))))
+        if workers == 1 or len(chunk) == 1:
+            for it in chunk:
+                idx, text = _one(it)
+                out[idx] = text
+            return out
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for idx, text in ex.map(_one, chunk):
+                out[idx] = text
         return out
 
 
@@ -443,6 +495,8 @@ def build(config: dict[str, Any]) -> OpenRouterBatchTranslator:
         base_url=config.get("base_url", _BASE_URL),
         chunk_size=int(config.get("chunk_size", 20)),
         overlap=int(config.get("overlap", 2)),
+        max_attempts=int(config.get("max_attempts", 3)),
+        retry_backoff_s=float(config.get("retry_backoff_s", 0.5)),
         reasoning=config.get("reasoning"),
         thinking=config.get("thinking"),
         referer=config.get("referer", "https://github.com/patmir-dub"),
