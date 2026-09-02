@@ -1,0 +1,1473 @@
+{
+  "results": [
+    {
+      "clip": "samples/sample_1.mkv",
+      "mode": "batch",
+      "label": "after",
+      "repeat_index": 0,
+      "job_id": "20260902-234646-sample_1",
+      "source_s": 301.11,
+      "total_wall_s": 102.03,
+      "agg_rtf": 0.339,
+      "stages": [
+        {
+          "name": "ingest",
+          "state": "done",
+          "wall_s": 0.41,
+          "build_s": 0.0,
+          "rtf": 0.001,
+          "pct": 0.4
+        },
+        {
+          "name": "separate",
+          "state": "done",
+          "wall_s": 9.58,
+          "build_s": 0.9,
+          "rtf": 0.032,
+          "pct": 9.4
+        },
+        {
+          "name": "diarize",
+          "state": "done",
+          "wall_s": 7.74,
+          "build_s": 6.21,
+          "rtf": 0.026,
+          "pct": 7.6
+        },
+        {
+          "name": "emotion",
+          "state": "done",
+          "wall_s": 6.86,
+          "build_s": 4.75,
+          "rtf": 0.023,
+          "pct": 6.7
+        },
+        {
+          "name": "asr",
+          "state": "done",
+          "wall_s": 26.09,
+          "build_s": 13.78,
+          "rtf": 0.087,
+          "pct": 25.6
+        },
+        {
+          "name": "translate",
+          "state": "done",
+          "wall_s": 9.99,
+          "build_s": 0.01,
+          "rtf": 0.033,
+          "pct": 9.8
+        },
+        {
+          "name": "tts",
+          "state": "done",
+          "wall_s": 31.0,
+          "build_s": 4.31,
+          "rtf": 0.103,
+          "pct": 30.4
+        },
+        {
+          "name": "mux",
+          "state": "done",
+          "wall_s": 4.75,
+          "build_s": 0.0,
+          "rtf": 0.016,
+          "pct": 4.7
+        },
+        {
+          "name": "output",
+          "state": "done",
+          "wall_s": 5.6,
+          "build_s": 0.0,
+          "rtf": 0.019,
+          "pct": 5.5
+        }
+      ],
+      "sentence_count": 81,
+      "tts": {
+        "unit": "chunk",
+        "count": 7,
+        "total_s": 25.11,
+        "mean_s": 3.588,
+        "median_s": 3.193,
+        "p90_s": 3.813,
+        "max_s": 5.96,
+        "audio_s": 221.28,
+        "tts_rtf": 0.113,
+        "chunks": 7,
+        "chunk_sentences": 81,
+        "sentences_per_chunk": 11.57,
+        "engine": "higgs_v3_torch_bfloat16",
+        "sentences": 81,
+        "overflows": 0
+      },
+      "translate": {
+        "unit": "sentence",
+        "count": 81,
+        "total_s": 112.58,
+        "mean_ms": 1389.9,
+        "median_ms": 1250.6,
+        "p90_ms": 1843.7,
+        "max_ms": 3532.4
+      },
+      "models": {
+        "ingest": "ffmpeg",
+        "separate": "htdemucs_vocals",
+        "diarize": "sortformer_nemo",
+        "emotion": "emotion2vec_plus_base",
+        "asr": "qwen3_asr_1_7b",
+        "translate": "openrouter_gemini_flash",
+        "tts": "higgs_v3_torch_bf16",
+        "mux": "ffmpeg_pad_stretch",
+        "output": "mkv_default"
+      },
+      "sections": null,
+      "notes": {
+        "build_pct_of_wall": 29.4,
+        "real_wall_s": 104.85,
+        "other_s": 2.82,
+        "agg_rtf_real": 0.348,
+        "cpu_s": {
+          "user": 74.72,
+          "sys": 13.58,
+          "children_user": 10.05,
+          "children_sys": 1.93,
+          "total": 100.28
+        },
+        "probes": {
+          "separate": {
+            "extract_s": 0.3618,
+            "model_s": 5.6634,
+            "vad_load_s": 0.0309,
+            "vad_infer_s": 1.3644,
+            "stem_write_s": 0.2113,
+            "vad_s": 2.1112,
+            "n_vad_intervals": 43
+          },
+          "emotion": {
+            "read_s": 0.0648,
+            "resample_s": 0.1028,
+            "infer_s": 1.4878,
+            "pick_refs_s": 0.2553,
+            "n_turns": 117,
+            "n_scored": 106
+          },
+          "asr": {
+            "probe_s": 1.0882,
+            "generate_s": 10.4144,
+            "align_s": 0.4859,
+            "tag_s": 0.0191,
+            "n_chunks": 13,
+            "n_generate_batches": 2,
+            "n_align_batches": 2,
+            "n_sentences": 81
+          },
+          "tts": {
+            "graph_capture_s": 6.7586,
+            "prefill_s": 6.7589,
+            "decode_s": 16.2492,
+            "codec_s": 1.9887,
+            "steps": 888,
+            "chunks": 7,
+            "live_row_steps": 6099,
+            "total_row_steps": 10164,
+            "values": {
+              "cuda_graphs": true,
+              "ms_per_step_decode": 18.3,
+              "live_row_fraction": 0.6,
+              "attn_impl": "sdpa",
+              "attn_impl_decode": "patmir_gqa_decode",
+              "max_batch": 12,
+              "dtype": "bfloat16",
+              "device": "cuda"
+            },
+            "details": [
+              {
+                "B": 12,
+                "seq": 440,
+                "steps": 92,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  33,
+                  45,
+                  66,
+                  85,
+                  71,
+                  32,
+                  37,
+                  89,
+                  45,
+                  68,
+                  48,
+                  48
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 12,
+                "seq": 425,
+                "steps": 76,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  58,
+                  56,
+                  31,
+                  26,
+                  49,
+                  53,
+                  57,
+                  74,
+                  37,
+                  54,
+                  67,
+                  51
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 12,
+                "seq": 449,
+                "steps": 108,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  49,
+                  50,
+                  49,
+                  42,
+                  49,
+                  48,
+                  33,
+                  107,
+                  54,
+                  68,
+                  73,
+                  18
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 12,
+                "seq": 447,
+                "steps": 120,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  29,
+                  30,
+                  51,
+                  49,
+                  39,
+                  74,
+                  92,
+                  117,
+                  85,
+                  42,
+                  61,
+                  54
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 454,
+                "steps": 108,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  100,
+                  52,
+                  92,
+                  106,
+                  45,
+                  75,
+                  37,
+                  25,
+                  80,
+                  54,
+                  59
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 460,
+                "steps": 144,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  208,
+                  224,
+                  228,
+                  236,
+                  236
+                ],
+                "lengths": [
+                  62,
+                  36,
+                  72,
+                  81,
+                  32,
+                  27,
+                  102,
+                  142,
+                  99,
+                  96,
+                  117
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 505,
+                "steps": 240,
+                "caps": [
+                  240,
+                  284,
+                  300,
+                  328,
+                  348,
+                  356,
+                  372,
+                  388,
+                  392,
+                  392,
+                  456
+                ],
+                "lengths": [
+                  124,
+                  121,
+                  128,
+                  168,
+                  162,
+                  238,
+                  197,
+                  163,
+                  212,
+                  169,
+                  183
+                ],
+                "attempt": 0
+              }
+            ]
+          },
+          "mux": {
+            "read_s": 0.0189,
+            "stretch_s": 3.7505,
+            "write_s": 0.1118,
+            "n_stretch_calls": 101
+          },
+          "output": {
+            "srt_s": 0.0003,
+            "ffprobe_s": 0.0332,
+            "ffmpeg_s": 5.5697
+          }
+        },
+        "gpu": {
+          "source": "nvml",
+          "device": "NVIDIA GeForce RTX 3090",
+          "power_limit_w": 350.0,
+          "power_limit_default_w": 350.0,
+          "power_limit_is_stock": true,
+          "samples": 102,
+          "interval_s": 1.0,
+          "throttle_reasons": {
+            "sw_power_cap": 19,
+            "sw_thermal_slowdown": 1
+          },
+          "throttled": true,
+          "at_power_ceiling_samples": 19,
+          "thermal_slowdown": true,
+          "capped_below_stock": false,
+          "idle_pct": 45.1,
+          "power_w": {
+            "avg": 162.9,
+            "min": 29.1,
+            "max": 348.0
+          },
+          "sm_mhz": {
+            "avg": 1315.3,
+            "min": 210.0,
+            "max": 1965.0
+          },
+          "mem_mhz": {
+            "avg": 6819.9,
+            "min": 405.0,
+            "max": 9501.0
+          },
+          "temp_c": {
+            "avg": 49.4,
+            "min": 36.0,
+            "max": 67.0
+          },
+          "util_pct": {
+            "avg": 33.1,
+            "min": 0.0,
+            "max": 99.0
+          },
+          "mem_util_pct": {
+            "avg": 17.8,
+            "min": 0.0,
+            "max": 68.0
+          },
+          "mem_used_mb": {
+            "avg": 10080.8,
+            "min": 1076.0,
+            "max": 18647.3
+          }
+        },
+        "peak_vram_gb": 16.72,
+        "peak_vram_reserved_gb": 17.15,
+        "vram_free_gb": 7.7,
+        "peak_rss_gb": 8.47,
+        "rss_scope": "repeat",
+        "peak_rss_process_gb": 8.79
+      },
+      "profile": "cuda",
+      "warm_cache": true,
+      "warm": false,
+      "build_total_s": 29.96
+    },
+    {
+      "clip": "samples/sample_1.mkv",
+      "mode": "batch",
+      "label": "after",
+      "repeat_index": 1,
+      "job_id": "20260902-234831-sample_1",
+      "source_s": 301.11,
+      "total_wall_s": 65.09,
+      "agg_rtf": 0.216,
+      "stages": [
+        {
+          "name": "ingest",
+          "state": "done",
+          "wall_s": 0.45,
+          "build_s": 0.0,
+          "rtf": 0.002,
+          "pct": 0.7
+        },
+        {
+          "name": "separate",
+          "state": "done",
+          "wall_s": 9.2,
+          "build_s": 0.0,
+          "rtf": 0.031,
+          "pct": 14.1
+        },
+        {
+          "name": "diarize",
+          "state": "done",
+          "wall_s": 1.42,
+          "build_s": 0.0,
+          "rtf": 0.005,
+          "pct": 2.2
+        },
+        {
+          "name": "emotion",
+          "state": "done",
+          "wall_s": 1.51,
+          "build_s": 0.0,
+          "rtf": 0.005,
+          "pct": 2.3
+        },
+        {
+          "name": "asr",
+          "state": "done",
+          "wall_s": 11.91,
+          "build_s": 0.0,
+          "rtf": 0.04,
+          "pct": 18.3
+        },
+        {
+          "name": "translate",
+          "state": "done",
+          "wall_s": 8.38,
+          "build_s": 0.0,
+          "rtf": 0.028,
+          "pct": 12.9
+        },
+        {
+          "name": "tts",
+          "state": "done",
+          "wall_s": 22.61,
+          "build_s": 0.0,
+          "rtf": 0.075,
+          "pct": 34.7
+        },
+        {
+          "name": "mux",
+          "state": "done",
+          "wall_s": 3.98,
+          "build_s": 0.0,
+          "rtf": 0.013,
+          "pct": 6.1
+        },
+        {
+          "name": "output",
+          "state": "done",
+          "wall_s": 5.63,
+          "build_s": 0.0,
+          "rtf": 0.019,
+          "pct": 8.7
+        }
+      ],
+      "sentence_count": 80,
+      "tts": {
+        "unit": "chunk",
+        "count": 7,
+        "total_s": 22.13,
+        "mean_s": 3.162,
+        "median_s": 2.849,
+        "p90_s": 3.09,
+        "max_s": 5.841,
+        "audio_s": 206.08,
+        "tts_rtf": 0.107,
+        "chunks": 7,
+        "chunk_sentences": 80,
+        "sentences_per_chunk": 11.43,
+        "engine": "higgs_v3_torch_bfloat16",
+        "sentences": 80,
+        "overflows": 0
+      },
+      "translate": {
+        "unit": "sentence",
+        "count": 80,
+        "total_s": 94.49,
+        "mean_ms": 1181.1,
+        "median_ms": 1145.5,
+        "p90_ms": 1440.5,
+        "max_ms": 2004.2
+      },
+      "models": {
+        "ingest": "ffmpeg",
+        "separate": "htdemucs_vocals",
+        "diarize": "sortformer_nemo",
+        "emotion": "emotion2vec_plus_base",
+        "asr": "qwen3_asr_1_7b",
+        "translate": "openrouter_gemini_flash",
+        "tts": "higgs_v3_torch_bf16",
+        "mux": "ffmpeg_pad_stretch",
+        "output": "mkv_default"
+      },
+      "sections": null,
+      "notes": {
+        "build_pct_of_wall": 0.0,
+        "real_wall_s": 67.1,
+        "other_s": 2.02,
+        "agg_rtf_real": 0.223,
+        "cpu_s": {
+          "user": 53.67,
+          "sys": 5.31,
+          "children_user": 9.64,
+          "children_sys": 1.75,
+          "total": 70.36
+        },
+        "probes": {
+          "separate": {
+            "extract_s": 0.3588,
+            "model_s": 5.6366,
+            "vad_load_s": 0.0705,
+            "vad_infer_s": 1.3628,
+            "stem_write_s": 0.2086,
+            "vad_s": 2.5262,
+            "n_vad_intervals": 42
+          },
+          "emotion": {
+            "read_s": 0.0535,
+            "resample_s": 0.1392,
+            "infer_s": 0.8992,
+            "pick_refs_s": 0.2554,
+            "n_turns": 91,
+            "n_scored": 87
+          },
+          "asr": {
+            "probe_s": 0.7224,
+            "generate_s": 10.4496,
+            "align_s": 0.4762,
+            "tag_s": 0.0132,
+            "n_chunks": 13,
+            "n_generate_batches": 2,
+            "n_align_batches": 2,
+            "n_sentences": 80
+          },
+          "tts": {
+            "graph_capture_s": 5.8096,
+            "prefill_s": 5.8098,
+            "decode_s": 14.8412,
+            "codec_s": 1.3834,
+            "steps": 824,
+            "chunks": 7,
+            "live_row_steps": 5712,
+            "total_row_steps": 9348,
+            "values": {
+              "cuda_graphs": true,
+              "ms_per_step_decode": 18.01,
+              "live_row_fraction": 0.611,
+              "attn_impl": "sdpa",
+              "attn_impl_decode": "patmir_gqa_decode",
+              "max_batch": 12,
+              "dtype": "bfloat16",
+              "device": "cuda"
+            },
+            "details": [
+              {
+                "B": 12,
+                "seq": 366,
+                "steps": 84,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  31,
+                  34,
+                  64,
+                  79,
+                  47,
+                  33,
+                  36,
+                  82,
+                  41,
+                  65,
+                  52,
+                  39
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 12,
+                "seq": 344,
+                "steps": 92,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  36,
+                  38,
+                  53,
+                  34,
+                  29,
+                  46,
+                  47,
+                  88,
+                  31,
+                  57,
+                  70,
+                  58
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 12,
+                "seq": 354,
+                "steps": 108,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  43,
+                  42,
+                  43,
+                  48,
+                  49,
+                  23,
+                  34,
+                  92,
+                  37,
+                  48,
+                  52,
+                  106
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 363,
+                "steps": 76,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  56,
+                  67,
+                  30,
+                  20,
+                  30,
+                  46,
+                  40,
+                  69,
+                  61,
+                  75,
+                  72
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 368,
+                "steps": 108,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  106,
+                  35,
+                  43,
+                  60,
+                  47,
+                  83,
+                  66,
+                  88,
+                  40,
+                  72,
+                  28
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 382,
+                "steps": 116,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  204,
+                  224,
+                  228,
+                  236
+                ],
+                "lengths": [
+                  28,
+                  82,
+                  52,
+                  48,
+                  78,
+                  100,
+                  29,
+                  91,
+                  112,
+                  113,
+                  87
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 449,
+                "steps": 240,
+                "caps": [
+                  256,
+                  284,
+                  292,
+                  300,
+                  312,
+                  348,
+                  392,
+                  392,
+                  404,
+                  456,
+                  496
+                ],
+                "lengths": [
+                  109,
+                  115,
+                  144,
+                  140,
+                  175,
+                  176,
+                  208,
+                  189,
+                  172,
+                  186,
+                  237
+                ],
+                "attempt": 0
+              }
+            ]
+          },
+          "mux": {
+            "read_s": 0.018,
+            "stretch_s": 3.2493,
+            "write_s": 0.1063,
+            "n_stretch_calls": 95
+          },
+          "output": {
+            "srt_s": 0.0003,
+            "ffprobe_s": 0.0329,
+            "ffmpeg_s": 5.597
+          }
+        },
+        "gpu": {
+          "source": "nvml",
+          "device": "NVIDIA GeForce RTX 3090",
+          "power_limit_w": 350.0,
+          "power_limit_default_w": 350.0,
+          "power_limit_is_stock": true,
+          "samples": 67,
+          "interval_s": 1.0,
+          "throttle_reasons": {
+            "sw_power_cap": 29
+          },
+          "throttled": false,
+          "at_power_ceiling_samples": 29,
+          "thermal_slowdown": false,
+          "capped_below_stock": false,
+          "idle_pct": 28.4,
+          "power_w": {
+            "avg": 211.3,
+            "min": 36.3,
+            "max": 349.7
+          },
+          "sm_mhz": {
+            "avg": 1481.4,
+            "min": 210.0,
+            "max": 1935.0
+          },
+          "mem_mhz": {
+            "avg": 7760.0,
+            "min": 405.0,
+            "max": 9501.0
+          },
+          "temp_c": {
+            "avg": 63.8,
+            "min": 53.0,
+            "max": 75.0
+          },
+          "util_pct": {
+            "avg": 50.3,
+            "min": 0.0,
+            "max": 99.0
+          },
+          "mem_util_pct": {
+            "avg": 26.5,
+            "min": 0.0,
+            "max": 67.0
+          },
+          "mem_used_mb": {
+            "avg": 17797.6,
+            "min": 16755.3,
+            "max": 18952.0
+          }
+        },
+        "peak_vram_gb": 16.71,
+        "peak_vram_reserved_gb": 17.12,
+        "vram_free_gb": 7.56,
+        "peak_rss_gb": 2.88,
+        "rss_scope": "repeat",
+        "peak_rss_process_gb": 8.79
+      },
+      "profile": "cuda",
+      "warm_cache": true,
+      "warm": true,
+      "build_total_s": 0.0
+    },
+    {
+      "clip": "samples/sample_1.mkv",
+      "mode": "batch",
+      "label": "after",
+      "repeat_index": 2,
+      "job_id": "20260902-234938-sample_1",
+      "source_s": 301.11,
+      "total_wall_s": 63.39,
+      "agg_rtf": 0.211,
+      "stages": [
+        {
+          "name": "ingest",
+          "state": "done",
+          "wall_s": 0.41,
+          "build_s": 0.0,
+          "rtf": 0.001,
+          "pct": 0.6
+        },
+        {
+          "name": "separate",
+          "state": "done",
+          "wall_s": 8.61,
+          "build_s": 0.0,
+          "rtf": 0.029,
+          "pct": 13.6
+        },
+        {
+          "name": "diarize",
+          "state": "done",
+          "wall_s": 1.28,
+          "build_s": 0.0,
+          "rtf": 0.004,
+          "pct": 2.0
+        },
+        {
+          "name": "emotion",
+          "state": "done",
+          "wall_s": 1.56,
+          "build_s": 0.0,
+          "rtf": 0.005,
+          "pct": 2.5
+        },
+        {
+          "name": "asr",
+          "state": "done",
+          "wall_s": 11.63,
+          "build_s": 0.0,
+          "rtf": 0.039,
+          "pct": 18.3
+        },
+        {
+          "name": "translate",
+          "state": "done",
+          "wall_s": 8.03,
+          "build_s": 0.0,
+          "rtf": 0.027,
+          "pct": 12.7
+        },
+        {
+          "name": "tts",
+          "state": "done",
+          "wall_s": 22.32,
+          "build_s": 0.0,
+          "rtf": 0.074,
+          "pct": 35.2
+        },
+        {
+          "name": "mux",
+          "state": "done",
+          "wall_s": 4.15,
+          "build_s": 0.0,
+          "rtf": 0.014,
+          "pct": 6.5
+        },
+        {
+          "name": "output",
+          "state": "done",
+          "wall_s": 5.42,
+          "build_s": 0.0,
+          "rtf": 0.018,
+          "pct": 8.6
+        }
+      ],
+      "sentence_count": 78,
+      "tts": {
+        "unit": "chunk",
+        "count": 7,
+        "total_s": 21.81,
+        "mean_s": 3.116,
+        "median_s": 2.795,
+        "p90_s": 3.382,
+        "max_s": 5.086,
+        "audio_s": 215.84,
+        "tts_rtf": 0.101,
+        "chunks": 7,
+        "chunk_sentences": 78,
+        "sentences_per_chunk": 11.14,
+        "engine": "higgs_v3_torch_bfloat16",
+        "sentences": 78,
+        "overflows": 0
+      },
+      "translate": {
+        "unit": "sentence",
+        "count": 78,
+        "total_s": 89.86,
+        "mean_ms": 1152.0,
+        "median_ms": 1127.5,
+        "p90_ms": 1456.8,
+        "max_ms": 1629.6
+      },
+      "models": {
+        "ingest": "ffmpeg",
+        "separate": "htdemucs_vocals",
+        "diarize": "sortformer_nemo",
+        "emotion": "emotion2vec_plus_base",
+        "asr": "qwen3_asr_1_7b",
+        "translate": "openrouter_gemini_flash",
+        "tts": "higgs_v3_torch_bf16",
+        "mux": "ffmpeg_pad_stretch",
+        "output": "mkv_default"
+      },
+      "sections": null,
+      "notes": {
+        "build_pct_of_wall": 0.0,
+        "real_wall_s": 65.45,
+        "other_s": 2.06,
+        "agg_rtf_real": 0.217,
+        "cpu_s": {
+          "user": 53.41,
+          "sys": 4.6,
+          "children_user": 9.61,
+          "children_sys": 1.82,
+          "total": 69.45
+        },
+        "probes": {
+          "separate": {
+            "extract_s": 0.3609,
+            "model_s": 5.4631,
+            "vad_load_s": 0.0291,
+            "vad_infer_s": 1.3784,
+            "stem_write_s": 0.2271,
+            "vad_s": 2.2233,
+            "n_vad_intervals": 42
+          },
+          "emotion": {
+            "read_s": 0.0493,
+            "resample_s": 0.1046,
+            "infer_s": 0.9923,
+            "pick_refs_s": 0.2514,
+            "n_turns": 110,
+            "n_scored": 101
+          },
+          "asr": {
+            "probe_s": 0.7465,
+            "generate_s": 10.1363,
+            "align_s": 0.4824,
+            "tag_s": 0.0155,
+            "n_chunks": 13,
+            "n_generate_batches": 2,
+            "n_align_batches": 2,
+            "n_sentences": 78
+          },
+          "tts": {
+            "graph_capture_s": 5.0138,
+            "prefill_s": 5.0141,
+            "decode_s": 15.66,
+            "codec_s": 1.0406,
+            "steps": 880,
+            "chunks": 7,
+            "live_row_steps": 5942,
+            "total_row_steps": 9788,
+            "values": {
+              "cuda_graphs": true,
+              "ms_per_step_decode": 17.8,
+              "live_row_fraction": 0.607,
+              "attn_impl": "sdpa",
+              "attn_impl_decode": "patmir_gqa_decode",
+              "max_batch": 12,
+              "dtype": "bfloat16",
+              "device": "cuda"
+            },
+            "details": [
+              {
+                "B": 12,
+                "seq": 304,
+                "steps": 108,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  24,
+                  43,
+                  52,
+                  68,
+                  50,
+                  34,
+                  36,
+                  105,
+                  38,
+                  70,
+                  42,
+                  57
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 279,
+                "steps": 108,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  42,
+                  60,
+                  36,
+                  35,
+                  57,
+                  52,
+                  104,
+                  34,
+                  54,
+                  62,
+                  53
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 292,
+                "steps": 124,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  48,
+                  47,
+                  50,
+                  47,
+                  56,
+                  54,
+                  35,
+                  120,
+                  41,
+                  58,
+                  22
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 310,
+                "steps": 100,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  17,
+                  36,
+                  42,
+                  31,
+                  96,
+                  53,
+                  71,
+                  89,
+                  88,
+                  37,
+                  38
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 311,
+                "steps": 88,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  55,
+                  40,
+                  77,
+                  67,
+                  70,
+                  45,
+                  75,
+                  37,
+                  34,
+                  28,
+                  84
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 327,
+                "steps": 136,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  204,
+                  204,
+                  224,
+                  236,
+                  244,
+                  252
+                ],
+                "lengths": [
+                  91,
+                  39,
+                  78,
+                  89,
+                  50,
+                  98,
+                  106,
+                  108,
+                  133,
+                  118,
+                  126
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 11,
+                "seq": 388,
+                "steps": 216,
+                "caps": [
+                  284,
+                  288,
+                  304,
+                  336,
+                  364,
+                  372,
+                  392,
+                  392,
+                  404,
+                  456,
+                  480
+                ],
+                "lengths": [
+                  123,
+                  175,
+                  141,
+                  174,
+                  144,
+                  171,
+                  196,
+                  200,
+                  177,
+                  197,
+                  212
+                ],
+                "attempt": 0
+              }
+            ]
+          },
+          "mux": {
+            "read_s": 0.018,
+            "stretch_s": 3.5064,
+            "write_s": 0.102,
+            "n_stretch_calls": 96
+          },
+          "output": {
+            "srt_s": 0.0003,
+            "ffprobe_s": 0.0309,
+            "ffmpeg_s": 5.3895
+          }
+        },
+        "gpu": {
+          "source": "nvml",
+          "device": "NVIDIA GeForce RTX 3090",
+          "power_limit_w": 350.0,
+          "power_limit_default_w": 350.0,
+          "power_limit_is_stock": true,
+          "samples": 65,
+          "interval_s": 1.0,
+          "throttle_reasons": {
+            "sw_power_cap": 31
+          },
+          "throttled": false,
+          "at_power_ceiling_samples": 31,
+          "thermal_slowdown": false,
+          "capped_below_stock": false,
+          "idle_pct": 30.8,
+          "power_w": {
+            "avg": 214.5,
+            "min": 37.7,
+            "max": 349.1
+          },
+          "sm_mhz": {
+            "avg": 1423.4,
+            "min": 210.0,
+            "max": 1950.0
+          },
+          "mem_mhz": {
+            "avg": 7425.0,
+            "min": 405.0,
+            "max": 9501.0
+          },
+          "temp_c": {
+            "avg": 67.8,
+            "min": 56.0,
+            "max": 78.0
+          },
+          "util_pct": {
+            "avg": 50.6,
+            "min": 0.0,
+            "max": 98.0
+          },
+          "mem_util_pct": {
+            "avg": 27.2,
+            "min": 0.0,
+            "max": 68.0
+          },
+          "mem_used_mb": {
+            "avg": 17811.0,
+            "min": 16895.3,
+            "max": 19065.3
+          }
+        },
+        "peak_vram_gb": 16.59,
+        "peak_vram_reserved_gb": 17.21,
+        "vram_free_gb": 7.42,
+        "peak_rss_gb": 3.15,
+        "rss_scope": "repeat",
+        "peak_rss_process_gb": 8.79
+      },
+      "profile": "cuda",
+      "warm_cache": true,
+      "warm": true,
+      "build_total_s": 0.0
+    }
+  ]
+}

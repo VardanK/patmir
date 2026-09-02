@@ -186,6 +186,12 @@ If it refuses to build at all, the pipeline still runs: flip the profile's `diar
 echo 'export HF_HOME=$HOME/.cache/huggingface' >> ~/.bashrc
 ```
 
+**This is done, and it mattered more than expected.** With `HF_HOME` on the 9p
+Windows mount, cold model builds cost **154 s** and `performance.md` attributed
+53 % of a cold run to them. On the ext4 virtual disk the same builds cost
+**22-26 s**. Any cold-start figure in the docs older than 2026-09-01 was
+measured across the slow mount.
+
 The test suite locates the model cache through `HF_HUB_CACHE` / `HF_HOME` too, so a cache on another
 drive is fine — but if those are unset in the shell running `pytest`, the eight batched-decode
 equivalence tests skip rather than fail, and the summary still looks green. Check for `s` characters
@@ -484,7 +490,26 @@ to `.wslconfig` and `wsl --shutdown`.
 
 ## GPU power limit
 
-**Set it on the Windows side, not in WSL.** The GPU is owned by the Windows driver and WSL only gets
+**Current state (2026-09-02): the card runs at its stock 350 W and is NOT
+limited.** The cooling was fixed and the 80 % mitigation below was removed.
+This section is kept because it describes how to re-apply one, and because the
+history matters: every CUDA figure in `performance.md` before 2026-09-02 was
+measured under that limit while nothing in the repo recorded it, and the bench
+captured no power or thermal state, so a throttled run could not be told from a
+clean one. `patmir bench` now samples power, clocks, temperature and throttle
+reasons every second (`patmir/telemetry.py`) and distinguishes a card at its
+own stock ceiling — normal under load — from one capped below it, which makes a
+run incomparable.
+
+What removing the limit was worth, measured: **warm batch agg RTF 0.393 ->
+0.377, about 4 %**, inside the run-to-run spread and exactly what the last
+paragraph of this section predicted. Two of three repeats still logged **one
+second each** of thermal slowdown at 80-81 C core, which is a transient rather
+than sustained throttling but is the first thermal number this repo has had.
+Worth re-checking on a feature-length dub, which runs 10-20x longer at the same
+duty cycle.
+
+**If you do re-apply one: set it on the Windows side, not in WSL.** The GPU is owned by the Windows driver and WSL only gets
 a stub (`libcuda.so` is stubbed in, and `nvidia-smi` lives at `/usr/lib/wsl/lib/nvidia-smi`).
 NVIDIA's CUDA-on-WSL guide states that "modifiable state features (ECC, Compute mode, Persistence
 mode) will not be supported" — it does not name the power limit specifically, but that is the

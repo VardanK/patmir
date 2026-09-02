@@ -28,6 +28,8 @@ The runs root defaults to `runs/` next to `patmir.toml` and is set by `[storage]
 | `mux_placements.json` | mux      | Where each synthesized line was actually placed — the record to read when a line sounds early, late, rippled by `voice_no_overlap`, or compressed by `voice_max_compress`. |
 | `out.mkv`             | output   | Final MKV — Armenian default audio, original retained as secondary, Armenian SRT as default subtitle track. |
 | `out.hy.srt`          | output   | Standalone subtitle file (also muxed into `out.mkv`).                                    |
+| `<stage>/bench_probe.json` | any | **Benchmark only** (2026-09-02). Intra-stage timing: where a stage's own wall went, which the manifest cannot say. Written by any stage with spans, plus the runner's own post-stage work (`pick_refs_s` under emotion, `tag_s` under asr). Spans and counters sit at the top level and ADD across a stream's sections; non-additive identities and derived ratios live under `values` — summing those is what once reported a `max_batch` of 88. Absent unless the job ran under `patmir bench`, where the probe syncs the device on each span edge; disabled it is a no-op. See `patmir/pipeline/probe.py`. |
+| `tts/trace_tts.json`  | tts      | **Benchmark only, opt-in** (`patmir bench --tts-trace`). A `torch.profiler` chrome trace of the FIRST decode chunk. One chunk only: a whole-job trace runs to hundreds of MB and every chunk runs the same loop. |
 
 ## Published deliverables (`[storage].library_root`)
 
