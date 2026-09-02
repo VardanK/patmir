@@ -193,19 +193,25 @@ def _resource_peaks(sampler: GpuSampler | None = None) -> dict[str, Any]:
             out["vram_free_gb"] = round(free_b / 1024 ** 3, 2)
     except Exception:
         pass
+    process_rss = None
+    try:
+        import sys
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is KiB on Linux, bytes on Darwin.
+        unit = 1024 ** 3 if sys.platform == "darwin" else 1024 ** 2
+        process_rss = round(maxrss / unit, 2)
+    except Exception:
+        pass
     if sampler is not None and sampler.peak_rss_gb is not None:
         out["peak_rss_gb"] = sampler.peak_rss_gb
         out["rss_scope"] = "repeat"
-    else:
-        try:
-            import sys
-            maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            # ru_maxrss is KiB on Linux, bytes on Darwin.
-            unit = 1024 ** 3 if sys.platform == "darwin" else 1024 ** 2
-            out["peak_rss_gb"] = round(maxrss / unit, 2)
-            out["rss_scope"] = "process"
-        except Exception:
-            pass
+        # A 1 Hz sampler can miss a transient allocation spike; ru_maxrss
+        # cannot. Publish both rather than choosing.
+        if process_rss is not None:
+            out["peak_rss_process_gb"] = process_rss
+    elif process_rss is not None:
+        out["peak_rss_gb"] = process_rss
+        out["rss_scope"] = "process"
     return out
 
 
@@ -672,11 +678,38 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                     return None
                 return _one(start, max_end)
 
+            def _idle() -> bool:
+                """When is a BENCHMARK of the stream over?
+
+                The live server answers this with `alive_fn`: the run ends when
+                the browser stops asking for sections. A synthetic viewer never
+                leaves, and `BenchPlayhead` refreshes `updated_at` on every call
+                to keep the abandon timer fed — so with neither hook passed,
+                `_default_idle` returned True forever and the scheduler idled in
+                a 2 s loop once coverage was complete. **`patmir bench --mode
+                watch-along` therefore never terminated under its own default
+                driver**, which is why every stored watch-along baseline was
+                taken with `--forward-loop`.
+
+                A benchmark is done when nothing in the video is left to dub.
+                Asking coverage, rather than treating `_next_start`'s None as
+                the end, is load-bearing: under `--playhead realtime` that None
+                also means "buffered more than `lookahead_seconds` ahead of the
+                viewer", where the right move is to keep waiting for the
+                playhead to advance.
+                """
+                if sched.coverage.first_uncovered(0.0, until=duration - 1.0) is None:
+                    return False
+                # Poll faster than the live 2 s: a benchmark has no viewer to
+                # be gentle with, and the wait is pure wall time in the result.
+                return not sched.stopped() and not sched._stop.wait(0.25)
+
             sched = StreamScheduler(
                 duration=duration,
                 prelude_end=prelude.window_end,
                 process_fn=_process,
                 playhead_fn=ph,
+                idle_fn=_idle,
             )
             ph.coverage = sched.coverage
             sched.run()
@@ -834,7 +867,10 @@ def _summary_line(results: list[BenchResult]) -> list[str]:
                    f"{peaks.get('peak_vram_reserved_gb')} GB reserved "
                    f"(free {peaks.get('vram_free_gb')} GB)")
     if peaks.get("peak_rss_gb") is not None:
-        mem.append(f"peak RSS {peaks['peak_rss_gb']} GB (process lifetime)")
+        scope = peaks.get("rss_scope", "process")
+        mem.append(f"peak RSS {peaks['peak_rss_gb']} GB ({scope})")
+    if peaks.get("peak_rss_process_gb") is not None:
+        mem.append(f"process-lifetime RSS {peaks['peak_rss_process_gb']} GB")
     if mem:
         out.append(f"--- {' · '.join(mem)}")
     return out
@@ -887,8 +923,14 @@ def _gpu_lines(res: BenchResult) -> list[str]:
                    f"of {g.get('power_limit_default_w')}W. Not comparable with a "
                    f"stock-limit run.")
     if g.get("thermal_slowdown"):
-        out.append(f"  gpu: THERMAL SLOWDOWN in {n} samples — the card was hot "
-                   f"enough to drop clocks.")
+        # Print the REASON's count, not the sample total. The first version of
+        # this line said "in {n} samples" and so reported a single 1-second
+        # transient as if the whole run had been thermally limited.
+        hits = sum(v for k, v in (g.get("throttle_reasons") or {}).items()
+                   if k.endswith("thermal_slowdown"))
+        out.append(f"  gpu: THERMAL SLOWDOWN in {hits}/{n} samples "
+                   f"(max {g.get('temp_c', {}).get('max')}C) — the card dropped "
+                   f"clocks to protect itself.")
     ceiling = g.get("at_power_ceiling_samples") or 0
     if ceiling:
         # Not a defect: a 350 W card under a bandwidth-bound decode is meant to

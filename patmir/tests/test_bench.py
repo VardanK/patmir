@@ -562,9 +562,22 @@ class GpuAndProbeReportingTest(unittest.TestCase):
         out = format_report([self._res({
             "gpu": {"samples": 100, "throttled": True, "thermal_slowdown": True,
                     "power_limit_w": 350.0, "capped_below_stock": False,
+                    "temp_c": {"max": 84.0},
                     "throttle_reasons": {"sw_thermal_slowdown": 7},
                     "at_power_ceiling_samples": 0}})])
         self.assertIn("THERMAL SLOWDOWN", out)
+        # The count must be the REASON's, not the sample total: the first cut
+        # of this line rendered a single 1-second transient as though the whole
+        # run had been thermally limited.
+        self.assertIn("7/100 samples", out)
+        self.assertIn("84.0C", out)
+
+    def test_sampled_and_process_rss_are_both_reported(self):
+        out = format_report([self._res({
+            "peak_rss_gb": 3.9, "rss_scope": "repeat",
+            "peak_rss_process_gb": 10.6})])
+        self.assertIn("peak RSS 3.9 GB (repeat)", out)
+        self.assertIn("process-lifetime RSS 10.6 GB", out)
 
     def test_probe_prints_under_its_stage_row(self):
         out = format_report([self._res({
