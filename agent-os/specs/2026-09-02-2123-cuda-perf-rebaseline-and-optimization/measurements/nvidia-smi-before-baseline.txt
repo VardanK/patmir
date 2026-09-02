@@ -1,0 +1,67 @@
+name, power.limit [W], power.default_limit [W], enforced.power.limit [W], temperature.gpu, memory.used [MiB]
+NVIDIA GeForce RTX 3090, 350.00 W, 350.00 W, 350.00 W, 39, 791 MiB
+
+
+==============NVSMI LOG==============
+
+Timestamp                                              : Wed Sep  2 22:15:46 2026
+Driver Version                                         : 616.56 [Deprecated; will be removed in CUDA 14.0. Use KMD Version instead]
+CUDA Version                                           : 13.4 [Deprecated; will be removed in CUDA 14.0. Use CUDA UMD Version instead]
+KMD Version                                            : 616.56
+CUDA UMD Version                                       : 13.4
+
+Attached GPUs                                          : 1
+GPU 00000000:01:00.0
+    Performance State                                  : P8
+    Clocks Event Reasons
+        Idle                                           : Active
+        Applications Clocks Setting                    : Not Active
+        SW Power Cap                                   : Not Active
+        HW Slowdown                                    : Not Active
+            HW Thermal Slowdown                        : Not Active
+            HW Power Brake Slowdown                    : Not Active
+        Sync Boost                                     : Not Active
+        SW Thermal Slowdown                            : Not Active
+        Display Clock Setting                          : Not Active
+        Board Limit                                    : Not Active
+        Reliability                                    : Not Active
+    Clocks Event Reasons Counters
+        SW Power Capping                               : 633722804 us
+        Sync Boost                                     : 0 us
+        SW Thermal Slowdown                            : 203195177 us
+        HW Thermal Slowdown                            : 0 us
+        HW Power Braking                               : 0 us
+    Sparse Operation Mode                              : N/A
+    GPU Power Readings
+        Average Power Draw                             : 30.48 W
+        Instantaneous Power Draw                       : 31.01 W
+        GPU Ceiling Power Limit
+            Current Power Limit                        : 350.00 W
+            Requested Power Limit                      : 350.00 W
+            Default Power Limit                        : 350.00 W
+        GPU Base Power
+            Current Base Power                         : N/A
+            Requested Base Power                       : N/A
+            Default Base Power                         : N/A
+            Adaptive TGP Adjusted Base Power           : N/A
+        Min Power Limit                                : 100.00 W
+        Max Power Limit                                : 350.00 W
+    Power Samples
+        Duration                                       : 11.53 sec
+        Number of Samples                              : 119
+        Max                                            : 33.43 W
+        Min                                            : 30.12 W
+        Avg                                            : 30.84 W
+    GPU Memory Power Readings 
+        Average Power Draw                             : N/A
+        Instantaneous Power Draw                       : N/A
+    Module Power Readings
+        Average Power Draw                             : N/A
+        Instantaneous Power Draw                       : N/A
+        Current Power Limit                            : N/A
+        Requested Power Limit                          : N/A
+        Default Power Limit                            : N/A
+        Min Power Limit                                : N/A
+        Max Power Limit                                : N/A
+    EDPp Multiplier                                    : N/A
+

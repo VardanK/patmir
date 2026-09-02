@@ -479,6 +479,31 @@ top_p         = 0.95
 seed          = 0
 max_retries   = 2
 max_batch     = 8
+# Grouped-query kernel for the single-token decode step (2026-09-02). Skips
+# transformers' `repeat_kv`, which expands 8 KV heads to 32 on every layer of
+# every step because `use_gqa_in_sdpa` is False whenever an attention mask is
+# present. With the CUDA graph it takes the step 27.15 -> 17.33 ms and the
+# pipeline to agg RTF 0.277. Prefill still runs transformers' own sdpa kernel.
+#
+# **Set here rather than defaulted in code because it changes the audio.** The
+# reduction order differs, so at temperature 0.8 draws flip and all 80 lines of
+# the reference clip re-roll (durations move up to 1.24 s; total speech within
+# 1.4%; reproducible run to run). `ui.cache.config_hash` hashes this entry, so
+# having it here correctly invalidates cached dubs — the alternative would let
+# one cache key hold either rendering. Enabling it re-dubs every cached video
+# once, the same price the audience guardrail paid on 2026-08-28.
+#
+# Author ear-test 2026-09-02 on `runs/20260902-230429-sample_1`: "sounds a
+# little better" than the sdpa rendering. Read as neutral-to-positive rather
+# than as an improvement — issue #19 measured this TTS's draws spreading
+# 2.4-27.9 dB on identical input, so one sample cannot establish a direction.
+# What it does establish is that the faster kernel is not worse. Revert by
+# setting "sdpa".
+decode_attention = "gqa"
+# CUDA graph capture of the decode step is on by default in code and NOT a key
+# here on purpose: it is bitwise identical (verified md5-for-md5 on 80 WAVs),
+# so it must not perturb the cache key. Disable for debugging with
+# PATMIR_TTS_CUDA_GRAPHS=0.
 
 [[eval.tts.candidates]]
 id            = "omnivoice_mlx_bf16"
