@@ -841,8 +841,12 @@ def _summary_line(results: list[BenchResult]) -> list[str]:
     """Cold and warm summarized separately — averaging them is the mistake this
     whole change exists to prevent."""
     batch = [r for r in results if r.mode == "batch"]
-    if len(batch) < 2:
+    if not batch:
         return []
+    # The cold/warm comparison needs two repeats, but the MEMORY line does not —
+    # and it was gated behind the same check, so a `--repeat 1` run reported no
+    # VRAM at all. Headroom is a decision input for the `max_batch` sweep, so a
+    # single repeat has to show it.
     cold = [r for r in batch if not r.warm]
     warm = [r for r in batch if r.warm]
     parts: list[str] = []
@@ -859,7 +863,7 @@ def _summary_line(results: list[BenchResult]) -> list[str]:
             if rtfs else
             f"{name} {which}: wall {statistics.mean(walls):.2f}s (build {statistics.mean(builds):.2f}s)"
         )
-    out = [""] + [f"--- {' | '.join(parts)}"] if parts else []
+    out = [""] + [f"--- {' | '.join(parts)}"] if (parts and len(batch) > 1) else []
     peaks = batch[-1].notes
     mem = []
     if peaks.get("peak_vram_gb") is not None:
