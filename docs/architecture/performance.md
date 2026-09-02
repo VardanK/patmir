@@ -47,38 +47,106 @@ stock**. Peak VRAM 16.7 GB of 24.
 
 ### Watch-along at 350 W
 
-Measured 2026-09-02 **before** the batch optimizations landed, with
-`--prewarm` and the real `StreamScheduler`:
+Greedy playhead, `--prewarm`, real `StreamScheduler`, before and after the same
+optimizations (the streaming path shares every one of them):
 
-| | greedy playhead | realtime playhead |
+| | 350 W baseline | **after** |
 | --- | ---: | ---: |
-| agg RTF (per dubbed second) | **0.623** | 0.725 |
-| agg RTF (per source second) | 0.683 | 0.795 |
-| time to first audio | 27.8 s | 38.9 s |
-| **stalls** | 0 (cannot stall by construction) | **0** |
+| agg RTF (per dubbed second) | 0.623 | **0.511** |
+| wall | 205.8 s | **153.9 s** |
+| time to first audio | 27.8 s | **23.0 s** |
+| worst single section | **1.053** | **0.676** |
+| stalls | 0 | 0 |
 
-The realtime row is the first stall measurement ever taken on this box: a
-viewer advancing with the clock never outran production, though two of ten
-sections individually exceeded realtime (1.416, 1.011) and were absorbed by the
-buffer.
+| stage | before | after |
+| --- | ---: | ---: |
+| tts | 81.4 s | **32.4 s** |
+| **translate** | 46.6 s | **44.2 s** |
+| asr | 29.1 s | 27.8 s |
+| separate | 10.9 s | 10.6 s |
+| `other_s` | 21.0 s | 20.9 s |
 
-**Not comparable with the 2026-09-01 watch-along row** further down without
-care: that run had no `--prewarm` and used `--forward-loop` (it had to — the
-scheduler driver could not terminate), so its 45.4 s to first audio describes a
-different configuration, not a slower version of this one.
+**No section exceeds realtime any more** — the worst fell from 1.053 to 0.676,
+so the buffer grows monotonically instead of being clawed back on two sections
+of ten.
 
-Translate is **23 % of watch-along wall**, and NOT for the reason first
-recorded here: sections carry 3-16 sentences against `chunk_size = 20`, so each
-is a single chunk making one call. There is no serial chunk walk to
-parallelize, and chunk concurrency would buy nothing. The remaining lever is
-overlapping a section's translate with the previous section's TTS —
-cross-stage pipelining, not built.
+**Translate is now the largest watch-along stage, at 29 % of wall**, and it
+barely moved (46.6 -> 44.2 s). That is expected and was checked rather than
+assumed: sections carry 3-16 sentences against `chunk_size = 20`, so **each
+section is a single chunk making exactly one call**. There is no serial chunk
+walk to parallelize and raising concurrency cannot help — the cost is one
+structured cloud round-trip per section, 1.9-3.8 s each. The remaining lever is
+overlapping a section's translate with the previous section's TTS, i.e.
+cross-stage pipelining, which this work excluded.
 
-> **A post-optimization watch-along re-measure is in flight and not in this
-> table yet.** The rows above predate the decode graph, the gqa kernel,
-> `max_batch = 12`, the ASR probe and the emotion batching, all of which the
-> streaming path also uses. Expect them to improve; the numbers will be
-> replaced rather than argued about.
+ASR also barely moved (29.1 -> 27.8 s) for a related reason: sections already
+receive `source_lang` from the prelude, so only the prelude ever paid the
+language probe. The 4 s saving is a batch-mode win.
+
+`other_s` is unchanged at ~2.3 s per section — the ffmpeg slice/trim, ECAPA
+embed and age/gender profile that no stage owns. It is now 14 % of watch-along
+wall and nothing in this work touched it.
+
+**Not comparable with the 2026-09-01 watch-along row** further down: that run
+had no `--prewarm` and used `--forward-loop` (it had to — the scheduler driver
+could not terminate), so its 45.4 s to first audio describes a different
+configuration rather than a slower version of this one.
+
+### Realtime playhead — a viewer advancing with the clock
+
+| | 350 W baseline | **after** |
+| --- | ---: | ---: |
+| agg RTF | 0.725 | **0.484** |
+| wall | 239.3 s | **145.7 s** |
+| time to first audio | 38.9 s | **22.2 s** |
+| worst single section | 1.416 | **0.635** |
+| **stalls** | 0 | **0** |
+
+**0 stalls in both**, and this is the measurement that matters for watch-along:
+it is the only driver whose synthetic viewer advances with the wall clock and
+can therefore outrun production. It had never been run on this box before
+2026-09-02 — the greedy driver cannot stall by construction, and the
+`--forward-loop` driver every stored baseline used cannot either.
+
+Before, two sections of ten individually exceeded realtime (1.416, 1.011) and
+the buffer had to claw the time back. Now the worst is 0.635, so the buffer
+grows monotonically.
+
+### Why translate dominates watch-along, measured
+
+Per-section translate calls in the after run, one call per section:
+
+| sentences | 4 | 5 | 6 | 9 | 9 | 9 | 12 | 12 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| seconds | 1.75 | 2.23 | 1.89 | 2.96 | **12.20** | **13.34** | 3.62 | **10.83** | 4.06 |
+
+**Three of nine calls account for 36 of the 44 s.** All 43 API responses in that
+run were HTTP 200 on the first attempt, so this is neither the retry logic
+added the same day nor rate limiting — it is provider-side latency on the
+JSON-schema-constrained decode. The per-sentence path shows nothing like it:
+p90 1.46 s, max 1.63 s over 78 calls.
+
+Three compounding causes:
+
+1. **No parallelism.** Batch mode fires 78 calls 12-at-a-time, compressing
+   89.9 s of latency into 8.0 s of wall (11.2x). Watch-along makes one call per
+   section and sections are serial, so there is nothing to overlap.
+2. **One call writes everything.** Output tokens scale with the section's
+   sentence count, and generation is token-bound.
+3. **That call's latency is erratic**, per the table.
+
+**An option that inverts an old decision.** `streaming_config()` selects the
+batched translator because, when the per-sentence path was *serial*, batching
+was faster — that is what its docstring says. It no longer holds: per-sentence
+now runs at concurrency 12, and a section has 4-16 sentences, so all of them fit
+inside one round-trip of wall (~1.2-1.6 s) against 2-13 s for one batched call.
+Estimated **44 s -> ~15 s, ~19 % of watch-along wall.**
+
+Not done, because it is a real trade rather than a free win: the batched
+candidate exists so the model sees a whole scene at once plus the previous
+chunk's translations, which is what keeps character register and pronouns
+consistent across a section. Switching buys latency with scene coherence and
+wants an ear verdict.
 
 ### Where the TTS time went, and the two things worth remembering
 

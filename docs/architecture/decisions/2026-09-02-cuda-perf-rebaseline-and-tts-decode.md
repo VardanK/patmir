@@ -145,17 +145,114 @@ A benchmark is now over when nothing in the video is left to dub, asked of
 realtime` that None also means "buffered far ahead of the viewer", where
 waiting is correct.
 
+### 8. Three more stages, and two plan items dropped on measurement
+
+**ASR language probe: 4.63 s -> 0.71 s.** It was a full transcription of the
+longest chunk — up to 28 s at `max_new_tokens=256` — whose text was discarded;
+only the language tag was read. The model emits `language <LANG><asr_text>...`,
+so the tag precedes the transcription: 8 s of audio and a 24-token budget
+suffice. The probe **validates** rather than assumes, because a truncated
+output parses to `language: None` and would have fallen through to "en",
+mislabelling a Russian soundtrack; a missing tag costs one full-length call
+instead. This is a batch-mode win only — watch-along sections already receive
+`source_lang` from the prelude, so only the prelude ever paid it.
+
+**Translate concurrency 6 -> 12: 16.53 s -> 8.22 s**, per-call latency
+unchanged at ~1197 ms so nothing was rate limited. Plus bounded retry on both
+candidates: any non-200 previously raised out of the adapter's thread pool and
+failed the whole stage, discarding every sentence already translated, for one
+429.
+
+**Emotion batched: 0.65 s -> 0.22 s on 24 real turns, 24/24 labels and
+confidences identical.** The equivalence is structural, not lucky: funasr still
+runs each clip at batch_size 1 internally, so no padding enters the pooled
+utterance embedding. Padding would have shifted scores, which feed the TTS
+emotion tag and therefore the audio — the stage would have got faster while
+quietly re-labelling emotions.
+
+**Two plan items dropped because the probes contradicted their estimates.**
+Caching Silero and skipping the unread `non_speech_vocals` write were budgeted
+at 1-2 s; they measure 0.03 s and 0.20 s. And gating the per-stage accelerator
+free was budgeted against inter-stage overhead that turned out to be 1.9 s,
+1.7 % of wall. None justifies a behaviour change.
+
+**One plan item dropped because its reasoning did not survive checking.** The
+plan expected pointing watch-along's `separate` at `htdemucs_vocals` to cut the
+section wall, citing vocals-only's 3.6x. But that 3.6x was against the
+four-model `htdemucs_ft` **bag**; streaming already runs `htdemucs_fast`, a
+single network, and the specialist is also a single network — per second of
+audio they measure the same (0.026 vs 0.028 s/s). The swap stays defensible on
+quality and VRAM, which is a different argument needing its own ear-test.
+
+### 9. Scheduling knobs must not move the cache key
+
+`config_hash` hashed every key of a candidate entry, on the sound reasoning that
+model ids, voices, dtypes and sampling knobs all change output. But
+`concurrency`, `max_attempts`, `retry_backoff_s` and `cuda_graphs` cannot change
+a single sample, and making them tunable means putting them in `patmir.toml` —
+which would have re-dubbed a finished library for a change that alters nothing.
+They are now excluded, with the bar stated in the code: it must be impossible
+for the knob to change one sample. `decode_attention` is named there as the near
+miss that stays in the key.
+
+### 10. What translate costs watch-along, and an old decision that inverted
+
+Watch-along translate is **44.2 s of a 153.9 s wall (29 %) — now the largest
+stage in that mode**, and it barely moved when concurrency was raised. Measured
+per-section, one call each: 1.75 / 1.89 / 2.23 / 2.96 / 3.62 / 4.06 s, then
+**10.83 / 12.20 / 13.34**. Three of nine calls are 36 of the 44 s. All 43 API
+responses were HTTP 200 first try, so this is neither the new retry logic nor
+rate limiting but provider-side latency on the JSON-schema-constrained decode;
+the per-sentence path over 78 calls has p90 1.46 s and max 1.63 s.
+
+`streaming_config()` selects the batched translator because, when the
+per-sentence path was **serial**, batching was faster. That is no longer true:
+per-sentence runs at concurrency 12 and a section holds 4-16 sentences, so all
+of them fit in one round-trip's wall against 2-13 s for one batched call —
+an estimated 44 s -> ~15 s, ~19 % of watch-along wall. Deliberately **not
+taken**: the batched candidate exists so the model sees a whole scene plus the
+previous chunk's translations, which is what keeps register and pronouns
+consistent. That is latency bought with scene coherence and wants an ear
+verdict, not a performance commit.
+
 ## Measured outcome
 
-- **Batch: agg RTF 0.377 -> 0.277 (26 %).** TTS 60.55 -> 29.27 s (2.1x), decode
-  step 2.6x. Peak VRAM 16.5 GB of 24.
-- **Watch-along at 350 W: 0.623 per dubbed second, 0 stalls at a realtime
-  playhead** (the first stall measurement taken on this box), first audio 27.8 s
-  with the prewarm the server does at boot.
-- Translate is the **second-largest watch-along stage at 23 % of wall**, against
-  14 % in batch, because watch-along forces the batched translator and
-  `translate_batch` walks its chunks serially with no concurrency at all. Not
-  yet addressed.
+**Batch, warm, `sample_1`, 3 repeats:**
+
+| | before (capped) | 350 W baseline | after |
+| --- | ---: | ---: | ---: |
+| agg RTF | 0.393 | 0.377 | **0.2135** |
+| wall | 118.3 s | 113.3 s | **64.2 s** |
+| cold agg RTF | 0.482 | 0.499 | **0.339** |
+
+**43 %.** Per-stage: tts 60.55 -> 22.47 s, asr 15.24 -> 11.77, translate
+16.02 -> 8.21, emotion 1.94 -> 1.54. Unchanged: separate ~8.9, output 5.5
+(all of it an AAC re-encode, still open), mux 4.1, diarize 1.3. Final-run GPU:
+214.5 W avg / 349.1 W max of 350, 78 C max, nothing capped below stock, no
+thermal slowdown. Peak VRAM 16.7 GB of 24.
+
+**Watch-along, `--prewarm`, real scheduler:**
+
+| | greedy before | greedy after | realtime before | realtime after |
+| --- | ---: | ---: | ---: | ---: |
+| agg RTF | 0.623 | **0.511** | 0.725 | **0.484** |
+| wall | 205.8 s | **153.9 s** | 239.3 s | **145.7 s** |
+| first audio | 27.8 s | **23.0 s** | 38.9 s | **22.2 s** |
+| worst section | 1.053 | **0.676** | 1.416 | **0.635** |
+| stalls | 0 | 0 | **0** | **0** |
+
+**No section exceeds realtime in either driver any more**, so the buffer grows
+monotonically instead of being clawed back. The realtime rows are the ones that
+matter: it is the only driver whose viewer advances with the wall clock and can
+outrun production, and it had never been run on this box (greedy cannot stall by
+construction, and neither can the `--forward-loop` driver every stored baseline
+used).
+
+Remaining, in order of size: **watch-along translate** (44.2 s, 29 %, see §10);
+**graph capture** (5.96 s, 25 % of the TTS stage, recoverable by reusing a
+capture across same-shape chunks); **`other_s`** in watch-along (20.9 s, 14 %,
+the ffmpeg slice/trim + ECAPA + age/gender work no stage owns); and the
+**output stage's AAC re-encode** (5.5 s, 8 % of batch wall).
 
 ## Revisit
 

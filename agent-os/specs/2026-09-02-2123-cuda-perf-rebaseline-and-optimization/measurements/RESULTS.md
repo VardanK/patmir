@@ -286,3 +286,60 @@ moved the key, so folding this in now costs one regeneration instead of two.
 
 Ear check available at `runs/20260902-233655-sample_1/out.mkv` (the mb12 warm run) against
 `runs/20260902-230429-sample_1/out.mkv` (the approved gqa rendering at B=8).
+
+## Watch-along after the optimizations (2026-09-02)
+
+| | greedy before | greedy after | realtime before | realtime after |
+| --- | ---: | ---: | ---: | ---: |
+| agg RTF | 0.623 | **0.511** | 0.725 | **0.484** |
+| wall | 205.8 s | **153.9 s** | 239.3 s | **145.7 s** |
+| first audio | 27.8 s | **23.0 s** | 38.9 s | **22.2 s** |
+| worst section | 1.053 | **0.676** | 1.416 | **0.635** |
+| stalls | 0 | 0 | **0** | **0** |
+
+No section exceeds realtime in either driver any more, so the buffer grows
+monotonically instead of being clawed back on the two sections that used to
+exceed it.
+
+Per-stage, greedy: tts **81.4 -> 32.4 s**, translate 46.6 -> 44.2, asr
+29.1 -> 27.8, separate 10.9 -> 10.6, `other_s` 21.0 -> 20.9.
+
+### Where watch-along time goes now
+
+| | seconds | share |
+| --- | ---: | ---: |
+| translate | 44.2 | 29 % |
+| tts | 32.4 | 21 % |
+| asr | 27.8 | 18 % |
+| `other_s` (no stage owns it) | 20.9 | 14 % |
+| separate | 10.6 | 7 % |
+| emotion + diarize + ingest + mux | ~5 | 3 % |
+
+**Translate became the largest stage without getting slower** — everything
+around it shrank. ASR barely moved because sections already receive
+`source_lang` from the prelude, so only the prelude ever paid the language
+probe; that saving is batch-only.
+
+### The four remaining levers, measured
+
+1. **Translate: one call per section is the wrong shape now.** Per-section
+   calls measured 1.75 / 1.89 / 2.23 / 2.96 / 3.62 / 4.06 s and then **10.83 /
+   12.20 / 13.34** — three of nine are 36 of the 44 s. All 43 API responses
+   were HTTP 200 first try, so it is provider latency on the
+   schema-constrained decode, not retries or rate limits (the per-sentence path
+   over 78 calls: p90 1.46 s, max 1.63 s). `streaming_config()` picks the
+   batched translator because per-sentence used to be *serial*; at concurrency
+   12 a 4-16 sentence section fits in one round-trip. **Est. 44 -> ~15 s
+   (~19 % of wall).** Costs scene coherence, so it needs an ear verdict.
+2. **Stage pipelining.** Translate is pure waiting on the network with the GPU
+   idle. Translating section N+1 while N is in TTS would hide most of it. The
+   largest structural win available and the most invasive.
+3. **Graph capture reuse.** 5.96 s, 25 % of the TTS stage, at ~0.85 s per
+   chunk. Reuse a capture across chunks with matching `(B, seq + max_cap)`.
+4. **`other_s`: 20.9 s that no stage owns**, ~2.3 s per section — ffmpeg
+   slice/trim, ECAPA embed, age/gender profile. Untouched by this work and now
+   14 % of wall.
+
+Plus **first audio at 22.2 s**, which is dominated by the 40 s prelude window
+(`prelude_window_seconds`); a shorter window starts sooner but establishes
+fewer characters up front.
