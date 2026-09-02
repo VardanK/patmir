@@ -287,6 +287,66 @@ A `pipeline_overlap_s` field was added and then removed rather than shipped:
 bench times `process()`, which excludes an analysis already prefetched, so it
 read **0.0 next to a 23 % improvement**. `prefetch_hits` is the honest signal.
 
+### 13. Translate was also the overlap *window*, so moving it off the main thread made things worse
+
+Section pipelining (§11) leaves the next obvious lever in plain sight: a
+prefetch hit still pays for its own translate on the main thread, so why not
+have the background worker translate the section it just analysed and hand it
+over ready to speak? Implemented, tested (5 tests, including one asserting
+translate never holds the GPU lock), measured — and **reverted, because it is
+14 % slower**: agg RTF 0.396 -> **0.439**, wall 119.3 -> **132.2 s**, on a run
+where the prefetch worked exactly as designed (7 of 8 sections arrived
+pre-translated) and every phase was individually as fast or faster (mean
+translate 5.52 -> 3.15 s).
+
+The per-section walls say what happened. They **oscillate** — 4.73 s on one
+section, 21.18 s on the next — while the phase sums stay flat, which is the
+signature of an overlap that engages every other cycle instead of every cycle.
+
+| | analyse | translate | speak | GPU (analyse+speak) | mean section wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| §11 pipeline | 4.48 | 5.52 | 3.83 | 8.31 | **12.21** |
+| + translate prefetch | 4.65 | 3.15 | 3.86 | 8.51 | **13.55** |
+
+The cause is the GPU lock, and it inverts the intuition that motivated the
+change. There is exactly **one** phase in a section that does not need the GPU,
+and the worker's analysis needs the GPU — so the *only* window in which a
+prefetch can run is the window while the main thread is translating. Move
+translate to the worker and the main thread goes from one GPU phase to
+back-to-back GPU phases, the worker's analysis is pushed to the *end* of the
+cycle, and the translate chained behind it lands after the next cycle has
+already asked for the section. So the main thread waits for both, having saved
+nothing:
+
+```
+§11:   main [translate 5.5 .......][speak 3.9]      cycle 9.4
+       work [analyse 4.7 ....]                       <- fits in the translate window
+
++tr:   main                        [speak 3.9]      cycle 11.7
+       work [blocked on GPU][analyse 4.7][translate 3.2]
+                                    ^ no window, so the analysis starts late
+```
+
+Two things follow, and they are why this is written down rather than deleted:
+
+- **The GPU is the floor, not the network.** analyse + speak is 8.5 s of
+  serialized GPU work per section against 3.2-5.5 s of network, so the ceiling
+  for any arrangement of these three phases is ~8.5 s/section — about 30 %
+  below the 12.2 s the shipped pipeline achieves. Reaching it needs the main
+  thread to **yield the GPU to a pending analysis** before speaking (or a
+  second lookahead level), which trades ~4.6 s of per-section delivery latency
+  for throughput. That is a buffer-policy decision, and with 0 stalls and
+  production at 2.5x realtime there is nothing to spend it on today.
+- **A phase's resource class is not a property of the phase alone.** §11
+  reasoned about translate as "the phase that does not use the GPU", which is
+  true and was the right basis for overlapping it. This attempt reasoned about
+  it as "the phase that does not need to be on the critical path", which is
+  false: on a single-lock pipeline, the non-GPU phase *is* the critical path's
+  contribution to everyone else's progress.
+
+Report: `measurements/pipelined-tr-greedy.json`. Nothing shipped; the
+`section_prefetch` flag and its behaviour are unchanged.
+
 ## Measured outcome
 
 **Batch, warm, `sample_1`, 3 repeats:**
@@ -348,10 +408,12 @@ win now that §11 has removed the latency it was meant to fix.
   the CUDA-gated tests will catch.
 - Graph capture reuse across same-shape chunks, worth the ~0.85 s/chunk it
   currently costs.
-- A second prefetch depth, or prefetching the *dub* of section k+1 — both were
-  left alone deliberately: one section of lookahead already covers a translate
-  round-trip, and anything deeper competes for the GPU rather than filling an
-  idle one.
+- The ~8.5 s/section GPU floor from §13, reachable only by yielding the GPU to
+  a pending analysis (or a second lookahead level) at the cost of ~4.6 s of
+  per-section delivery latency — worth revisiting if watch-along ever needs the
+  headroom, and *not* by prefetching translate, which §13 measured.
+- Prefetching the *dub* of section k+1, left alone deliberately: it competes
+  for the GPU rather than filling an idle one.
 - The 120 s lookahead becoming the binding constraint on how far ahead a
   viewer can be buffered, now that production is well clear of realtime.
 - An ear-test that finds the gqa re-roll worse on other content, in which case

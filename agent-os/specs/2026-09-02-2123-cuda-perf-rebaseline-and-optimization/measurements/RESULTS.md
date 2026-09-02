@@ -403,3 +403,42 @@ A `pipeline_overlap_s` note was added and then deleted: bench times
 previous section's translate, so the per-section sum already equals the elapsed
 wall and the field read **0.0 next to a 23 % improvement**. `prefetch_hits` is
 the honest signal.
+
+### Translate prefetch: attempted, measured, reverted (2026-09-02)
+
+The next step after section pipelining looked free — let the background worker
+translate the section it just analysed, so a prefetch hit arrives ready to
+speak. It is **14 % slower** and was reverted.
+Report: `pipelined-tr-greedy.json`.
+
+| | agg RTF | wall | sections wall | mean section wall | mean other_s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| §11 pipeline (shipped) | **0.396** | **119.3 s** | 106.4 s | 12.21 s | 0.67 s |
+| + translate prefetch | 0.439 | 132.2 s | 116.9 s | 13.55 s | 2.70 s |
+
+Not a wiring failure: 7 of 8 sections arrived pre-translated, 0 discarded, and
+every phase was individually as fast or faster (mean translate 5.52 -> 3.15 s,
+analyse 4.48 -> 4.65, speak 3.83 -> 3.86).
+
+Per-section walls **oscillate** where the shipped pipeline's are steady, which
+is what a once-every-two-cycles overlap looks like:
+
+| idx | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| shipped | 19.27 | 9.31 | 10.16 | 13.26 | 10.64 | 15.94 | 13.46 | 5.67 |
+| + tr prefetch | 13.25 | **4.73** | 9.31 | **21.18** | 13.48 | 17.44 | 17.25 | 11.78 |
+
+Cause: translate is the **only** phase that does not hold the GPU lock, so the
+main thread translating *is* the window the background analysis runs in.
+Removing it leaves the main thread holding the GPU back to back, the analysis
+lands at the end of the cycle, and its chained translate finishes after the
+next cycle has already asked for the section — so the main thread waits for
+both. See ADR §13.
+
+**The floor this exposes:** analyse + speak is 8.5 s of serialized GPU work per
+section against 3.2-5.5 s of network, so ~8.5 s/section is the ceiling for any
+arrangement of these three phases — ~30 % below the shipped 12.2 s. Reaching it
+requires the main thread to yield the GPU to a pending analysis before
+speaking, trading ~4.6 s of per-section delivery latency for throughput. With
+0 stalls and production at 2.5x realtime, there is nothing to spend that on
+yet.

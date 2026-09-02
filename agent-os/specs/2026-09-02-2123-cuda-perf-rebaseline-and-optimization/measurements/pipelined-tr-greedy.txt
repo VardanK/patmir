@@ -1,0 +1,62 @@
+[NeMo I 2026-09-03 00:30:31 save_restore_connector:287] Model SortformerEncLabelModel was successfully restored from /home/vardan/.cache/huggingface/hub/models--nvidia--diar_streaming_sortformer_4spk-v2.1/snapshots/fafaab5faa1617a0ca52d38dd3dc4bd636800d3d/diar_streaming_sortformer_4spk-v2.1.nemo.
+funasr version: 1.4.9.
+Check update of funasr, and it would cost few times. You may disable it by set `disable_update=True` in AutoModel
+New version is available: 1.4.13.
+Please use the command "pip install -U funasr" to upgrade.
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.blocks.0.0.weight, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.blocks.0.0.bias, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.blocks.1.0.weight, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.blocks.1.0.bias, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.blocks.2.0.weight, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.blocks.2.0.bias, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.blocks.3.0.weight, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.blocks.3.0.bias, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.proj.weight, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+Warning, miss key in ckpt: modality_encoders.AUDIO.decoder.proj.bias, /home/vardan/.cache/huggingface/hub/models--emotion2vec--emotion2vec_plus_base/snapshots/b318240bfe67db81a8c572ecb37ce9c3759b81c9/model.pt
+[NeMo I 2026-09-03 00:30:58 vad_utils:89] No postprocessing YAML file has been provided. Default postprocessing configurations will be applied.
+[NeMo I 2026-09-03 00:31:21 vad_utils:89] No postprocessing YAML file has been provided. Default postprocessing configurations will be applied.
+[NeMo I 2026-09-03 00:31:26 vad_utils:89] No postprocessing YAML file has been provided. Default postprocessing configurations will be applied.
+[NeMo I 2026-09-03 00:31:39 vad_utils:89] No postprocessing YAML file has been provided. Default postprocessing configurations will be applied.
+[NeMo I 2026-09-03 00:31:48 vad_utils:89] No postprocessing YAML file has been provided. Default postprocessing configurations will be applied.
+[NeMo I 2026-09-03 00:32:10 vad_utils:89] No postprocessing YAML file has been provided. Default postprocessing configurations will be applied.
+[NeMo I 2026-09-03 00:32:23 vad_utils:89] No postprocessing YAML file has been provided. Default postprocessing configurations will be applied.
+[NeMo I 2026-09-03 00:32:40 vad_utils:89] No postprocessing YAML file has been provided. Default postprocessing configurations will be applied.
+[NeMo I 2026-09-03 00:32:57 vad_utils:89] No postprocessing YAML file has been provided. Default postprocessing configurations will be applied.
+
+=== watch-along | sample_1.mkv | 20260903-003055-prelude ===
+source 301.11s  wall 132.24s  agg RTF 0.439  (faster than realtime) [per dubbed_audio_s 300.97s; per source 0.439]
+
+  stage          wall    build     rtf      %
+  ---------- -------- -------- ------- ------
+  ingest          1.0        -   0.003    0.9
+  separate       10.9        -   0.036   10.1
+             └ extract_s 0.47  model_s 8.20  vad_load_s 0.29  vad_infer_s 2.01  stem_write_s 0.35  vad_s 3.22  n_vad_intervals 64
+  diarize        2.31        -   0.008    2.1
+  emotion         2.3        -   0.008    2.1
+             └ read_s 0.06  resample_s 0.12  infer_s 1.91  pick_refs_s 0.31  n_turns 161  n_scored 154
+  asr           27.44        -   0.091   25.5
+             └ probe_s 4.33  generate_s 26.04  align_s 0.71  tag_s 0.02  n_chunks 18  probe_fallbacks 2  n_generate_batches 10  n_align_batches 10  n_sentences 98
+  translate     27.79        -   0.092   25.8
+  tts           32.12        -   0.107   29.8
+             └ graph_capture_s 6.07  prefill_s 6.07  decode_s 25.22  codec_s 2.11  steps 1480  chunks 11  live_row_steps 6267  total_row_steps 13552  cuda_graphs True  ms_per_step_decode 17.04  live_row_fraction 0.46  attn_impl sdpa  attn_impl_decode patmir_gqa_decode  max_batch 12  dtype bfloat16  device cuda  11 rows
+  mux            3.83        -   0.013    3.6
+             └ read_s 0.02  stretch_s 3.52  write_s 0.18  n_stretch_calls 111
+  output          0.0        -     0.0    0.0
+
+  cpu: 130.41s total (self 115.31u/8.18s, children 5.35u/1.57s)
+  gpu: power 172.2W avg / 342.8W max of 350.0W · sm 1564MHz avg / 1965 max · temp 64C max · util 34%
+  gpu: THERMAL SLOWDOWN in 2/130 samples (max 64.0C) — the card dropped clocks to protect itself.
+  gpu: at its 350.0W stock ceiling in 15/130 samples (expected under load)
+  gpu: idle in 34.6% of samples (cloud translate + ffmpeg + host-side work)
+
+  watch-along: 9 sections, prelude 15.33s, build 0.0s (0.0% of wall)
+  sec   start   span    wall   anlys     dub   build    rtf
+    0     0.0   33.6    8.48    6.75     7.7     0.0  0.253
+    1    33.6   35.8   13.25    3.18     4.5     0.0   0.37
+    2    69.4   35.7    4.73    5.12    6.06     0.0  0.132
+    3   105.1   28.4    9.31    3.83    3.04     0.0  0.328
+    4   133.5   36.5   21.18    6.95    11.8     0.0   0.58
+    5   170.0   36.5   13.48    4.43    6.03     0.0  0.369
+    6   206.5   36.5   17.44    4.81    9.71     0.0  0.478
+    7   243.0   36.5   17.25    5.83    8.41     0.0  0.473
+    8   279.5  21.47   11.78    3.06     6.5     0.0  0.549

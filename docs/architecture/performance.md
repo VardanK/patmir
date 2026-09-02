@@ -148,6 +148,36 @@ chunk's translations, which is what keeps character register and pronouns
 consistent across a section. Switching buys latency with scene coherence and
 wants an ear verdict.
 
+### Translate prefetch: measured 14 % slower, reverted
+
+Section pipelining overlaps the next section's **analysis** with this one's
+translate. The obvious extension — have that same background worker also
+*translate* the section it analysed, so a prefetch hit arrives ready to speak —
+is a **regression** and was reverted (report
+`measurements/pipelined-tr-greedy.json`, ADR §13):
+
+| greedy driver | agg RTF | wall | mean section wall | mean `other_s` |
+| --- | ---: | ---: | ---: | ---: |
+| analysis prefetch (shipped) | **0.396** | **119.3 s** | 12.21 s | 0.67 s |
+| + translate prefetch | 0.439 | 132.2 s | 13.55 s | 2.70 s |
+
+The prefetch itself worked (7 of 8 sections pre-translated, 0 discarded) and
+every phase was individually as fast or faster. What broke is the overlap:
+translate is the **only** phase that does not hold the GPU lock, so the main
+thread translating *is* the window the background analysis runs in. Take it
+away and the main thread holds the GPU back to back, the analysis is pushed to
+the end of the cycle, and the translate chained behind it finishes after the
+next cycle already needed it — so the main thread waits for both. Per-section
+walls oscillate (4.73 s then 21.18 s) where the shipped pipeline's are steady.
+
+**The floor it exposes:** analyse + speak is **8.5 s of serialized GPU work per
+section** against 3.2-5.5 s of network, so ~8.5 s/section is the ceiling for
+any arrangement of these three phases — about **30 % below** the shipped
+12.2 s. Getting there needs the main thread to yield the GPU to a pending
+analysis before speaking (or a second lookahead level), trading ~4.6 s of
+per-section delivery latency for throughput. Left alone: production is 2.5x
+realtime with 0 stalls, so there is no stall budget to spend it on.
+
 ### Where the TTS time went, and the two things worth remembering
 
 The decode step measured 45.5 ms where the card's bandwidth allows ~9-12. The
