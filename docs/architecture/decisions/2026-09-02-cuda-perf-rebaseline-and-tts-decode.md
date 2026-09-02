@@ -209,11 +209,83 @@ the per-sentence path over 78 calls has p90 1.46 s and max 1.63 s.
 per-sentence path was **serial**, batching was faster. That is no longer true:
 per-sentence runs at concurrency 12 and a section holds 4-16 sentences, so all
 of them fit in one round-trip's wall against 2-13 s for one batched call —
-an estimated 44 s -> ~15 s, ~19 % of watch-along wall. Deliberately **not
-taken**: the batched candidate exists so the model sees a whole scene plus the
-previous chunk's translations, which is what keeps register and pronouns
-consistent. That is latency bought with scene coherence and wants an ear
-verdict, not a performance commit.
+an estimated 44 s -> ~15 s. Deliberately **not taken**: the batched candidate
+exists so the model sees a whole scene plus the previous chunk's translations,
+which is what keeps register and pronouns consistent. That is latency bought
+with scene coherence and wants an ear verdict, not a performance commit.
+
+**What was taken instead — §11 — is strictly better**: it removes the same cost
+without touching the translation at all.
+
+### 11. The section's phases want different resources, so stop serializing them
+
+Translate is a network round-trip with the GPU idle. Every other phase is GPU
+work. The sections ran serially not because the work is serial but because
+nothing had separated "waiting on a network" from "using the accelerator".
+
+    section k    [analyse][translate .......][speak]
+    section k+1           [analyse]                 [translate ....][speak]
+                          ^^^^^^^^ the GPU, busy during k's network wait
+
+`SectionPipeline` (`streaming/pipeline.py`) drives the live server and the
+scheduler-driven bench; `process_section` stays the serial path for
+`stream_sections`, the bench forward-loop and the tests. Measured on the greedy
+driver — the one that measures production — **agg RTF 0.511 -> 0.396, wall
+153.9 -> 119.3 s (22 %)**, with 7 prefetch hits of 8 possible and 0 discarded.
+Stage totals barely move: the same work happens with ~33 s of it hidden.
+
+**The GPU is never used by two phases at once, and that is load-bearing.** The
+TTS decode captures a CUDA graph (§5) and capture fails or corrupts if another
+thread allocates on the device — so the optimization that made TTS 2.5x faster
+is precisely what forbids the naive version of this one. One lock serializes
+every GPU phase *and* the registry mutation identity resolution performs;
+translate is the only phase outside it. That constraint is why
+`process_section` had to be split into three phases at all, which the runner's
+`resume_from`/`stop_after` range already permitted.
+
+Prefetch is one section deep, so a seek discards at most one section's work,
+and it refuses to trust stale analysis in four ways — each of them a way to
+emit audio for the wrong span, the class of bug behind quality issues #22 and
+#24:
+
+* a different start discards it;
+* a `max_end` clamp discards it, because the clamp changes where the section
+  ends;
+* a prefetch is never *started* with a clamp, since the next window's clamp
+  comes from coverage the scheduler has not updated yet;
+* `close()` waits for an in-flight analysis, because a torch forward cannot be
+  interrupted and abandoning the thread would hand the GPU to the next job
+  while we still held it.
+
+Numbering stays with the caller: a resumed stream must number past the highest
+cached index or it overwrites `section_NNN.wav` (#22).
+
+The load-bearing test is a **live overlap detector** — it runs the phases with a
+long translate to give the prefetch every chance to collide and asserts two GPU
+phases are never in flight together. Reasoning about that was not good enough
+for a constraint whose violation corrupts a capture.
+
+`[pipeline.options] section_prefetch = false` restores the serial loop.
+
+### 12. Two ways the watch-along numbers can mislead, both now written down
+
+**A realtime wall is viewer-bound once production outpaces the lookahead.**
+`DEFAULT_LOOKAHEAD_SECONDS` is 120 and the clip is 301 s, so the last section
+cannot start until the playhead passes ~181 s however fast we get. Of the
+pipelined realtime run's 174.0 s of section time, **73.3 s was idle waiting for
+the viewer** (production 100.7 s, against serial's 145.7 s — a 31 % gain that
+the wall figure hides). Its elapsed wall therefore went *up*, 145.7 -> 187.0 s,
+and that is not a regression. **Read greedy for throughput and realtime for
+stalls and first-audio latency.**
+
+**`sections_wall_s` changed definition here**, from the sum of per-section
+walls to real elapsed, because overlap makes the sum meaningless. Serial runs
+agree on both, so pre-pipelining *greedy* rows stay comparable; realtime rows
+do not, since elapsed includes idle.
+
+A `pipeline_overlap_s` field was added and then removed rather than shipped:
+bench times `process()`, which excludes an analysis already prefetched, so it
+read **0.0 next to a 23 % improvement**. `prefetch_hits` is the honest signal.
 
 ## Measured outcome
 
@@ -231,15 +303,23 @@ verdict, not a performance commit.
 214.5 W avg / 349.1 W max of 350, 78 C max, nothing capped below stock, no
 thermal slowdown. Peak VRAM 16.7 GB of 24.
 
-**Watch-along, `--prewarm`, real scheduler:**
+**Watch-along, `--prewarm`, real scheduler.** Greedy is the throughput driver:
 
-| | greedy before | greedy after | realtime before | realtime after |
-| --- | ---: | ---: | ---: | ---: |
-| agg RTF | 0.623 | **0.511** | 0.725 | **0.484** |
-| wall | 205.8 s | **153.9 s** | 239.3 s | **145.7 s** |
-| first audio | 27.8 s | **23.0 s** | 38.9 s | **22.2 s** |
-| worst section | 1.053 | **0.676** | 1.416 | **0.635** |
-| stalls | 0 | 0 | **0** | **0** |
+| | baseline | stage work | **+ pipelining** |
+| --- | ---: | ---: | ---: |
+| agg RTF | 0.623 | 0.511 | **0.396** |
+| wall | 205.8 s | 153.9 s | **119.3 s** |
+| first audio | 27.8 s | 23.0 s | **21.6 s** |
+| worst section | 1.053 | 0.676 | **0.485** |
+
+**42 % off watch-along**, matching batch. Realtime playhead, which is the stall
+and latency check rather than a throughput measure:
+
+| | baseline | stage work | **+ pipelining** |
+| --- | ---: | ---: | ---: |
+| **stalls** | **0** | **0** | **0** |
+| first audio | 38.9 s | 22.2 s | **21.4 s** |
+| production time | — | 145.7 s | **100.7 s** |
 
 **No section exceeds realtime in either driver any more**, so the buffer grows
 monotonically instead of being clawed back. The realtime rows are the ones that
@@ -248,11 +328,17 @@ outrun production, and it had never been run on this box (greedy cannot stall by
 construction, and neither can the `--forward-loop` driver every stored baseline
 used).
 
-Remaining, in order of size: **watch-along translate** (44.2 s, 29 %, see §10);
-**graph capture** (5.96 s, 25 % of the TTS stage, recoverable by reusing a
-capture across same-shape chunks); **`other_s`** in watch-along (20.9 s, 14 %,
-the ffmpeg slice/trim + ECAPA + age/gender work no stage owns); and the
-**output stage's AAC re-encode** (5.5 s, 8 % of batch wall).
+**No section exceeds realtime in either driver any more** (worst 0.485 against
+1.416 at the baseline), so the buffer grows monotonically instead of being
+clawed back.
+
+Remaining, in order of size: **graph capture** (5.96 s, 25 % of the TTS stage,
+recoverable by reusing a capture across same-shape chunks); **`other_s`** in
+watch-along (~20 s, the ffmpeg slice/trim + ECAPA + age/gender work no stage
+owns — now a larger share since everything around it shrank); the **output
+stage's AAC re-encode** (5.5 s, 8 % of batch wall); and **per-sentence
+translate in watch-along** (§10), which is a coherence trade rather than a free
+win now that §11 has removed the latency it was meant to fix.
 
 ## Revisit
 
@@ -260,8 +346,14 @@ the ffmpeg slice/trim + ECAPA + age/gender work no stage owns); and the
 - Upstream transformers gaining a GQA-native masked decode path, which would
   make our kernel redundant; or breaking the bitwise properties in §5, which
   the CUDA-gated tests will catch.
-- Graph capture reuse across same-shape chunks, worth the ~0.6 s/chunk it
+- Graph capture reuse across same-shape chunks, worth the ~0.85 s/chunk it
   currently costs.
+- A second prefetch depth, or prefetching the *dub* of section k+1 — both were
+  left alone deliberately: one section of lookahead already covers a translate
+  round-trip, and anything deeper competes for the GPU rather than filling an
+  idle one.
+- The 120 s lookahead becoming the binding constraint on how far ahead a
+  viewer can be buffered, now that production is well clear of realtime.
 - An ear-test that finds the gqa re-roll worse on other content, in which case
   `decode_attention = "sdpa"` reverts it and keeps the graph's 18 %.
 - `max_batch` is still unswept, and only meaningful now that the step is no
