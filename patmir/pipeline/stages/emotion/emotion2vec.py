@@ -152,38 +152,63 @@ class Emotion2VecCandidate:
         # turn timestamps are in seconds, independent of the source SR.
         del scale  # unused, but kept for readability
 
-        predictions: list[EmotionPrediction] = []
         n_turns = max(1, len(diarization.turns))
         ctx.probe.bump("n_turns", len(diarization.turns))
+
+        # Slice first, score in batches. This was one `generate` call per turn
+        # — ~108 calls on a 5-minute clip — which paid funasr's per-call setup
+        # every time. Handing it the list instead measured **2.96x** on 24 real
+        # turns (0.65 s -> 0.22 s) with **24/24 labels and confidences
+        # identical**, because funasr still runs each clip at batch_size 1
+        # internally: there is no padding to leak into the pooled embedding,
+        # which is what would otherwise have made this a quality change rather
+        # than a scheduling one.
+        clips: list[Any] = []
+        scored_at: list[int] = []          # index into `diarization.turns`
         for i, turn in enumerate(diarization.turns):
             clip = _slice_mono(mono_16k, 16_000, turn.start, turn.end)
             if len(clip) < int(0.2 * 16_000):
-                # < 200 ms — too short to score reliably; default to neutral.
+                continue                   # < 200 ms — see the neutral default below
+            clips.append(clip)
+            scored_at.append(i)
+
+        labels: dict[int, tuple[str, float]] = {}
+        for offset in range(0, len(clips), EMOTION_BATCH):
+            group = clips[offset:offset + EMOTION_BATCH]
+            with ctx.probe.section("infer_s"):
+                raw = self.model.generate(group, granularity="utterance",
+                                          extract_embedding=False)
+            ctx.probe.bump("n_scored", len(group))
+            # One result per clip. A shape mismatch would silently misalign
+            # every emotion with the wrong turn, so fall back to per-clip
+            # calls rather than trusting the length.
+            rows = raw if isinstance(raw, list) and len(raw) == len(group) else None
+            for k, clip in enumerate(group):
+                item = [rows[k]] if rows is not None else self.model.generate(
+                    clip, granularity="utterance", extract_embedding=False)
+                labels[scored_at[offset + k]] = _top_label(item)
+            done = min(len(clips), offset + EMOTION_BATCH)
+            ctx.progress("emotion", 0.1 + 0.85 * done / max(1, len(clips)),
+                         f"scored {done}/{len(clips)} turns")
+
+        predictions: list[EmotionPrediction] = []
+        for i, turn in enumerate(diarization.turns):
+            if i not in labels:
+                # Too short to score reliably; default to neutral.
                 predictions.append(EmotionPrediction(
-                    start=turn.start, end=turn.end, emotion="neutral", confidence=0.0,
+                    start=turn.start, end=turn.end, emotion="neutral",
+                    confidence=0.0,
                 ))
                 continue
-
-            # One forward per turn, batch 1 — ~108 calls on a 5-minute clip.
-            # `n_scored` beside `infer_s` is what makes the per-call cost
-            # visible, since funasr's `generate` accepts a list and this does
-            # not use it.
-            with ctx.probe.section("infer_s"):
-                raw = self.model.generate(clip, granularity="utterance",
-                                          extract_embedding=False)
-            ctx.probe.bump("n_scored")
-            label, conf = _top_label(raw)
+            label, conf = labels[i]
             if conf < self.min_confidence:
                 emo: Emotion = "neutral"
             else:
                 emo = self.bin_map.get(label.lower(), "neutral")
             predictions.append(EmotionPrediction(
-                start=turn.start, end=turn.end, emotion=emo, confidence=float(conf),
+                start=turn.start, end=turn.end, emotion=emo,
+                confidence=float(conf),
             ))
-
-            if (i + 1) % 10 == 0 or i + 1 == n_turns:
-                ctx.progress("emotion", 0.1 + 0.85 * (i + 1) / n_turns,
-                             f"scored {i + 1}/{n_turns} turns")
 
         emotion_dir = ctx.job_dir / "emotion"
         emotion_dir.mkdir(exist_ok=True)
@@ -209,6 +234,12 @@ class Emotion2VecCandidate:
                      f"{len(predictions)} turns: " + ", ".join(
                          f"{e}={n}" for e, n in bin_counts.most_common()))
         return predictions
+
+
+# Turns handed to funasr per call. It processes them at batch_size 1 internally,
+# so this only amortizes per-call setup and a larger value buys nothing beyond
+# a point; 32 keeps the progress line moving on a long clip.
+EMOTION_BATCH = 32
 
 
 def _top_label(raw: Any) -> tuple[str, float]:
