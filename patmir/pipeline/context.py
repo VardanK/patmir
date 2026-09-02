@@ -176,6 +176,13 @@ class PipelineOptions:
     # ~10 GB with the current models — so set False on a memory-constrained box
     # or when the server is started just to browse finished runs.
     prewarm_stages: bool = True
+    # Watch-along: analyse the next section while this one waits on the
+    # translate round-trip. Translate is 44.2 s of a 153.9 s watch-along wall
+    # (29%) as one cloud call per section, with the GPU idle throughout;
+    # analysis is the GPU work that fits in that gap. A single lock keeps GPU
+    # phases serialized, which the TTS CUDA-graph capture requires. False
+    # restores the fully serial section loop.
+    section_prefetch: bool = True
     # Age register the translator is steered toward: "child" | "teenager" |
     # "adult". Prompt-only softening -- gentler wording, never a dropped,
     # blanked or bleeped line.

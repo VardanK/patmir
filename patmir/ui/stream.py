@@ -529,15 +529,23 @@ class StreamManager:
         # played at 154.9 s and 190.3 s, live and on every rewatch.
         index_counter = {"n": _index_seed(prior, opening.index)}
 
+        # Analyse the next section while this one waits on the translate
+        # round-trip. Translate is 29% of watch-along wall with the GPU idle
+        # throughout, and analysis is the GPU work that fits in that gap. One
+        # lock inside the driver keeps GPU phases serialized, which the TTS
+        # CUDA-graph capture requires. `section_prefetch = false` restores the
+        # fully serial path.
+        pipeline = SectionPipeline(
+            local_path, cfg, prelude.registry,
+            runs_root=self._runs_root, stage_cache=stage_cache, cancel=cancel,
+            source_lang=prelude.source_lang, duration=rec.duration,
+            prefetch=bool(getattr(cfg.options, "section_prefetch", True)),
+            index_start=index_counter["n"],
+        )
+
         def _process(start: float, max_end: float | None = None) -> SectionResult | None:
-            index_counter["n"] += 1
             try:
-                return process_section(
-                    local_path, cfg, prelude.registry,
-                    index=index_counter["n"], start=start, runs_root=self._runs_root,
-                    stage_cache=stage_cache, cancel=cancel,
-                    source_lang=prelude.source_lang, max_end=max_end,
-                )
+                return pipeline.process(start, max_end)
             except JobCancelled:
                 # MUST propagate. This except-Exception used to swallow it and
                 # report a failed section, so Stop would be silently downgraded
@@ -560,7 +568,14 @@ class StreamManager:
             for s in prior.get("sections", []):
                 scheduler.coverage.add(float(s["start"]), float(s["end"]))
         rec._scheduler = scheduler
-        scheduler.run()
+        try:
+            scheduler.run()
+        finally:
+            # Drop any in-flight prefetch before returning. A running analysis
+            # cannot be interrupted (it is a torch forward), so this waits for
+            # it rather than leaving a thread on the GPU after the stream is
+            # gone — which would meet the next job holding the accelerator.
+            pipeline.close()
 
         if scheduler.coverage.is_complete(rec.duration):
             cache_mod.finalize_stream(self._cache_root, ck)

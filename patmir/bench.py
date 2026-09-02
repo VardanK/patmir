@@ -50,6 +50,7 @@ from patmir.pipeline.runner import (
 )
 from patmir.pipeline.stage import STAGE_ORDER
 from patmir.pipeline.streaming import timing as timing_mod
+from patmir.pipeline.streaming.pipeline import SectionPipeline
 from patmir.pipeline.streaming.scheduler import Playhead, StreamScheduler
 from patmir.telemetry import GpuSampler
 
@@ -676,20 +677,33 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
 
         counter = {"n": 0}
         stalls: list[dict[str, Any]] = []
+        # The live server drives sections through `SectionPipeline`, which
+        # analyses the next one during this one's translate round-trip. Bench
+        # uses the same driver or it would not be measuring the live path.
+        pipeline = SectionPipeline(
+            clip, cfg, prelude.registry,
+            runs_root=runs_root, stage_cache=stage_cache, bench=traces,
+            source_lang=prelude.source_lang, duration=duration,
+            prefetch=bool(getattr(cfg.options, "section_prefetch", True)),
+        ) if scheduler else None
 
         def _one(start: float, max_end: float | None = None):
-            counter["n"] += 1
             s0 = time.perf_counter()
-            sec = process_section(
-                clip, cfg, prelude.registry,
-                index=counter["n"], start=start, runs_root=runs_root,
-                stage_cache=stage_cache, bench=traces,
-                source_lang=prelude.source_lang,
-                # Only the scheduler branch supplies this; the straight-line
-                # loop below never revisits covered ground, so it has no clamp.
-                max_end=max_end,
-            )
-            sections.append(_section_record(counter["n"], sec,
+            if pipeline is not None:
+                sec = pipeline.process(start, max_end)
+                counter["n"] = sec.index
+            else:
+                counter["n"] += 1
+                sec = process_section(
+                    clip, cfg, prelude.registry,
+                    index=counter["n"], start=start, runs_root=runs_root,
+                    stage_cache=stage_cache, bench=traces,
+                    source_lang=prelude.source_lang,
+                    # Only the scheduler branch supplies this; the straight-line
+                    # loop below never revisits covered ground, so no clamp.
+                    max_end=max_end,
+                )
+            sections.append(_section_record(sec.index, sec,
                                             time.perf_counter() - s0, runs_root))
             probe_dirs.append(sec.job_dir)
             return sec
@@ -740,7 +754,11 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
                 idle_fn=_idle,
             )
             ph.coverage = sched.coverage
-            sched.run()
+            try:
+                sched.run()
+            finally:
+                if pipeline is not None:
+                    pipeline.close()
             stalls = ph.stalls
         else:
             idx = 1
@@ -757,7 +775,13 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
         cpu = _cpu_delta(cpu0)
         wa_probes = _aggregate_probes([prelude.job_dir, *probe_dirs])
         dubbed_audio_s = sum(s["section_s"] for s in sections)
-        sections_wall = sum(s["wall_s"] for s in sections)
+        # Two different quantities once sections overlap. The SUM of per-section
+        # walls double-counts time the pipelined driver hid behind a translate
+        # round-trip; the real elapsed wall does not. `agg_rtf` uses the real
+        # one, and the sum is published beside it — for a serial run the two
+        # agree, so every pre-pipelining row stays comparable.
+        sections_wall_sum = sum(s["wall_s"] for s in sections)
+        sections_wall = time.perf_counter() - run_t0 - prelude_wall
         total_wall = prelude_wall + sections_wall
 
         # Aggregate per-stage walls + builds across all sections, so the table
@@ -798,6 +822,13 @@ def bench_watch_along(clip: Path, config_path: Path, *, runs_root: Path,
             notes={
                 "prelude_wall_s": round(prelude_wall, 2),
                 "sections_wall_s": round(sections_wall, 2),
+                # Per-section walls no longer sum to the elapsed wall in any
+                # useful way: bench times `pipeline.process()`, which EXCLUDES
+                # an analysis already done during the previous section's
+                # translate. `prefetch_hits` is the honest signal for how many
+                # sections had their analysis hidden.
+                "sections_wall_sum_s": round(sections_wall_sum, 2),
+                **({"prefetch": pipeline.stats} if pipeline is not None else {}),
                 "dubbed_audio_s": round(dubbed_audio_s, 2),
                 "n_sections": len(sections),
                 "total_build_s": round(total_build, 2),

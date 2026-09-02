@@ -1,0 +1,771 @@
+{
+  "results": [
+    {
+      "clip": "samples/sample_1.mkv",
+      "mode": "watch-along",
+      "label": "pipelined",
+      "repeat_index": 0,
+      "job_id": "20260903-000745-prelude",
+      "source_s": 301.11,
+      "total_wall_s": 119.31,
+      "agg_rtf": 0.396,
+      "stages": [
+        {
+          "name": "ingest",
+          "state": "done",
+          "wall_s": 0.97,
+          "build_s": null,
+          "rtf": 0.003,
+          "pct": 0.8
+        },
+        {
+          "name": "separate",
+          "state": "done",
+          "wall_s": 10.53,
+          "build_s": null,
+          "rtf": 0.035,
+          "pct": 8.4
+        },
+        {
+          "name": "diarize",
+          "state": "done",
+          "wall_s": 2.59,
+          "build_s": null,
+          "rtf": 0.009,
+          "pct": 2.1
+        },
+        {
+          "name": "emotion",
+          "state": "done",
+          "wall_s": 2.19,
+          "build_s": null,
+          "rtf": 0.007,
+          "pct": 1.7
+        },
+        {
+          "name": "asr",
+          "state": "done",
+          "wall_s": 26.72,
+          "build_s": null,
+          "rtf": 0.089,
+          "pct": 21.2
+        },
+        {
+          "name": "translate",
+          "state": "done",
+          "wall_s": 46.85,
+          "build_s": null,
+          "rtf": 0.156,
+          "pct": 37.2
+        },
+        {
+          "name": "tts",
+          "state": "done",
+          "wall_s": 32.07,
+          "build_s": null,
+          "rtf": 0.107,
+          "pct": 25.5
+        },
+        {
+          "name": "mux",
+          "state": "done",
+          "wall_s": 3.91,
+          "build_s": null,
+          "rtf": 0.013,
+          "pct": 3.1
+        },
+        {
+          "name": "output",
+          "state": "done",
+          "wall_s": 0.0,
+          "build_s": null,
+          "rtf": 0.0,
+          "pct": 0.0
+        }
+      ],
+      "sentence_count": null,
+      "tts": null,
+      "translate": null,
+      "models": {
+        "ingest": "ffmpeg",
+        "separate": "htdemucs_fast",
+        "diarize": "sortformer_nemo",
+        "emotion": "emotion2vec_plus_base",
+        "asr": "qwen3_asr_1_7b",
+        "translate": "openrouter_gemini_flash_batch",
+        "tts": "higgs_v3_torch_bf16",
+        "mux": "ffmpeg_pad_stretch",
+        "output": "mkv_default"
+      },
+      "sections": [
+        {
+          "index": 0,
+          "start": 0.0,
+          "end": 33.6,
+          "section_s": 33.6,
+          "wall_s": 8.67,
+          "analysis_wall_s": 7.18,
+          "dub_wall_s": 7.98,
+          "build_s": 0.0,
+          "rtf": 0.258,
+          "stage_wall_s": {
+            "ingest": 0.12,
+            "separate": 1.82,
+            "diarize": 0.51,
+            "emotion": 0.31,
+            "asr": 4.42,
+            "translate": 2.66,
+            "tts": 4.81,
+            "mux": 0.51,
+            "output": 0.0
+          },
+          "new_speakers": [
+            "SPEAKER_01"
+          ],
+          "other_s": 0.0
+        },
+        {
+          "index": 1,
+          "start": 33.6,
+          "end": 69.4,
+          "section_s": 35.8,
+          "wall_s": 19.27,
+          "analysis_wall_s": 2.98,
+          "dub_wall_s": 14.03,
+          "build_s": 0.0,
+          "rtf": 0.538,
+          "stage_wall_s": {
+            "ingest": 0.11,
+            "separate": 1.14,
+            "diarize": 0.23,
+            "emotion": 0.15,
+            "asr": 1.35,
+            "translate": 11.91,
+            "tts": 1.88,
+            "mux": 0.24,
+            "output": 0.0
+          },
+          "new_speakers": [],
+          "other_s": 2.26
+        },
+        {
+          "index": 2,
+          "start": 69.4,
+          "end": 105.1,
+          "section_s": 35.7,
+          "wall_s": 9.31,
+          "analysis_wall_s": 4.89,
+          "dub_wall_s": 6.19,
+          "build_s": 0.0,
+          "rtf": 0.261,
+          "stage_wall_s": {
+            "ingest": 0.11,
+            "separate": 1.23,
+            "diarize": 0.25,
+            "emotion": 0.3,
+            "asr": 3.0,
+            "translate": 2.84,
+            "tts": 3.01,
+            "mux": 0.34,
+            "output": 0.0
+          },
+          "new_speakers": [],
+          "other_s": 0.0
+        },
+        {
+          "index": 3,
+          "start": 105.1,
+          "end": 133.5,
+          "section_s": 28.4,
+          "wall_s": 10.16,
+          "analysis_wall_s": 3.86,
+          "dub_wall_s": 3.2,
+          "build_s": 0.0,
+          "rtf": 0.358,
+          "stage_wall_s": {
+            "ingest": 0.11,
+            "separate": 1.11,
+            "diarize": 0.25,
+            "emotion": 0.2,
+            "asr": 2.19,
+            "translate": 1.85,
+            "tts": 1.18,
+            "mux": 0.16,
+            "output": 0.0
+          },
+          "new_speakers": [],
+          "other_s": 3.1
+        },
+        {
+          "index": 4,
+          "start": 133.5,
+          "end": 170.0,
+          "section_s": 36.5,
+          "wall_s": 13.26,
+          "analysis_wall_s": 6.72,
+          "dub_wall_s": 9.4,
+          "build_s": 0.0,
+          "rtf": 0.363,
+          "stage_wall_s": {
+            "ingest": 0.1,
+            "separate": 1.13,
+            "diarize": 0.46,
+            "emotion": 0.39,
+            "asr": 4.63,
+            "translate": 3.3,
+            "tts": 5.45,
+            "mux": 0.65,
+            "output": 0.0
+          },
+          "new_speakers": [],
+          "other_s": 0.0
+        },
+        {
+          "index": 5,
+          "start": 170.0,
+          "end": 206.5,
+          "section_s": 36.5,
+          "wall_s": 10.64,
+          "analysis_wall_s": 4.46,
+          "dub_wall_s": 9.14,
+          "build_s": 0.0,
+          "rtf": 0.292,
+          "stage_wall_s": {
+            "ingest": 0.12,
+            "separate": 1.1,
+            "diarize": 0.23,
+            "emotion": 0.23,
+            "asr": 2.78,
+            "translate": 5.85,
+            "tts": 2.94,
+            "mux": 0.34,
+            "output": 0.0
+          },
+          "new_speakers": [],
+          "other_s": 0.0
+        },
+        {
+          "index": 6,
+          "start": 206.5,
+          "end": 243.0,
+          "section_s": 36.5,
+          "wall_s": 15.94,
+          "analysis_wall_s": 4.63,
+          "dub_wall_s": 15.21,
+          "build_s": 0.0,
+          "rtf": 0.437,
+          "stage_wall_s": {
+            "ingest": 0.1,
+            "separate": 1.11,
+            "diarize": 0.25,
+            "emotion": 0.23,
+            "asr": 2.93,
+            "translate": 9.05,
+            "tts": 5.52,
+            "mux": 0.64,
+            "output": 0.0
+          },
+          "new_speakers": [],
+          "other_s": 0.0
+        },
+        {
+          "index": 7,
+          "start": 243.0,
+          "end": 279.5,
+          "section_s": 36.5,
+          "wall_s": 13.46,
+          "analysis_wall_s": 5.34,
+          "dub_wall_s": 12.74,
+          "build_s": 0.0,
+          "rtf": 0.369,
+          "stage_wall_s": {
+            "ingest": 0.11,
+            "separate": 1.09,
+            "diarize": 0.22,
+            "emotion": 0.27,
+            "asr": 3.65,
+            "translate": 7.34,
+            "tts": 4.59,
+            "mux": 0.81,
+            "output": 0.0
+          },
+          "new_speakers": [],
+          "other_s": 0.0
+        },
+        {
+          "index": 8,
+          "start": 279.5,
+          "end": 300.97,
+          "section_s": 21.47,
+          "wall_s": 5.67,
+          "analysis_wall_s": 2.96,
+          "dub_wall_s": 4.96,
+          "build_s": 0.0,
+          "rtf": 0.264,
+          "stage_wall_s": {
+            "ingest": 0.09,
+            "separate": 0.8,
+            "diarize": 0.19,
+            "emotion": 0.11,
+            "asr": 1.77,
+            "translate": 2.05,
+            "tts": 2.69,
+            "mux": 0.22,
+            "output": 0.0
+          },
+          "new_speakers": [],
+          "other_s": 0.0
+        }
+      ],
+      "notes": {
+        "prelude_wall_s": 12.92,
+        "sections_wall_s": 106.39,
+        "sections_wall_sum_s": 106.38,
+        "pipeline_overlap_s": 0.0,
+        "prefetch": {
+          "prefetch_hits": 7,
+          "prefetch_misses": 1,
+          "prefetch_discarded": 0
+        },
+        "dubbed_audio_s": 300.97,
+        "n_sections": 9,
+        "total_build_s": 0.0,
+        "time_to_first_audio_s": 21.6,
+        "prewarm_s": 31.16,
+        "other_s": 5.36,
+        "driver": "scheduler",
+        "playhead": "greedy",
+        "stalls": [],
+        "stall_count": 0,
+        "stall_total_s": 0,
+        "build_pct_of_wall": 0.0,
+        "rtf_denominator": "dubbed_audio_s",
+        "agg_rtf_source": 0.396,
+        "cpu_s": {
+          "user": 111.25,
+          "sys": 8.35,
+          "children_user": 5.39,
+          "children_sys": 1.52,
+          "total": 126.51
+        },
+        "probes": {
+          "separate": {
+            "extract_s": 0.4765,
+            "model_s": 7.9815,
+            "vad_load_s": 0.3419,
+            "vad_infer_s": 1.9716,
+            "stem_write_s": 0.3449,
+            "vad_s": 3.2588,
+            "n_vad_intervals": 64
+          },
+          "emotion": {
+            "read_s": 0.054,
+            "resample_s": 0.1422,
+            "infer_s": 1.8177,
+            "pick_refs_s": 0.3012,
+            "n_turns": 161,
+            "n_scored": 154
+          },
+          "asr": {
+            "probe_s": 4.5012,
+            "generate_s": 25.552,
+            "align_s": 0.7435,
+            "tag_s": 0.0163,
+            "n_chunks": 18,
+            "probe_fallbacks": 2,
+            "n_generate_batches": 10,
+            "n_align_batches": 10,
+            "n_sentences": 98
+          },
+          "tts": {
+            "graph_capture_s": 6.0101,
+            "prefill_s": 6.0104,
+            "decode_s": 25.3673,
+            "codec_s": 2.0245,
+            "steps": 1496,
+            "chunks": 11,
+            "live_row_steps": 6427,
+            "total_row_steps": 13776,
+            "values": {
+              "cuda_graphs": true,
+              "ms_per_step_decode": 16.96,
+              "live_row_fraction": 0.467,
+              "attn_impl": "sdpa",
+              "attn_impl_decode": "patmir_gqa_decode",
+              "max_batch": 12,
+              "dtype": "bfloat16",
+              "device": "cuda"
+            },
+            "details": [
+              {
+                "B": 10,
+                "seq": 145,
+                "steps": 148,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  252,
+                  272
+                ],
+                "lengths": [
+                  30,
+                  46,
+                  56,
+                  82,
+                  43,
+                  25,
+                  30,
+                  65,
+                  96,
+                  145
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 10,
+                "seq": 145,
+                "steps": 148,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  252,
+                  272
+                ],
+                "lengths": [
+                  30,
+                  46,
+                  56,
+                  82,
+                  43,
+                  25,
+                  30,
+                  65,
+                  96,
+                  145
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 6,
+                "seq": 133,
+                "steps": 68,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  38,
+                  61,
+                  64,
+                  38,
+                  63,
+                  51
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 9,
+                "seq": 169,
+                "steps": 140,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  276
+                ],
+                "lengths": [
+                  37,
+                  41,
+                  48,
+                  47,
+                  67,
+                  39,
+                  38,
+                  60,
+                  139
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 4,
+                "seq": 119,
+                "steps": 52,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  49,
+                  44,
+                  43,
+                  50
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 8,
+                "seq": 142,
+                "steps": 100,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200
+                ],
+                "lengths": [
+                  93,
+                  48,
+                  30,
+                  39,
+                  98,
+                  44,
+                  63,
+                  56
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 8,
+                "seq": 191,
+                "steps": 152,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  208,
+                  364
+                ],
+                "lengths": [
+                  117,
+                  53,
+                  53,
+                  33,
+                  22,
+                  46,
+                  99,
+                  150
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 9,
+                "seq": 175,
+                "steps": 136,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  268,
+                  300
+                ],
+                "lengths": [
+                  35,
+                  47,
+                  30,
+                  81,
+                  76,
+                  62,
+                  43,
+                  135,
+                  115
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 12,
+                "seq": 234,
+                "steps": 240,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  236,
+                  304,
+                  536
+                ],
+                "lengths": [
+                  36,
+                  34,
+                  38,
+                  87,
+                  109,
+                  67,
+                  69,
+                  97,
+                  51,
+                  105,
+                  119,
+                  236
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 12,
+                "seq": 332,
+                "steps": 180,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  200,
+                  220,
+                  244,
+                  292,
+                  312,
+                  360,
+                  504
+                ],
+                "lengths": [
+                  53,
+                  30,
+                  28,
+                  28,
+                  79,
+                  57,
+                  48,
+                  126,
+                  165,
+                  141,
+                  158,
+                  179
+                ],
+                "attempt": 0
+              },
+              {
+                "B": 5,
+                "seq": 168,
+                "steps": 132,
+                "caps": [
+                  200,
+                  200,
+                  200,
+                  200,
+                  272
+                ],
+                "lengths": [
+                  42,
+                  60,
+                  96,
+                  37,
+                  131
+                ],
+                "attempt": 0
+              }
+            ]
+          },
+          "mux": {
+            "read_s": 0.019,
+            "stretch_s": 3.5273,
+            "write_s": 0.1752,
+            "n_stretch_calls": 111
+          }
+        },
+        "gpu": {
+          "source": "nvml",
+          "device": "NVIDIA GeForce RTX 3090",
+          "power_limit_w": 350.0,
+          "power_limit_default_w": 350.0,
+          "power_limit_is_stock": true,
+          "samples": 117,
+          "interval_s": 1.0,
+          "throttle_reasons": {
+            "sw_power_cap": 14,
+            "sw_thermal_slowdown": 2
+          },
+          "throttled": true,
+          "at_power_ceiling_samples": 14,
+          "thermal_slowdown": true,
+          "capped_below_stock": false,
+          "idle_pct": 24.8,
+          "power_w": {
+            "avg": 183.5,
+            "min": 29.2,
+            "max": 348.5
+          },
+          "sm_mhz": {
+            "avg": 1660.5,
+            "min": 210.0,
+            "max": 1950.0
+          },
+          "mem_mhz": {
+            "avg": 8283.6,
+            "min": 405.0,
+            "max": 9501.0
+          },
+          "temp_c": {
+            "avg": 51.5,
+            "min": 36.0,
+            "max": 67.0
+          },
+          "util_pct": {
+            "avg": 35.5,
+            "min": 0.0,
+            "max": 97.0
+          },
+          "mem_util_pct": {
+            "avg": 20.4,
+            "min": 0.0,
+            "max": 86.0
+          },
+          "mem_used_mb": {
+            "avg": 17127.5,
+            "min": 15814.5,
+            "max": 18827.2
+          }
+        },
+        "peak_vram_gb": 16.68,
+        "peak_vram_reserved_gb": 16.94,
+        "vram_free_gb": 7.45,
+        "peak_rss_gb": 4.48,
+        "rss_scope": "repeat",
+        "peak_rss_process_gb": 7.49
+      },
+      "profile": "cuda",
+      "warm_cache": true,
+      "warm": false,
+      "build_total_s": 0.0
+    }
+  ]
+}

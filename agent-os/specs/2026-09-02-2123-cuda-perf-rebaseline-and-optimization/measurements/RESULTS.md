@@ -343,3 +343,63 @@ probe; that saving is batch-only.
 Plus **first audio at 22.2 s**, which is dominated by the 40 s prelude window
 (`prelude_window_seconds`); a shorter window starts sooner but establishes
 fewer characters up front.
+
+## Section pipelining (2026-09-02)
+
+Analyse the next section while this one waits on its translate round-trip.
+`SectionPipeline` (`streaming/pipeline.py`), used by the live server and the
+scheduler-driven bench; `process_section` stays the serial path.
+
+### Throughput — greedy playhead, the driver that measures production
+
+| | serial | **pipelined** |
+| --- | ---: | ---: |
+| agg RTF | 0.511 | **0.396** |
+| wall | 153.9 s | **119.3 s** |
+| section time | 139.4 s | **106.4 s** |
+| time to first audio | 23.0 s | **21.6 s** |
+| prefetch hits / misses / discarded | — | **7 / 1 / 0** |
+
+**22 % off watch-along**, on top of the 18 % the earlier work gave it. Stage
+totals barely moved (tts 32.4 -> 32.1, translate 44.2 -> 46.9, asr 27.8 ->
+26.7): the same work happens, ~33 s of it now hidden behind network waits.
+7 of 8 possible prefetches hit and none was discarded.
+
+### Realtime playhead — the stall check, and a wall figure that needs reading
+
+| | baseline | serial | **pipelined** |
+| --- | ---: | ---: | ---: |
+| **stalls** | **0** | **0** | **0** |
+| worst single section | 1.416 | 0.635 | **0.485** |
+| time to first audio | 38.9 s | 22.2 s | **21.4 s** |
+| production time | — | 145.7 s | **100.7 s** |
+| wall (elapsed) | 239.3 s | (not measured) | 187.0 s |
+
+**Production time fell 145.7 -> 100.7 s, 31 %** — a larger gain than greedy
+shows, because a realtime viewer leaves more translate gaps to fill.
+
+**The elapsed wall went UP (145.7 -> 187.0) and that is not a regression.** Two
+things make the raw figures unreadable:
+
+1. **`sections_wall_s` changed definition in this work.** It was the SUM of
+   per-section walls and is now real elapsed, because overlap makes the sum
+   meaningless. For a serial run the two agree, so every pre-pipelining
+   *greedy* row stays comparable — but a realtime row does not, because
+   elapsed includes idle.
+2. **A realtime wall is viewer-bound once production outpaces the lookahead.**
+   `DEFAULT_LOOKAHEAD_SECONDS` is 120, the clip is 301 s, so the last section
+   cannot start until the playhead passes ~181 s no matter how fast we are.
+   Measured directly: of the pipelined run's 174.0 s of section time, **73.3 s
+   was idle waiting for the viewer** (production 100.7 s).
+
+So for watch-along, read **greedy for throughput** and **realtime for stalls
+and first-audio latency**. Faster production shows up in the realtime driver as
+*more idle*, not less wall.
+
+### A telemetry field removed rather than shipped
+
+A `pipeline_overlap_s` note was added and then deleted: bench times
+`pipeline.process()`, which excludes an analysis already done during the
+previous section's translate, so the per-section sum already equals the elapsed
+wall and the field read **0.0 next to a 23 % improvement**. `prefetch_hits` is
+the honest signal.
