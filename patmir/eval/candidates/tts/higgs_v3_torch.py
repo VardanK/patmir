@@ -307,6 +307,131 @@ class _DelayState:
         return bool(self.done.all())
 
 
+# transformers' attention name for our single-token decode kernel. Registered
+# once, lazily, and only used when the candidate asks for it by name.
+_GQA_ATTN = "patmir_gqa_decode"
+_gqa_registered = False
+
+
+def _register_gqa_attention() -> bool:
+    """Register a grouped-query attention kernel for the q_len == 1 decode step.
+
+    Why this exists: transformers' sdpa path sets `use_gqa_in_sdpa` to False
+    whenever an attention mask is present (`integrations/sdpa_attention.py`),
+    so `repeat_kv` materializes K and V four times over — 8 KV heads expanded
+    to 32 query heads — on every layer of every decode step. At B=8 that copy
+    dominates the layer: measured 0.48 ms per layer against 0.17 ms for a
+    grouped matmul, which over 36 layers is ~11 ms of a ~32 ms step.
+
+    Only the single-token case is handled. Prefill (q_len > 1) is delegated
+    straight back to transformers' own sdpa forward, so the long, expensive,
+    numerically-delicate path is untouched and this is not a second attention
+    implementation to maintain.
+
+    `F.scaled_dot_product_attention(enable_gqa=True)` was the obvious
+    alternative and is worse: with a mask it falls to the cuDNN backend and
+    measured 0.99-1.80 ms per layer, slower than the copy it avoids.
+    """
+    global _gqa_registered
+    if _gqa_registered:
+        return True
+    try:
+        import torch
+        from transformers import AttentionInterface, AttentionMaskInterface
+        from transformers.integrations.sdpa_attention import sdpa_attention_forward
+        from transformers.masking_utils import sdpa_mask
+    except ImportError:
+        return False
+
+    def _gqa_decode(module, query, key, value, attention_mask,
+                    scaling=None, **kwargs):
+        if query.shape[2] != 1 or attention_mask is None:
+            return sdpa_attention_forward(module, query, key, value,
+                                          attention_mask, scaling=scaling,
+                                          **kwargs)
+        B, H, _q, D = query.shape
+        kv_heads = key.shape[1]
+        group = H // kv_heads
+        # [B, KVH, G, D] @ [B, KVH, D, L] -> [B, KVH, G, L]: the group axis
+        # rides along as extra rows of the matmul, so the KV heads are read
+        # once instead of being expanded `group` times.
+        scores = torch.matmul(query.view(B, kv_heads, group, D),
+                              key.transpose(-1, -2)).float()
+        scores = scores * (scaling if scaling is not None else D ** -0.5)
+        # The mask arrives as [B, 1, q, L]; q is 1 here.
+        scores = scores.masked_fill(
+            ~attention_mask[:, :, 0].unsqueeze(1).bool(), float("-inf"))
+        probs = scores.softmax(dim=-1).to(value.dtype)
+        out = torch.matmul(probs, value)                    # [B, KVH, G, D]
+        # transformers expects [B, q, H, D].
+        return out.view(B, H, 1, D).transpose(1, 2), None
+
+    try:
+        AttentionInterface.register(_GQA_ATTN, _gqa_decode)
+        # Masks are built exactly as sdpa's are; only the kernel differs.
+        AttentionMaskInterface.register(_GQA_ATTN, sdpa_mask)
+    except Exception:  # noqa: BLE001
+        return False
+    _gqa_registered = True
+    return True
+
+
+class _DecodeGraph:
+    """One captured decode step, replayed once per token.
+
+    What is captured: audio embedding of the fed codes, the 36-layer backbone
+    forward against a `StaticCache`, the audio head, and the position
+    increment. What stays OUTSIDE: sampling. Per-row generators must keep
+    advancing on the host — capturing `multinomial` would freeze its RNG
+    offsets and reintroduce exactly the batch-position dependence that ADR
+    2026-08-24 removed.
+
+    Three things make the capture legal, and all three came from the
+    "worth 0 ms" groundwork commit: the mask lives at a fixed address, nothing
+    inside reads back to the host, and the state machine no longer calls
+    `.item()`.
+
+    Equivalence is measured, not assumed. Graph replay is bitwise identical to
+    eager stepping and `StaticCache` is bitwise identical to `DynamicCache`
+    (verified over 12 steps with ragged left-padded prompts), so this path
+    changes no sample of audio. `GraphedDecodeEquivalenceTest` pins it.
+
+    Capture is per chunk and costs a warmup plus one step, ~0.2 s, against
+    ~14 ms saved on each of a chunk's ~120 steps.
+    """
+
+    __slots__ = ("graph", "logits", "codes_buf", "pos_buf", "cache",
+                 "_cum0", "_pos0", "_mask", "_seq")
+
+    def __init__(self, *, graph, logits, codes_buf, pos_buf, cache,
+                 cum0, pos0, mask, seq) -> None:
+        self.graph = graph
+        self.logits = logits          # static output, [B, N, V] float32
+        self.codes_buf = codes_buf    # static input, [B, N] long
+        self.pos_buf = pos_buf        # static input, [B, 1] long
+        self.cache = cache
+        self._cum0 = cum0             # per-layer cumulative_length after prefill
+        self._pos0 = pos0
+        self._mask = mask
+        self._seq = seq
+
+    def rewind(self) -> None:
+        """Undo what warmup and capture advanced.
+
+        Both run the step for real, so the cache write offset, the position ids
+        and the mask columns they touched have to go back to their
+        post-prefill values or the first replayed step would write into the
+        wrong cache slot.
+        """
+        for layer, saved in zip(self.cache.layers, self._cum0):
+            layer.cumulative_length.copy_(saved)
+        self.pos_buf.copy_(self._pos0)
+        self._mask[:, self._seq:] = 0
+
+    def replay(self) -> None:
+        self.graph.replay()
+
+
 # How often the decode loop asks whether every row has finished. The question
 # costs a device->host read, and asking it per step is what the per-row `.cpu()`
 # used to hide the cost of. At 4, a chunk runs at most 3 forwards past the point
@@ -436,6 +561,8 @@ class HiggsV3Torch:
         seed: int = 0,
         max_retries: int = 2,
         max_batch: int = 8,
+        cuda_graphs: bool = True,
+        decode_attention: str = "sdpa",
         _model: Any = None,
         _tokenizer: Any = None,
     ) -> None:
@@ -452,6 +579,41 @@ class HiggsV3Torch:
         self.base_seed = int(seed)
         self.max_retries = int(max_retries)
         self.tts_max_batch = max(1, int(max_batch))
+        # Capture the decode step as a CUDA graph and replay it. The step is
+        # bound by kernel-LAUNCH cost, not by the 4B weights: a 36-layer model
+        # with negligible widths measured 42.9 ms/step on this box against the
+        # real model's 45.9, so ~93% of the step is the CPU issuing ~36 layers
+        # of kernels. A graph replays them from one launch.
+        #
+        # Bitwise-safe, which was NOT assumed going in and had to be measured:
+        # graph replay is byte-identical to eager stepping, and StaticCache is
+        # byte-identical to DynamicCache even with ragged left-padded prompts.
+        # So this is not a quality trade — see `_capture_decode_graph`.
+        self.cuda_graphs = bool(cuda_graphs)
+        # "gqa" swaps the single-token decode attention for a grouped matmul
+        # that skips transformers' `repeat_kv` expansion; "sdpa" keeps
+        # transformers' kernel everywhere.
+        #
+        # **Defaults to sdpa, and that is a quality decision, not caution.**
+        # Unlike the graph, this changes the reduction order, and at
+        # temperature 0.8 a one-ulp logit difference flips a multinomial draw:
+        # measured, it re-rolls ALL 80 lines of the reference clip, moving
+        # individual line durations by up to 1.24 s (total speech within
+        # 1.4%). Expected quality is unchanged — it is a different draw from
+        # the same distribution — but issue #19 records that this TTS's draws
+        # vary by up to 26 dB on utterance-final level, so a re-roll is a
+        # re-spin of a known lottery and needs an ear verdict before it becomes
+        # the default.
+        #
+        # It is also why this knob belongs in `patmir.toml` when enabled rather
+        # than defaulted on in code: `ui.cache.config_hash` hashes the
+        # candidate entry, so setting it there correctly invalidates cached
+        # dubs. Flipping it in code would leave one cache key able to hold
+        # either rendering.
+        #
+        # Worth 27.15 -> 17.33 ms/step (agg RTF 0.309 -> 0.277) on top of the
+        # graph. Enable with `decode_attention = "gqa"` on this candidate.
+        self.decode_attention = str(decode_attention or "sdpa").lower()
 
         if _model is not None:
             # Injection seam for the equivalence test, which drives a tiny
@@ -506,6 +668,20 @@ class HiggsV3Torch:
         self._up = sys.modules[type(self.model).__module__]
         self.n_codebooks = int(self.model.num_codebooks)
 
+        # Point the BACKBONE at the grouped-attention kernel. Set on the text
+        # config only, so the audio codec's own attention (if any) is untouched;
+        # and the kernel itself delegates every q_len > 1 call back to
+        # transformers, so prefill runs the same code as before.
+        self.attn_impl_decode = self.attn_implementation
+        if self.decode_attention == "gqa" and _register_gqa_attention():
+            try:
+                self.model.model.config._attn_implementation = _GQA_ATTN
+                self.attn_impl_decode = _GQA_ATTN
+            except Exception as exc:  # noqa: BLE001
+                print(f"tts: could not select {_GQA_ATTN} "
+                      f"({type(exc).__name__}: {exc}) — keeping "
+                      f"{self.attn_implementation}")
+
         # Reference clip -> raw [T, N] codes. Upstream re-encodes the reference
         # on every call; with one pinned ref per speaker that is the same clip
         # re-encoded once per sentence.
@@ -514,6 +690,8 @@ class HiggsV3Torch:
             "engine": f"higgs_v3_torch_{dtype}",
             "device": self.device,
             "max_batch": self.tts_max_batch,
+            "cuda_graphs": self.cuda_graphs,
+            "decode_attention": self.decode_attention,
             "sentences": 0,
             "overflows": 0,
             "batches": 0,
@@ -603,6 +781,91 @@ class HiggsV3Torch:
         )
 
     # ---- batched autoregressive decode ---- #
+    def _capture_decode_graph(self, *, embeds, mask_full, position_ids, seq,
+                              B, N, device, probe):
+        """Prefill into a `StaticCache` and capture one decode step.
+
+        Returns `(holder, hidden0, next_pos)`, or None whenever graphs are
+        unavailable or capture fails — in which case the caller does an
+        ordinary prefill and steps eagerly. That fallback is bitwise identical
+        and only ~14 ms/step slower, so a failure here costs speed and never
+        correctness.
+
+        Owning the prefill is deliberate: a `DynamicCache` prefill cannot be
+        transplanted into a `StaticCache`, and doing both would pay for it
+        twice.
+        """
+        import torch
+
+        if not self.cuda_graphs or device.type != "cuda":
+            return None
+        try:
+            from transformers import StaticCache
+        except ImportError:
+            return None
+
+        model = self.model
+        max_cache_len = mask_full.shape[1]
+        try:
+            with probe.section("graph_capture_s"):
+                cache = StaticCache(
+                    config=model.config.text_config, max_cache_len=max_cache_len)
+                out = model.model(
+                    inputs_embeds=embeds,
+                    attention_mask=mask_full[:, :seq],
+                    position_ids=position_ids,
+                    use_cache=True,
+                    past_key_values=cache,
+                )
+                hidden0 = out.last_hidden_state[:, -1, :]
+                next_pos = position_ids[:, -1] + 1
+
+                codes_buf = torch.zeros(B, N, dtype=torch.long, device=device)
+                pos_buf = next_pos.unsqueeze(1).clone()
+                cum0 = [l.cumulative_length.clone() for l in cache.layers]
+                pos0 = pos_buf.clone()
+
+                def _step():
+                    step_embed = model.audio_embedding(codes_buf).unsqueeze(1).to(
+                        embeds.dtype)
+                    o = model.model(
+                        inputs_embeds=step_embed,
+                        attention_mask=mask_full,
+                        position_ids=pos_buf,
+                        past_key_values=cache,
+                        use_cache=True,
+                    )
+                    lg = model.audio_head(o.last_hidden_state[:, -1, :]).to(
+                        torch.float32)
+                    pos_buf.add_(1)
+                    return lg
+
+                holder = _DecodeGraph(
+                    graph=None, logits=None, codes_buf=codes_buf,
+                    pos_buf=pos_buf, cache=cache, cum0=cum0, pos0=pos0,
+                    mask=mask_full, seq=seq)
+
+                # PyTorch requires warmup on a side stream before capture.
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(3):
+                        _step()
+                torch.cuda.current_stream().wait_stream(side)
+                holder.rewind()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    logits_static = _step()
+                holder.graph = graph
+                holder.logits = logits_static
+                holder.rewind()
+            return holder, hidden0, next_pos
+        except Exception as exc:  # noqa: BLE001
+            print(f"tts: CUDA graph capture unavailable "
+                  f"({type(exc).__name__}: {exc}) — eager decode")
+            return None
+
     def _decode_chunk(self, requests: list[_Request],
                       attempt: int = 0) -> list[tuple[Any, bool]]:
         """Decode a chunk of requests together.
@@ -658,17 +921,29 @@ class HiggsV3Torch:
         position_ids = (mask.cumsum(-1) - 1).clamp(min=0)
 
         with torch.no_grad():
+            # The graph path prefills into its own StaticCache, so only one
+            # prefill runs either way.
+            graph = None
             with probe.section("prefill_s"):
-                out = model.model(
-                    inputs_embeds=embeds,
-                    attention_mask=mask,
-                    position_ids=position_ids,
-                    use_cache=True,
-                    cache_position=torch.arange(seq, device=device),
-                )
-            past = out.past_key_values
-            hidden = out.last_hidden_state[:, -1, :]          # [B, D]
-            next_pos = position_ids[:, -1] + 1                 # [B]
+                captured = self._capture_decode_graph(
+                    embeds=embeds, mask_full=mask_full,
+                    position_ids=position_ids, seq=seq, B=B, N=N,
+                    device=device, probe=probe)
+                if captured is not None:
+                    graph, hidden, next_pos = captured
+                    past = None
+                else:
+                    out = model.model(
+                        inputs_embeds=embeds,
+                        attention_mask=mask,
+                        position_ids=position_ids,
+                        use_cache=True,
+                        cache_position=torch.arange(seq, device=device),
+                    )
+                    past = out.past_key_values
+                    hidden = out.last_hidden_state[:, -1, :]      # [B, D]
+                    next_pos = position_ids[:, -1] + 1             # [B]
+            probe.set("cuda_graphs", graph is not None)
 
             # One RNG stream per row, seeded from that request's own content, so
             # a sentence's audio cannot depend on its batch-mates or its slot.
@@ -701,7 +976,13 @@ class HiggsV3Torch:
                     # inflates the very total it explains. `decode_s` is the
                     # number to quote.
                     with probe.step_section("sample_s"):
-                        logits = model.audio_head(hidden).to(torch.float32)   # [B, N, V]
+                        if graph is None or step == 0:
+                            # Step 0's logits come from the prefill's hidden
+                            # state, which is outside the captured region.
+                            logits = model.audio_head(hidden).to(torch.float32)
+                        else:
+                            # Produced by the previous iteration's replay.
+                            logits = graph.logits                             # [B, N, V]
                         if self.temperature <= 1e-5:
                             # Upstream's argmax path consumes no randomness, so
                             # neither does this one — which is what lets the
@@ -736,19 +1017,27 @@ class HiggsV3Torch:
                         break
 
                     with probe.step_section("forward_s"):
-                        step_embed = model.audio_embedding(fed).unsqueeze(1).to(embeds.dtype)
                         mask_full[:, seq + step] = 1
-                        out = model.model(
-                            inputs_embeds=step_embed,
-                            attention_mask=mask_full[:, :seq + step + 1],
-                            position_ids=next_pos.unsqueeze(1),
-                            past_key_values=past,
-                            use_cache=True,
-                            cache_position=cache_pos[step:step + 1],
-                        )
-                    past = out.past_key_values
-                    hidden = out.last_hidden_state[:, -1, :]
-                    next_pos = next_pos + 1
+                        if graph is not None:
+                            # One launch for the whole 36-layer step. The codes
+                            # buffer is a captured input, so feeding it is a
+                            # copy into a fixed address.
+                            graph.codes_buf.copy_(fed)
+                            graph.replay()
+                        else:
+                            step_embed = model.audio_embedding(fed).unsqueeze(1).to(
+                                embeds.dtype)
+                            out = model.model(
+                                inputs_embeds=step_embed,
+                                attention_mask=mask_full[:, :seq + step + 1],
+                                position_ids=next_pos.unsqueeze(1),
+                                past_key_values=past,
+                                use_cache=True,
+                                cache_position=cache_pos[step:step + 1],
+                            )
+                            past = out.past_key_values
+                            hidden = out.last_hidden_state[:, -1, :]
+                            next_pos = next_pos + 1
 
             # The one device->host read of the whole chunk.
             lengths = state.length.tolist()
@@ -835,6 +1124,8 @@ class HiggsV3Torch:
             pr.set("live_row_fraction",
                    round(pr.counters.get("live_row_steps", 0) / total_rows, 3))
         pr.set("attn_impl", self.attn_implementation)
+        pr.set("attn_impl_decode", getattr(self, "attn_impl_decode",
+                                           self.attn_implementation))
         pr.set("max_batch", self.tts_max_batch)
         pr.set("dtype", self.dtype_name)
         pr.set("device", self.device)
@@ -949,6 +1240,19 @@ def _wav_bytes(audio: np.ndarray, sr: int) -> bytes:
     return buf.getvalue()
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean override from the environment.
+
+    Present so a perf A/B can flip one lever between two runs without editing
+    `patmir.toml` — which would otherwise put a config change in the middle of
+    a measurement series.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def build(config: dict[str, Any]) -> HiggsV3Torch:
     return HiggsV3Torch(
         repo_id=config.get("repo_id", REPO_DEFAULT),
@@ -961,4 +1265,9 @@ def build(config: dict[str, Any]) -> HiggsV3Torch:
         seed=int(config.get("seed", 0)),
         max_retries=int(config.get("max_retries", 2)),
         max_batch=int(config.get("max_batch", 8)),
+        # Bench-only override so the max_batch sweep needs no patmir.toml edit.
+        cuda_graphs=_env_flag("PATMIR_TTS_CUDA_GRAPHS",
+                              bool(config.get("cuda_graphs", True))),
+        decode_attention=os.environ.get(
+            "PATMIR_TTS_DECODE_ATTN", str(config.get("decode_attention", "sdpa"))),
     )

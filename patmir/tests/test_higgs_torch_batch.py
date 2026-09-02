@@ -29,6 +29,7 @@ import os
 import unittest
 import wave
 from pathlib import Path
+from unittest import mock
 
 from patmir.eval.candidates.tts import higgs_v3_torch
 from patmir.eval.candidates.tts.higgs_v3_torch import (
@@ -1265,3 +1266,287 @@ class SamplerStateVectorizationTest(unittest.TestCase):
         _e, lengths, over = self._vectorized([st], [N + 3], N)
         self.assertEqual(lengths[0], N + 3)
         self.assertTrue(over[0])
+
+
+def _cuda_or_skip():
+    try:
+        import torch
+    except ImportError:  # pragma: no cover
+        raise unittest.SkipTest("torch unavailable")
+    if not torch.cuda.is_available():
+        raise unittest.SkipTest("no CUDA device")
+    return torch
+
+
+class GqaDecodeAttentionTest(unittest.TestCase):
+    """The grouped-query decode kernel: right answer, right scope.
+
+    transformers sets `use_gqa_in_sdpa` False whenever a mask is present, so
+    `repeat_kv` expands 8 KV heads to 32 on every layer of every decode step.
+    This kernel keeps them grouped. It is NOT bitwise against sdpa — the
+    reduction order differs — so what is pinned here is that it computes
+    attention correctly, and that it only ever touches the single-token case.
+    """
+
+    def _register(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import (
+            _GQA_ATTN,
+            _register_gqa_attention,
+        )
+        if not _register_gqa_attention():
+            self.skipTest("transformers AttentionInterface unavailable")
+        from transformers import AttentionInterface
+        return AttentionInterface._global_mapping[_GQA_ATTN]
+
+    class _Mod:
+        num_key_value_groups = 4
+
+    def test_matches_a_reference_attention_for_one_token(self):
+        import torch
+        fn = self._register()
+        torch.manual_seed(0)
+        B, KVH, G, D, L = 2, 8, 4, 128, 40
+        H = KVH * G
+        q = torch.randn(B, H, 1, D)
+        k = torch.randn(B, KVH, L, D)
+        v = torch.randn(B, KVH, L, D)
+        mask = torch.ones(B, 1, 1, L, dtype=torch.bool)
+        mask[:, :, :, L // 2:] = False          # half the keys masked out
+
+        out, _ = fn(self._Mod(), q, k, v, mask, scaling=D ** -0.5)
+
+        # Reference: expand the KV heads the way transformers' repeat_kv does.
+        kx = k.repeat_interleave(G, dim=1)
+        vx = v.repeat_interleave(G, dim=1)
+        scores = (q @ kx.transpose(-1, -2)).float() * D ** -0.5
+        scores = scores.masked_fill(~mask, float("-inf"))
+        ref = (scores.softmax(-1).to(v.dtype) @ vx).transpose(1, 2)
+        self.assertEqual(out.shape, ref.shape)
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+    def test_group_axis_is_not_transposed(self):
+        # A wrong view() here silently permutes heads: attention still runs,
+        # audio still comes out, and it is noise. So check a head-asymmetric
+        # case rather than trusting the shape.
+        import torch
+        fn = self._register()
+        B, KVH, G, D, L = 1, 2, 3, 4, 5
+        H = KVH * G
+        q = torch.zeros(B, H, 1, D)
+        for h in range(H):
+            q[0, h, 0, h % D] = 1.0
+        k = torch.randn(B, KVH, L, D)
+        v = torch.randn(B, KVH, L, D)
+        mask = torch.ones(B, 1, 1, L, dtype=torch.bool)
+        out, _ = fn(self._Mod(), q, k, v, mask, scaling=1.0)
+        kx = k.repeat_interleave(G, dim=1)
+        vx = v.repeat_interleave(G, dim=1)
+        ref = ((q @ kx.transpose(-1, -2)).float().softmax(-1).to(v.dtype) @ vx
+               ).transpose(1, 2)
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+    def test_prefill_is_delegated_untouched(self):
+        # q_len > 1 must go to transformers' own forward: the long path is
+        # where the numerics matter and it is not ours to reimplement.
+        import torch
+        fn = self._register()
+        called = {"n": 0}
+        import transformers.integrations.sdpa_attention as sdpa_mod
+        real = sdpa_mod.sdpa_attention_forward
+
+        def _spy(*a, **kw):
+            called["n"] += 1
+            return real(*a, **kw)
+
+        import patmir.eval.candidates.tts.higgs_v3_torch as cand
+        with mock.patch.object(sdpa_mod, "sdpa_attention_forward", _spy):
+            # Re-register so the closure picks up the patched symbol.
+            cand._gqa_registered = False
+            fn2 = self._register()
+            q = torch.randn(1, 8, 6, 16)       # q_len 6 -> prefill
+            k = torch.randn(1, 2, 6, 16)
+            v = torch.randn(1, 2, 6, 16)
+            fn2(self._Mod(), q, k, v, torch.ones(1, 1, 6, 6, dtype=torch.bool),
+                scaling=0.25)
+        self.assertEqual(called["n"], 1)
+        cand._gqa_registered = False
+
+    def test_no_mask_is_delegated(self):
+        import torch
+        fn = self._register()
+        q = torch.randn(1, 8, 1, 16)
+        k = torch.randn(1, 2, 4, 16)
+        v = torch.randn(1, 2, 4, 16)
+        out, _ = fn(self._Mod(), q, k, v, None, scaling=0.25)
+        self.assertEqual(out.shape, (1, 1, 8, 16))
+
+
+class GraphedDecodeEquivalenceTest(unittest.TestCase):
+    """A captured decode step must equal an eager one, bitwise.
+
+    This is what let the graph ship as a byte-identical change rather than one
+    needing an ear-test, and it was measured rather than assumed: both the
+    `StaticCache` swap and the graph replay came out bitwise equal to the
+    `DynamicCache` eager path over ragged left-padded prompts. If a future
+    torch or transformers breaks that, this fails instead of quietly re-rolling
+    every line in the dub.
+    """
+
+    def test_static_cache_matches_dynamic_cache(self):
+        torch = _cuda_or_skip()
+        from transformers import AutoConfig, DynamicCache, StaticCache
+        from transformers.models.qwen3 import Qwen3Model
+
+        cfg = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B")
+        cfg.num_hidden_layers = 2
+        cfg.hidden_size = 256; cfg.num_attention_heads = 8
+        cfg.num_key_value_heads = 2; cfg.head_dim = 32
+        cfg.intermediate_size = 512
+        cfg._attn_implementation = "sdpa"
+        torch.manual_seed(0)
+        m = Qwen3Model(cfg).to("cuda", torch.bfloat16).eval()
+
+        B, seq, L, steps = 4, 24, 40, 6
+        torch.manual_seed(1)
+        emb = torch.randn(B, seq, 256, device="cuda", dtype=torch.bfloat16)
+        toks = torch.randn(steps, B, 1, 256, device="cuda", dtype=torch.bfloat16)
+        pad = torch.zeros(B, seq, dtype=torch.long, device="cuda")
+        for b in range(B):
+            pad[b, b * 2:] = 1                 # ragged left padding
+
+        def run(static):
+            cache = (StaticCache(config=cfg, max_cache_len=L) if static
+                     else DynamicCache())
+            with torch.no_grad():
+                pos = (pad.cumsum(-1) - 1).clamp(min=0)
+                m(inputs_embeds=emb, attention_mask=pad, position_ids=pos,
+                  use_cache=True, past_key_values=cache)
+                pb = (pos[:, -1] + 1).unsqueeze(1).clone()
+                mask = (torch.zeros(B, L, dtype=torch.long, device="cuda")
+                        if static else pad.clone())
+                if static:
+                    mask[:, :seq] = pad
+                hs = []
+                for i in range(steps):
+                    if static:
+                        mask[:, seq + i] = 1
+                        mk = mask
+                    else:
+                        mask = torch.cat(
+                            [mask, torch.ones(B, 1, dtype=torch.long, device="cuda")], 1)
+                        mk = mask
+                    o = m(inputs_embeds=toks[i], attention_mask=mk,
+                          position_ids=pb, use_cache=True, past_key_values=cache)
+                    hs.append(o.last_hidden_state[:, -1, :].clone())
+                    pb = pb + 1
+            return torch.stack(hs)
+
+        self.assertTrue(torch.equal(run(False), run(True)),
+                        "StaticCache diverged from DynamicCache")
+
+    def test_graph_replay_matches_eager_stepping(self):
+        torch = _cuda_or_skip()
+        from transformers import AutoConfig, StaticCache
+        from transformers.models.qwen3 import Qwen3Model
+
+        cfg = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B")
+        cfg.num_hidden_layers = 2
+        cfg.hidden_size = 256; cfg.num_attention_heads = 8
+        cfg.num_key_value_heads = 2; cfg.head_dim = 32
+        cfg.intermediate_size = 512
+        cfg._attn_implementation = "sdpa"
+        torch.manual_seed(0)
+        m = Qwen3Model(cfg).to("cuda", torch.bfloat16).eval()
+
+        B, seq, L, steps = 4, 24, 40, 6
+        torch.manual_seed(1)
+        emb = torch.randn(B, seq, 256, device="cuda", dtype=torch.bfloat16)
+        toks = torch.randn(steps, B, 1, 256, device="cuda", dtype=torch.bfloat16)
+
+        def run(graphed):
+            cache = StaticCache(config=cfg, max_cache_len=L)
+            mask = torch.zeros(B, L, dtype=torch.long, device="cuda")
+            mask[:, :seq] = 1
+            with torch.no_grad():
+                pos = (mask[:, :seq].cumsum(-1) - 1).clamp(min=0)
+                m(inputs_embeds=emb, attention_mask=mask[:, :seq],
+                  position_ids=pos, use_cache=True, past_key_values=cache)
+                cb = torch.zeros(B, 1, 256, device="cuda", dtype=torch.bfloat16)
+                pb = (pos[:, -1] + 1).unsqueeze(1).clone()
+                cum0 = [l.cumulative_length.clone() for l in cache.layers]
+                pos0 = pb.clone()
+
+                def step():
+                    return m(inputs_embeds=cb, attention_mask=mask,
+                             position_ids=pb, use_cache=True,
+                             past_key_values=cache)
+
+                def rewind():
+                    for layer, saved in zip(cache.layers, cum0):
+                        layer.cumulative_length.copy_(saved)
+                    pb.copy_(pos0)
+                    mask[:, seq:] = 0
+
+                hs = []
+                if graphed:
+                    side = torch.cuda.Stream()
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        for _ in range(3):
+                            step()
+                    torch.cuda.current_stream().wait_stream(side)
+                    rewind()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        out = step()
+                        h_static = out.last_hidden_state[:, -1, :]
+                        pb += 1
+                    rewind()
+                    for i in range(steps):
+                        cb.copy_(toks[i]); mask[:, seq + i] = 1
+                        g.replay()
+                        hs.append(h_static.clone())
+                else:
+                    for i in range(steps):
+                        cb.copy_(toks[i]); mask[:, seq + i] = 1
+                        o = step()
+                        hs.append(o.last_hidden_state[:, -1, :].clone())
+                        pb += 1
+            return torch.stack(hs)
+
+        self.assertTrue(torch.equal(run(False), run(True)),
+                        "graph replay diverged from eager stepping")
+
+
+class DecodeKnobsTest(unittest.TestCase):
+    def test_build_reads_both_knobs_and_env_overrides(self):
+        import os
+
+        from patmir.eval.candidates.tts import higgs_v3_torch as mod
+        seen = {}
+
+        class _Stub:
+            def __init__(self, **kw):
+                seen.update(kw)
+
+        with mock.patch.object(mod, "HiggsV3Torch", _Stub):
+            mod.build({"cuda_graphs": False, "decode_attention": "sdpa"})
+            self.assertFalse(seen["cuda_graphs"])
+            self.assertEqual(seen["decode_attention"], "sdpa")
+
+            with mock.patch.dict(os.environ, {"PATMIR_TTS_CUDA_GRAPHS": "1",
+                                              "PATMIR_TTS_DECODE_ATTN": "gqa"}):
+                mod.build({"cuda_graphs": False, "decode_attention": "sdpa"})
+            self.assertTrue(seen["cuda_graphs"])
+            self.assertEqual(seen["decode_attention"], "gqa")
+
+    def test_env_flag_parsing(self):
+        import os
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import _env_flag
+        self.assertTrue(_env_flag("NOPE_MISSING", True))
+        self.assertFalse(_env_flag("NOPE_MISSING", False))
+        for raw, want in (("0", False), ("false", False), ("no", False),
+                          ("off", False), ("1", True), ("true", True)):
+            with mock.patch.dict(os.environ, {"X_FLAG": raw}):
+                self.assertIs(_env_flag("X_FLAG", not want), want, raw)
