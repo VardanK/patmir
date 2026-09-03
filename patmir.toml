@@ -827,7 +827,14 @@ tts       = "higgs_v3_torch_bf16"  # same Higgs v3 model, upstream transformers 
 # exist off Apple Silicon. `translate` is left alone — the batched OpenRouter
 # candidate that override selects is cloud and platform-independent.
 [pipeline.profiles.cuda.streaming]
-separate  = "htdemucs_fast"        # base single-model torch Demucs
+# Unified with batch 2026-09-03. Both are SINGLE models, so this is not the
+# 4-model bag: the vocals specialist costs about what the base model costs and
+# gives the better vocal stem, which is upstream of ASR, diarization and which
+# window becomes each character's reference clip. It also means one Demucs
+# resident instead of two, which matters on a 24 GB card — the same argument
+# that unified the TTS candidate on 2026-08-23. Author's call; it was Task 9 of
+# the 2026-09-02 perf plan and had been left undone.
+separate  = "htdemucs_vocals"      # ft vocals specialist (sig 04573f0d), as batch
 
 [pipeline.options]
 stretch_cap            = 0.20    # max ±20% time-stretch ratio per sentence (preserves pitch)

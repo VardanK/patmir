@@ -31,8 +31,22 @@ fallback if the `mix − vocals` residual bed is ever dirty on a clip.
 
 ## Watch-along
 
-`streaming_config()` overrides separate → `htdemucs_mlx_fast` (base single-model
-`htdemucs`, ~4× faster than the `_ft` 4-model bag), also on MLX.
+**Apple Silicon:** `streaming_config()` overrides separate →
+`htdemucs_mlx_fast` (base single-model `htdemucs`, ~4× faster than the `_ft`
+4-model bag), also on MLX.
+
+**CUDA (unified with batch 2026-09-03):**
+`[pipeline.profiles.cuda.streaming].separate = "htdemucs_vocals"` — the same
+ft vocals specialist batch runs, replacing `htdemucs_fast`. Both are *single*
+models, so this is not the 4-model bag and costs about what the base model
+costs; what it buys is the better vocal stem, which is upstream of ASR,
+diarization and which window becomes each character's reference clip, plus
+**one Demucs resident instead of two** (the same argument that unified the TTS
+candidate on 2026-08-23, and it matters on a 24 GB card where the accelerator
+lock exists because one pipeline fits and two do not). With this, all four
+model stages are identical between the two modes on CUDA and only `translate`
+differs by design. Changes the watch-along cache key, so cached sections
+regenerate once.
 
 ## Fallback (registered)
 

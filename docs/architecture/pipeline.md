@@ -190,7 +190,10 @@ The same 9 stages run under two execution models, selected per submission by a
 - **Watch-along mode (D3, additive)** — the dub is produced in VAD-snapped
   sections and streamed behind a short buffer while the viewer watches; each
   section is written into the cache as it lands (free rewatch). See ADR
-  `decisions/2026-06-13-near-realtime-d3-spike.md`. Active TTS is the
+  `decisions/2026-06-13-near-realtime-d3-spike.md`. On CUDA all four model
+  stages are the **same candidates as batch** since 2026-09-03 (separate was
+  the last holdout, `htdemucs_fast` -> `htdemucs_vocals`); only `translate`
+  differs, using the batched candidate. Active TTS is the
   ElevenLabs `eleven_v3` preset-voice pool (`elevenlabs_pool`, no IVC cloning),
   which clears realtime; OmniVoice with a low `num_steps` is the offline fallback.
 
