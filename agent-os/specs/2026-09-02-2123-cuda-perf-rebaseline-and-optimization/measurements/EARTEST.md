@@ -13,7 +13,50 @@ produced before, and needed no listening.
 
 ---
 
-## [OPEN] `max_batch = 12`
+## [KEPT, NOT LIKED] `max_batch = 12`
+
+**Verdict 2026-09-03.** The author listened to
+`runs/20260902-234938-sample_1/out.mkv` and rejected it — "audio contains
+artifacts, pauses and the translation quality itself degraded", and separately
+"the very first speech (male actor) starts with garbled sound". On
+investigation **none of the three is attributable to `max_batch`** (see
+"What the investigation found" below), and after that the author's decision was
+to **keep** 12 and the gqa kernel: *"I would not say that I like any of them,
+but let's keep for now."*
+
+So this is not an approval. It is a decision to stop paying for a comparison
+that the pipeline cannot currently support, because run-to-run variance is
+larger than the thing being compared — now filed as **quality issue #28**.
+
+### What the investigation found
+
+The rejected run was compared against the approved one, which confounds four
+independent lotteries. Holding text, refs and emotion fixed and varying only
+the batch width (`runs/ab-mb8` vs `runs/ab-mb12`, both resumed from the same
+job dir at `--resume-from tts`):
+
+| symptom | measured |
+| --- | --- |
+| garbled first line | onset flatness **0.0002** in the approved run, **0.0076** rejected, **0.0056** at batch 8 with identical text and refs — so noisy at both widths |
+| artifacts | 0 non-finite samples, 0 clipped in the mix, no discontinuity; batch 8's worst intra-line step (0.673) is *larger* than batch 12's (0.667) |
+| pauses | ASR covers 151.4 s of 301.1 s with 7 gaps over 5 s (81.1 s total, max 23.3 s) in **all ten runs**, the approved one included — structural, not new |
+| translation | 24 of 66 shared lines differ; each translate call is one sentence with no history, so concurrency cannot touch wording. The **emotion tag is in the prompt**, and 12 of those 66 sentences carry a different label |
+| the age guard | `audience: teenager`, `audience_honored: true` in both runs, clause 1331 chars, no unsteerable warning — the guard was live, and does not govern police slang or formality |
+
+The cause of the garble is the **pinned reference clip changing**:
+`tts_pin_speaker_ref` picks `max(duration)` over a speaker's refs, those refs
+come from diarization turns, and diarization emitted 91-117 turns across ten
+runs of one file. The approved run pinned SPEAKER_01 from 237.4-248.3 s, the
+rejected one from 273.2-281.4 s — a different cloned voice for the whole video.
+Issue #28.
+
+A test gap the report exposed was closed: the gqa decode kernel had never been
+exercised on **ragged per-row masks**, which is exactly what a wider batch
+produces. It is correct there, and rows provably do not leak into each other.
+
+---
+
+## The question as it was originally posed
 
 ### What to listen to
 

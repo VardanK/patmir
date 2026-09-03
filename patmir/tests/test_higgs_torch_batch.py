@@ -1324,6 +1324,46 @@ class GqaDecodeAttentionTest(unittest.TestCase):
         self.assertEqual(out.shape, ref.shape)
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 
+    def test_ragged_per_row_masks_at_batch_12(self):
+        """Each row masks a different prefix, which is what left-padding is.
+
+        The uniform-mask test above cannot see a bug that mixes rows: with one
+        shared mask, borrowing another row's keys is indistinguishable from
+        using your own. `max_batch = 12` widens the length spread inside a
+        chunk, so the padding is both larger and more ragged than at 8 — if
+        this kernel indexed the mask wrongly, wider batches would degrade and
+        narrow ones would not, which is exactly the shape of a report that
+        batch 12 sounds worse than batch 8.
+        """
+        import torch
+        fn = self._register()
+        torch.manual_seed(3)
+        B, KVH, G, D, L = 12, 8, 4, 128, 96
+        H = KVH * G
+        q = torch.randn(B, H, 1, D)
+        k = torch.randn(B, KVH, L, D)
+        v = torch.randn(B, KVH, L, D)
+        mask = torch.ones(B, 1, 1, L, dtype=torch.bool)
+        for b in range(B):
+            mask[b, :, :, : b * 7] = False     # a different left pad per row
+        mask[:, :, :, L - 1] = True            # the current token, always live
+
+        out, _ = fn(self._Mod(), q, k, v, mask, scaling=D ** -0.5)
+
+        kx = k.repeat_interleave(G, dim=1)
+        vx = v.repeat_interleave(G, dim=1)
+        scores = (q @ kx.transpose(-1, -2)).float() * D ** -0.5
+        ref = (scores.masked_fill(~mask, float("-inf")).softmax(-1).to(v.dtype)
+               @ vx).transpose(1, 2)
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+        # And a row must not be reachable from another row's keys: zeroing
+        # row 0's values may not move row 11's output.
+        v2 = v.clone()
+        v2[0] = 0.0
+        out2, _ = fn(self._Mod(), q, k, v2, mask, scaling=D ** -0.5)
+        torch.testing.assert_close(out2[1:], out[1:], rtol=0, atol=0)
+
     def test_group_axis_is_not_transposed(self):
         # A wrong view() here silently permutes heads: attention still runs,
         # audio still comes out, and it is noise. So check a head-asymmetric
