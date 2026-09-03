@@ -89,6 +89,20 @@ def _slice_mono(audio: np.ndarray, sr: int, start: float, end: float) -> np.ndar
 
 
 
+
+def _centre_window(clip: Any, max_samples: int) -> Any:
+    """The middle `max_samples` of a clip, or the clip if it already fits.
+
+    Bounds the ALiBi bias, which is quadratic in clip length — see
+    `EMOTION_MAX_CLIP_SECONDS` for why the middle rather than the head.
+    """
+    n = len(clip)
+    if n <= max_samples:
+        return clip
+    start = (n - max_samples) // 2
+    return clip[start:start + max_samples]
+
+
 def _batches(clips: list[Any], max_count: int, long_limit: int):
     """Yield `(offset, group)`, keeping any clip over `long_limit` on its own.
 
@@ -254,6 +268,7 @@ class Emotion2VecCandidate:
             clip = _slice_mono(mono_16k, 16_000, turn.start, turn.end)
             if len(clip) < int(0.2 * 16_000):
                 continue                   # < 200 ms — see the neutral default below
+            clip = _centre_window(clip, int(EMOTION_MAX_CLIP_SECONDS * 16_000))
             clips.append(clip)
             scored_at.append(i)
 
@@ -335,6 +350,25 @@ EMOTION_BATCH = 32
 # the emotion stage died of CUDA OOM. A long clip never needed the batch
 # anyway — its per-call overhead is negligible against its own compute.
 EMOTION_BATCH_MAX_SECONDS = 12.0
+# Longest audio handed to the model for ONE clip. A centred window is scored
+# when a turn is longer.
+#
+# The ALiBi bias is quadratic in clip length, so a long turn is expensive on
+# its own, batch or no batch: the measured failure was a **101.5 s** turn
+# needing a **1.15 GiB** single allocation, which no batching change can help
+# because one clip is already the minimum. 16 of that job's 41 turns were over
+# 12 s and 3 were over 60 s. This is NOT a regression from the 2026-09-02
+# batching — the per-call code before it passed whole turns too and would have
+# died the same way; the batching just blew up first on short clips and hid it.
+#
+# 20 s costs ~48 MB (about 1000 frames), against 1.15 GiB for 101.5 s.
+#
+# It IS a quality trade, stated plainly: for a turn over 20 s the emotion label
+# comes from an excerpt rather than the whole turn. The window is CENTRED,
+# because the start of a long turn is often a lead-in and the end a trail-off,
+# so the middle is the most representative of sustained delivery. The
+# alternative on offer is the stage failing the job.
+EMOTION_MAX_CLIP_SECONDS = 20.0
 
 
 def _top_label(raw: Any) -> tuple[str, float]:

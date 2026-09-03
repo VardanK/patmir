@@ -282,3 +282,70 @@ class OomFallbackTest(unittest.TestCase):
         self.assertTrue(_is_oom(RuntimeError("cuda OUT OF MEMORY")))
         self.assertFalse(_is_oom(RuntimeError("shape mismatch")))
         self.assertFalse(_is_oom(ValueError("out of memory")))
+
+
+class LongTurnWindowTest(unittest.TestCase):
+    """A very long turn is scored on a bounded centred window.
+
+    The ALiBi bias is quadratic in clip length, so a long turn is expensive on
+    its own — batch or no batch. Measured: a **101.5 s** turn needed a
+    **1.15 GiB** single allocation and the stage died, with the batch already
+    down to one clip so no batching change could help. 16 of that job's 41
+    turns were over 12 s and 3 over 60 s.
+
+    Not a regression from the 2026-09-02 batching: the per-call code before it
+    passed whole turns too. The batching blew up first on short clips and hid
+    this.
+    """
+
+    def _clip(self, seconds):
+        import numpy as np
+        return np.arange(int(seconds * 16_000), dtype="float32")
+
+    def test_a_clip_that_fits_is_untouched(self):
+        from patmir.pipeline.stages.emotion.emotion2vec import _centre_window
+        clip = self._clip(5)
+        out = _centre_window(clip, 20 * 16_000)
+        self.assertIs(out, clip)
+
+    def test_a_clip_exactly_at_the_limit_is_untouched(self):
+        from patmir.pipeline.stages.emotion.emotion2vec import _centre_window
+        clip = self._clip(20)
+        self.assertEqual(len(_centre_window(clip, 20 * 16_000)), len(clip))
+
+    def test_the_measured_101_second_turn_is_bounded(self):
+        from patmir.pipeline.stages.emotion.emotion2vec import _centre_window
+        out = _centre_window(self._clip(101.5), 20 * 16_000)
+        self.assertEqual(len(out), 20 * 16_000)
+
+    def test_the_window_is_centred_not_the_head(self):
+        """The start of a long turn is often a lead-in and the end a
+        trail-off, so the middle is the most representative of sustained
+        delivery. `_clip` is a ramp, so its values identify the position."""
+        from patmir.pipeline.stages.emotion.emotion2vec import _centre_window
+        clip = self._clip(60)
+        out = _centre_window(clip, 20 * 16_000)
+        expected_start = (len(clip) - 20 * 16_000) // 2
+        self.assertEqual(float(out[0]), float(expected_start))
+        self.assertGreater(float(out[0]), 0.0, "not the head of the clip")
+
+    def test_a_short_clip_is_never_padded(self):
+        # A 200 ms clip must stay 200 ms: padding would put silence into the
+        # pooled utterance embedding, which is the thing that would make this
+        # a quality change rather than a memory one.
+        from patmir.pipeline.stages.emotion.emotion2vec import _centre_window
+        clip = self._clip(0.25)
+        self.assertEqual(len(_centre_window(clip, 20 * 16_000)), len(clip))
+
+    def test_the_cap_keeps_the_allocation_small(self):
+        """The point of the cap, expressed as the ALiBi bias size it implies.
+
+        `[batch * heads, T, T]` at 4 bytes, ~50 frames/s, 12 heads: 101.5 s
+        needs ~1.15 GiB (what failed), 20 s needs ~48 MB.
+        """
+        from patmir.pipeline.stages.emotion.emotion2vec import (
+            EMOTION_MAX_CLIP_SECONDS,
+        )
+        frames = EMOTION_MAX_CLIP_SECONDS * 50
+        gib = (12 * frames * frames * 4) / (1024 ** 3)
+        self.assertLess(gib, 0.2, "the capped clip must be nowhere near 1.15 GiB")
