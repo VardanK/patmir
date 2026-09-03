@@ -165,6 +165,13 @@ class PipelineOptions:
     # windows fail the floor, the longest still wins (never drop a speaker's
     # only ref). Quality issue #12.
     ref_min_rms_db: float = -33.0
+    # Pinning one ref per speaker (`tts_pin_speaker_ref`) used to take the
+    # longest clip regardless of its emotion bin, and Higgs clones prosody
+    # from the reference — so a character whose longest clip was angry
+    # delivered the whole film angrily. Prefer the neutral clip when it is at
+    # least this share of the longest one's length; above 1.0 disables the
+    # preference. Quality issue #15.
+    tts_pin_neutral_fraction: float = 0.5
     # Watch-along only: seconds of the opening analyzed in the prelude to
     # establish the cast before playback starts. Smaller = faster time-to-first
     # -audio, but fewer characters are seen up front (later ones register on the

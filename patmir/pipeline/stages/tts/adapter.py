@@ -35,6 +35,12 @@ from patmir.pipeline.stage import (
 )
 
 
+
+def _ref_seconds(ref: Any) -> float:
+    """Length of a reference clip's source window, in seconds."""
+    return float(ref.source_end - ref.source_start)
+
+
 class SentenceTTS:
     id = "tts_adapter"
 
@@ -101,7 +107,8 @@ class SentenceTTS:
         return r.ref_text.strip() != ""
 
     def _lookup_ref(self, diarization: Diarization | None, speaker_id: str | None, emotion: str | None,
-                    pin_speaker_ref: bool = False):
+                    pin_speaker_ref: bool = False,
+                    neutral_fraction: float = 0.5):
         """Fallback chain (Phase 2.x): preserve speaker identity first,
         emotion match second.
 
@@ -121,19 +128,46 @@ class SentenceTTS:
         if diarization is None or not speaker_id:
             return None
 
-        # Any usable ref for this speaker, longest source window first.
-        same_speaker = [
-            r for (spk, _bin), r in diarization.refs.items()
+        # Any usable ref for this speaker, keeping the emotion bin: the pin
+        # below needs it, and `refs` is keyed by `(speaker, bin)`.
+        same_binned = [
+            (bin_, r) for (spk, bin_), r in diarization.refs.items()
             if spk == speaker_id and self._usable(r)
         ]
-        # Pin one ref per speaker: ignore emotion entirely, always use the
-        # longest/cleanest same-speaker clip so the cloned voice never swaps
-        # mid-character. (Emotion varies via the TTS candidate's own emotion
-        # control — an inline `<|emotion:..|>` tag on the Higgs candidates.)
+        same_speaker = [r for _bin, r in same_binned]
+        # Pin one ref per speaker so the cloned voice never swaps mid-character
+        # (quality issue #11). Emotion varies via the TTS candidate's own
+        # control — an inline `<|emotion:..|>` tag on the Higgs candidates.
+        #
+        # Which clip, though, is not emotion-neutral. Higgs clones *prosody*
+        # from the reference, so pinning an angry clip makes a character
+        # deliver every line in the film angrily, calm ones included — and
+        # plain `max(duration)` picked a non-neutral clip in **26 of 34**
+        # speaker-runs measured (angry 10, happy 13, sad 3, neutral 8), because
+        # nothing was looking at the bin. That is a much larger contributor to
+        # "the characters are overdoing it" (quality issue #15) than the
+        # emotion tag, which by then reached only ~9% of sentences.
+        #
+        # So: prefer the neutral clip, but not at any price. A much shorter ref
+        # clones worse (the timbre drift noted on issue #24), so neutral has to
+        # be within `neutral_fraction` of the longest clip to win. One number,
+        # and it says what it means: never trade more than that share of
+        # reference length for neutrality. A value above 1.0 disables the
+        # preference, since a neutral clip cannot exceed the longest one — the
+        # same "out of range disables it" convention as
+        # `duplicate_containment`.
         if pin_speaker_ref:
-            if same_speaker:
-                return max(same_speaker, key=lambda r: r.source_end - r.source_start)
-            return None
+            if not same_binned:
+                return None
+            longest = max(same_speaker, key=_ref_seconds)
+            neutral = next((r for b, r in same_binned if b == "neutral"), None)
+            if (
+                neutral is not None
+                and neutral is not longest
+                and _ref_seconds(neutral) >= neutral_fraction * _ref_seconds(longest)
+            ):
+                return neutral
+            return longest
 
         emo = emotion or "neutral"
         ref = diarization.refs.get((speaker_id, emo))
@@ -250,11 +284,16 @@ class SentenceTTS:
             if not s.target_text.strip():
                 continue
             pin_ref = bool(getattr(ctx.options, "tts_pin_speaker_ref", True))
+            neutral_frac = float(getattr(ctx.options, "tts_pin_neutral_fraction", 0.5))
             ref = None
             if self._supports_ref:
                 ref = self._locked_ref(locked_refs, s.speaker_id)
                 if ref is None:
-                    ref = self._lookup_ref(diarization, s.speaker_id, s.emotion, pin_speaker_ref=pin_ref)
+                    ref = self._lookup_ref(
+                        diarization, s.speaker_id, s.emotion,
+                        pin_speaker_ref=pin_ref,
+                        neutral_fraction=neutral_frac,
+                    )
                 if ref is None:
                     ref = self._pool_ref(diarization, s.speaker_id, ref_pool_cfg, speaker_profiles)
             ref_audio = ref.ref_audio if ref is not None else None

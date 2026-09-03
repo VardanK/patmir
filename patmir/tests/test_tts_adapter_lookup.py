@@ -182,3 +182,87 @@ class PoolRefTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PinPrefersNeutralRefTest(unittest.TestCase):
+    """Which clip the per-speaker pin chooses is not emotion-neutral.
+
+    Higgs clones prosody from the reference, so pinning an angry clip makes a
+    character deliver every line angrily — calm ones included. Plain
+    `max(duration)` chose a non-neutral clip in 26 of 34 speaker-runs measured
+    on real data (angry 10, happy 13, sad 3, neutral 8), which is a larger
+    contributor to quality issue #15 than the emotion tag, then reaching ~9%
+    of sentences.
+
+    The rule: prefer neutral, but only when it is within `neutral_fraction` of
+    the longest clip — a much shorter reference clones worse (issue #24's
+    timbre drift), so neutrality is not worth any price.
+    """
+
+    def _refs(self, spec):
+        # spec: {bin: seconds}
+        return _diar({
+            ("SPEAKER_00", bin_): _ref("SPEAKER_00", bin_, start=0.0, end=float(secs))
+            for bin_, secs in spec.items()
+        })
+
+    def _pick(self, spec, fraction=0.5):
+        tts = SentenceTTS(inner=_RefTextOptional())
+        return tts._lookup_ref(
+            self._refs(spec), "SPEAKER_00", "angry",
+            pin_speaker_ref=True, neutral_fraction=fraction,
+        )
+
+    def test_neutral_wins_over_a_longer_angry_clip(self):
+        # The measured case: SPEAKER_01 had angry 13.7s and neutral 8.2s, and
+        # the old rule pinned angry, so the character was angry throughout.
+        ref = self._pick({"angry": 13.72, "neutral": 8.20})
+        self.assertEqual(ref.source_end, 8.20)
+
+    def test_a_much_shorter_neutral_clip_does_not_win(self):
+        # 1.6s against 13.7s is 0.12 of the length — below the floor, so the
+        # longer clip keeps it. Trading that much reference for neutrality
+        # buys emotion at the cost of the voice itself.
+        ref = self._pick({"angry": 13.72, "neutral": 1.60})
+        self.assertEqual(ref.source_end, 13.72)
+
+    def test_exactly_at_the_fraction_qualifies(self):
+        ref = self._pick({"angry": 10.0, "neutral": 5.0})
+        self.assertEqual(ref.source_end, 5.0)
+
+    def test_no_neutral_clip_falls_back_to_the_longest(self):
+        # A speaker seen only while angry still gets their own voice rather
+        # than another character's — the point of step 3 in the chain.
+        ref = self._pick({"angry": 7.7, "happy": 3.0})
+        self.assertEqual(ref.source_end, 7.7)
+
+    def test_neutral_is_used_when_it_is_also_the_longest(self):
+        ref = self._pick({"angry": 3.0, "neutral": 9.0})
+        self.assertEqual(ref.source_end, 9.0)
+
+    def test_a_fraction_above_one_disables_the_preference(self):
+        # Same convention as `duplicate_containment`: out of range turns it
+        # off, because a neutral clip cannot exceed the longest one.
+        ref = self._pick({"angry": 13.72, "neutral": 8.20}, fraction=1.5)
+        self.assertEqual(ref.source_end, 13.72)
+
+    def test_pin_still_returns_none_with_no_usable_ref(self):
+        # A candidate that requires `ref_text` plus a ref with none: the pin
+        # must decline rather than hand back an unusable clip.
+        tts = SentenceTTS(inner=_NeedsRefText())
+        refs = _diar({("SPEAKER_00", "angry"):
+                      _ref("SPEAKER_00", "angry", text="", end=5.0)})
+        ref = tts._lookup_ref(refs, "SPEAKER_00", "angry",
+                              pin_speaker_ref=True, neutral_fraction=0.5)
+        self.assertIsNone(ref)
+
+    def test_the_unpinned_chain_is_untouched(self):
+        # `tts_pin_speaker_ref=false` restores Phase-2.x per-emotion binning,
+        # and this change must not leak into it.
+        tts = SentenceTTS(inner=_RefTextOptional())
+        ref = tts._lookup_ref(
+            self._refs({"angry": 13.72, "neutral": 8.20}),
+            "SPEAKER_00", "angry",
+            pin_speaker_ref=False, neutral_fraction=0.5,
+        )
+        self.assertEqual(ref.source_end, 13.72)   # exact (speaker, angry) match

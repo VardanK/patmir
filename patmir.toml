@@ -838,6 +838,15 @@ voice_gain_db          = -3.0    # global trim on top of the per-sentence RMS ma
 min_ref_seconds        = 1.5     # shortest clean turn that qualifies as a (speaker, emotion) ref clip (ElevenLabs IVC accepts ≥1 s; 1.5 leaves headroom)
 sentence_afade_seconds = 0.05    # per-sentence fade in/out on the AR voice (suppresses boundary bleed — quality issue #4)
 ref_min_rms_db         = -33.0   # loudness floor for ref-clip windows; quieter slices lose to louder eligible ones (quality issue #12)
+# Which clip the per-speaker pin chooses is not emotion-neutral: Higgs clones
+# PROSODY from the reference, so pinning an angry clip makes a character deliver
+# the whole film angrily. Plain "longest wins" picked a non-neutral clip in 26 of
+# 34 speaker-runs measured (angry 10, happy 13, sad 3, neutral 8). Prefer the
+# neutral clip when it is at least this share of the longest one's length — a far
+# shorter reference clones worse, so neutrality is not worth any price. Above 1.0
+# disables the preference (a neutral clip cannot exceed the longest), the same
+# convention as `duplicate_containment`. Quality issue #15.
+tts_pin_neutral_fraction = 0.5
 
 # Age register the translator is steered toward: "child" | "teenager" | "adult".
 # Prompt-only softening — gentler wording, never a dropped, blanked or bleeped
