@@ -62,6 +62,33 @@ async function ensureServerPermission(server) {
   }
 }
 
+/**
+ * Ask the server whether it accepts this token, before storing it.
+ *
+ * Three outcomes, and the distinction matters: a **401 is definitive** — the
+ * server is there and rejects this token, so storing it would leave a
+ * configuration that cannot work. Anything else is inconclusive: the server
+ * may simply not be running yet, which is a legitimate thing to configure
+ * around, so we save and say so rather than blocking.
+ *
+ * A malformed token is what actually broke this on 2026-09-03 — pasted with a
+ * line break — after the server bind, the host permission and the WSL
+ * networking had all been chased first. Nothing checked the one value nobody
+ * suspected.
+ */
+async function verifyToken(server, token) {
+  const url = `${server}/cache/lookup?url=`
+            + encodeURIComponent("https://youtu.be/patmir-probe");
+  try {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (res.status === 401) return { ok: false, kind: "rejected" };
+    if (res.ok) return { ok: true, kind: "verified" };
+    return { ok: true, kind: "status", status: res.status };
+  } catch (err) {
+    return { ok: true, kind: "unreachable", detail: err.message };
+  }
+}
+
 async function save() {
   const raw = serverEl.value.trim();
   const server = PatmirServer.normalizeServerUrl(raw) || (raw ? null : "http://127.0.0.1:8765");
@@ -72,7 +99,11 @@ async function save() {
     statusEl.className = "err";
     return;
   }
-  const token = tokenEl.value.trim();
+  // Normalize before anything looks at it: a trailing newline, a break from a
+  // wrapped terminal line, quotes, or a copied `Bearer ` prefix all arrive
+  // here and all produce a 401 later.
+  const token = PatmirServer.normalizeToken(tokenEl.value);
+  tokenEl.value = token;               // show the viewer what will be stored
   if (!token) {
     statusEl.textContent = "Token is required.";
     statusEl.className = "err";
@@ -88,6 +119,15 @@ async function save() {
   }
   const audience = AUDIENCE_LEVELS.includes(audienceEl.value)
     ? audienceEl.value : DEFAULT_AUDIENCE;
+  const check = await verifyToken(server, token);
+  if (!check.ok) {
+    statusEl.textContent =
+      `${server} rejected that token (401). Nothing saved — re-copy the value `
+      + `\`patmir ui\` printed at startup.`;
+    statusEl.className = "err";
+    return;
+  }
+
   await chrome.storage.local.set({
     patmirServer: server,
     patmirToken: token,
@@ -96,9 +136,21 @@ async function save() {
     patmirSkipAds: skipAdsEl.checked,
     patmirSkipAdSeek: skipAdSeekEl.checked,
   });
-  statusEl.textContent = "Saved.";
-  statusEl.className = "ok";
-  setTimeout(() => { statusEl.textContent = ""; }, 2000);
+
+  if (check.kind === "verified") {
+    statusEl.textContent = "Saved — server reachable and token accepted.";
+    statusEl.className = "ok";
+    setTimeout(() => { statusEl.textContent = ""; }, 4000);
+    return;
+  }
+  // Saved, but we could not confirm it. Say which, and do not clear it: an
+  // unconfirmed save is exactly the state worth leaving on screen.
+  const shape = PatmirServer.looksLikeToken(token)
+    ? "" : " The token is also not the 64 hex characters the server issues.";
+  statusEl.textContent = check.kind === "unreachable"
+    ? `Saved, but ${server} did not respond — is the server running?${shape}`
+    : `Saved, but ${server} answered HTTP ${check.status} instead of 200.${shape}`;
+  statusEl.className = "warn";
 }
 
 saveEl.addEventListener("click", save);

@@ -160,3 +160,125 @@ class EmotionBatchingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LongClipIsolationTest(unittest.TestCase):
+    """A long clip is scored alone, because batch cost is quadratic in it.
+
+    The 2026-09-02 batching capped by COUNT, but emotion2vec's ALiBi bias is a
+    `[batch * heads, T, T]` tensor (`base.py:716`, `.repeat(bn, 1, 1)`), so a
+    batch's memory scales with the square of its longest member. Measured on a
+    58-minute video: a 1.15 GiB single allocation and the emotion stage died of
+    CUDA OOM. The speedup was measured on 24 turns of 1-8 s and is about
+    amortizing per-call setup over SHORT clips; a long clip never needed it.
+    """
+
+    def _clips(self, seconds):
+        import numpy as np
+        return [np.zeros(int(s * 16_000), dtype="float32") for s in seconds]
+
+    def test_short_clips_batch_together(self):
+        from patmir.pipeline.stages.emotion.emotion2vec import _batches
+        groups = list(_batches(self._clips([1, 1, 1, 1]), 4, 12 * 16_000))
+        self.assertEqual([len(g) for _, g in groups], [4])
+
+    def test_a_long_clip_is_alone(self):
+        from patmir.pipeline.stages.emotion.emotion2vec import _batches
+        groups = list(_batches(self._clips([1, 1, 30, 1]), 8, 12 * 16_000))
+        self.assertEqual([len(g) for _, g in groups], [2, 1, 1])
+
+    def test_offsets_stay_aligned_with_the_clip_list(self):
+        """The offset indexes `scored_at`, so a wrong one mislabels every turn
+        after it — the failure this cannot afford."""
+        from patmir.pipeline.stages.emotion.emotion2vec import _batches
+        clips = self._clips([1, 1, 30, 1, 1, 1])
+        seen = []
+        for offset, group in _batches(clips, 2, 12 * 16_000):
+            for k, clip in enumerate(group):
+                seen.append((offset + k, len(clip)))
+        self.assertEqual([i for i, _ in seen], list(range(len(clips))))
+        for i, n in seen:
+            self.assertEqual(n, len(clips[i]))
+
+    def test_every_clip_is_scored_exactly_once(self):
+        from patmir.pipeline.stages.emotion.emotion2vec import _batches
+        clips = self._clips([1, 20, 1, 1, 15, 1, 1, 1, 1])
+        total = sum(len(g) for _, g in _batches(clips, 4, 12 * 16_000))
+        self.assertEqual(total, len(clips))
+
+    def test_a_run_of_long_clips_is_all_singletons(self):
+        from patmir.pipeline.stages.emotion.emotion2vec import _batches
+        groups = list(_batches(self._clips([20, 30, 40]), 8, 12 * 16_000))
+        self.assertEqual([len(g) for _, g in groups], [1, 1, 1])
+
+    def test_no_clips_yields_nothing(self):
+        from patmir.pipeline.stages.emotion.emotion2vec import _batches
+        self.assertEqual(list(_batches([], 4, 12 * 16_000)), [])
+
+
+class OomFallbackTest(unittest.TestCase):
+    """On CUDA OOM the batch halves and retries, down to one clip.
+
+    The size cap is a heuristic and cannot know the real ceiling — it depends
+    on the clip lengths, what else is resident on the card, and fragmentation.
+    This does, by construction.
+    """
+
+    def _cand(self, fail_above):
+        import numpy as np
+
+        from patmir.pipeline.stages.emotion.emotion2vec import Emotion2VecCandidate
+        cand = object.__new__(Emotion2VecCandidate)
+        calls = []
+
+        class _Model:
+            def generate(self, group, **kw):
+                calls.append(len(group))
+                if len(group) > fail_above:
+                    raise RuntimeError("CUDA out of memory. Tried to allocate 1.15 GiB")
+                return [{"labels": ["neutral"], "scores": [0.9]} for _ in group]
+
+        cand.model = _Model()
+        return cand, calls, [np.zeros(16_000, dtype="float32") for _ in range(8)]
+
+    def test_it_halves_until_it_fits(self):
+        cand, calls, clips = self._cand(fail_above=2)
+        out = cand._generate_group(clips)
+        self.assertEqual(len(out), 8, "every clip must still be scored")
+        self.assertIn(8, calls)
+        self.assertIn(2, calls)
+
+    def test_a_batch_that_fits_is_not_split(self):
+        cand, calls, clips = self._cand(fail_above=8)
+        cand._generate_group(clips)
+        self.assertEqual(calls, [8])
+
+    def test_a_single_clip_that_ooms_raises(self):
+        """A genuinely exhausted card must not be silently swallowed."""
+        cand, _calls, clips = self._cand(fail_above=0)
+        with self.assertRaises(RuntimeError):
+            cand._generate_group(clips[:1])
+
+    def test_a_non_oom_error_is_re_raised_immediately(self):
+        import numpy as np
+
+        from patmir.pipeline.stages.emotion.emotion2vec import Emotion2VecCandidate
+        cand = object.__new__(Emotion2VecCandidate)
+        calls = []
+
+        class _Model:
+            def generate(self, group, **kw):
+                calls.append(len(group))
+                raise ValueError("something else entirely")
+
+        cand.model = _Model()
+        with self.assertRaises(ValueError):
+            cand._generate_group([np.zeros(16_000, dtype="float32")] * 4)
+        self.assertEqual(calls, [4], "a non-OOM failure must not be retried")
+
+    def test_oom_is_recognised_in_both_spellings(self):
+        from patmir.pipeline.stages.emotion.emotion2vec import _is_oom
+        self.assertTrue(_is_oom(RuntimeError("CUDA out of memory. Tried...")))
+        self.assertTrue(_is_oom(RuntimeError("cuda OUT OF MEMORY")))
+        self.assertFalse(_is_oom(RuntimeError("shape mismatch")))
+        self.assertFalse(_is_oom(ValueError("out of memory")))

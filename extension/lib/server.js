@@ -44,6 +44,36 @@ function hostPermissionPattern(raw) {
   return `${u.protocol}//${u.hostname}/*`;
 }
 
+/**
+ * Clean up a pasted bearer token.
+ *
+ * The server prints 64 hex characters. What arrives in the field can carry a
+ * trailing newline, a line break from a wrapped terminal, surrounding quotes,
+ * or a `Bearer ` prefix copied along with a curl example — and every one of
+ * those is stored happily and then fails as a 401 that nothing surfaces. A
+ * malformed token is what actually broke this on 2026-09-03, after the bind,
+ * the host permission and the WSL networking had all been chased first.
+ */
+function normalizeToken(raw) {
+  let text = String(raw == null ? "" : raw).trim();
+  text = text.replace(/^["'`]+|["'`]+$/g, "");
+  text = text.replace(/^\s*Bearer\s+/i, "");
+  // A token pasted from a wrapped terminal line arrives with the break in it.
+  text = text.replace(/\s+/g, "");
+  return text;
+}
+
+/**
+ * True when a token has the shape the server issues: 64 hex characters.
+ *
+ * Advisory only — the server is the authority, and `ensure_token` could change
+ * format. Used to warn, never to refuse, so a future format cannot lock the
+ * viewer out of their own options page.
+ */
+function looksLikeToken(raw) {
+  return /^[0-9a-f]{64}$/i.test(normalizeToken(raw));
+}
+
 /** True when a server URL points at this machine, which needs no permission. */
 function isLoopbackServer(raw) {
   const origin = normalizeServerUrl(raw);
@@ -57,6 +87,8 @@ const PatmirServer = {
   normalizeServerUrl,
   hostPermissionPattern,
   isLoopbackServer,
+  normalizeToken,
+  looksLikeToken,
 };
 
 if (typeof module !== "undefined" && module.exports) {
