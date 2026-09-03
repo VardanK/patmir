@@ -40,7 +40,7 @@ class HTDemucs:
     id = "htdemucs"
 
     def __init__(self, model_name: str = "htdemucs_ft", device: str = "auto",
-                 vocals_only: bool = False) -> None:
+                 vocals_only: bool = False, shifts: int = 0) -> None:
         from demucs.pretrained import get_model  # lazy import (heavy)
 
         # Vocals-only mode: `model_name` is the bare signature of htdemucs_ft's
@@ -52,6 +52,27 @@ class HTDemucs:
         # model's own non-vocals stems are not trusted. Mirrors the MLX
         # candidate; ADR 2026-06-19-vocals-only-separation.
         self.vocals_only = vocals_only
+        # `shifts` is demucs' random-shift test-time augmentation, and 0 is
+        # deliberate — it is the whole reason this pipeline was reproducible
+        # from `separate` down. `apply_model` DEFAULTS TO shifts=1, and at
+        # `demucs/apply.py:245` it draws `random.randint(0, 0.5 * samplerate)`
+        # from the unseeded global `random`, shifts the mix by that offset,
+        # separates, and shifts back. With shifts=1 the loop runs once and
+        # divides by 1 — so there is **no averaging**: it is one prediction at
+        # an arbitrary offset, which buys nothing and costs `max_shift` of
+        # extra padded audio through the model.
+        #
+        # Measured consequence of the default: ten runs of one file at one
+        # config produced eight distinct `vocals.wav` files, and every stage
+        # below inherited it — VAD intervals, diarization turns (91-117),
+        # which window became each speaker's reference clip (so a character's
+        # cloned voice changed run to run), emotion labels, and therefore the
+        # translator's prompt. Quality issue #28.
+        #
+        # Averaging needs shifts >= 2, which is a quality/throughput trade
+        # nobody has measured here; if it is ever wanted, seed `random` at the
+        # same time or the reproducibility comes straight back.
+        self.shifts = int(shifts)
         self.device = _resolve_device(device)
         self.model_name = model_name
         self.model = get_model(model_name)
@@ -99,6 +120,7 @@ class HTDemucs:
                 wav,
                 device=self.device,
                 split=True,
+                shifts=self.shifts,
                 progress=False,
             )
         # sources shape: (batch=1, n_sources, channels, samples).
@@ -169,6 +191,7 @@ class HTDemucs:
             "channels": self.channels,
             "model": self.model_name,
             "vocals_only": self.vocals_only,
+            "shifts": self.shifts,
             "device": self.device,
         }
         (ctx.job_dir / "separated.meta.json").write_text(json.dumps(meta, indent=2))
@@ -283,4 +306,5 @@ def build(config: dict[str, Any]) -> HTDemucs:
         model_name=config.get("model", "htdemucs_ft"),
         device=config.get("device", "auto"),
         vocals_only=bool(config.get("vocals_only", False)),
+        shifts=int(config.get("shifts", 0)),
     )

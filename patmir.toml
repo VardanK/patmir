@@ -904,7 +904,11 @@ module = "patmir.pipeline.stages.ingest.ffmpeg"
 id      = "htdemucs_mlx"
 module  = "patmir.pipeline.stages.separate.htdemucs_mlx"
 model   = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
-shifts  = 1
+# 0, not demucs' default 1: shifts=1 is ONE prediction at an unseeded random
+# offset (no averaging — that needs >= 2), and it made every run produce a
+# different vocal stem, which re-rolled ref clips, emotion labels and the
+# translator's prompt underneath it. Quality issue #28.
+shifts  = 0
 overlap = 0.25
 
 # Vocals-specialist single model from the htdemucs_ft bag (sig 04573f0d). The ft
@@ -917,7 +921,7 @@ id          = "htdemucs_mlx_vocals"
 module      = "patmir.pipeline.stages.separate.htdemucs_mlx"
 model       = "04573f0d"
 vocals_only = true
-shifts      = 1
+shifts      = 0          # reproducibility — see htdemucs_mlx above, issue #28
 overlap     = 0.25
 
 # Base single-model Demucs on MLX — ~4× faster than the _ft 4-model bag.
@@ -926,7 +930,7 @@ overlap     = 0.25
 id      = "htdemucs_mlx_fast"
 module  = "patmir.pipeline.stages.separate.htdemucs_mlx"
 model   = "htdemucs"
-shifts  = 1
+shifts  = 0              # reproducibility — see htdemucs_mlx above, issue #28
 overlap = 0.25
 
 # PyTorch Demucs (MPS) — fallback for both variants. ~4× faster base model is
@@ -953,6 +957,7 @@ id          = "htdemucs_vocals"
 module      = "patmir.pipeline.stages.separate.htdemucs"
 model       = "04573f0d"
 vocals_only = true
+shifts      = 0          # reproducibility — see htdemucs_mlx above, issue #28
 device      = "auto"
 
 # ─── Diarize (who-spoke-when) ─────────────────────────────────────────────────

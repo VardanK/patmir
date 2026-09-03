@@ -17,7 +17,7 @@ The runs root defaults to `runs/` next to `patmir.toml` and is set by `[storage]
 | `accompaniment.wav`   | separate | Music + sound-effects bed (drums + bass + other stems summed). What mux mixes under the AR voice. |
 | `speech_vocals.wav`   | separate | VAD-masked vocals with 20 ms cosine fades. What `ref_picker` slices ref clips from. Cleaner than `vocals.wav`. |
 | `non_speech_vocals.wav` | separate | Inverse VAD mask — atmospheric vocals only. Mixed back into the bed at mux time so cartoon screams/laughs survive. |
-| `separated.meta.json` | separate | Sample rate, channels, VAD intervals list, paths.                                        |
+| `separated.meta.json` | separate | Sample rate, channels, VAD intervals list, paths, and `shifts` (0 — demucs' random-shift augmentation, off for reproducibility; issue #28). |
 | `transcript.json`     | asr      | Word-level ASR output: `language`, full `words` list (each with `start`/`end`/`text`), and grouped `sentences` (each with `speaker_id` + Phase-2.x `emotion`). |
 | `sentences.json`      | asr      | Same sentences as in `transcript.json` but flat (legacy convenience).                    |
 | `translated.json`     | translate | `TranslatedTranscript` — source + target text per sentence + timing + speaker_id (+ emotion). |
