@@ -51,6 +51,84 @@ _LEVEL_MATCH_RMS_FLOOR = 1e-3
 
 
 
+
+# The TTS sometimes opens a clip with a loud, pitch-free impulse instead of
+# speech — heard by the author as "a muffled gun shot" before the first word.
+# It is a decoder attack transient, and it is only audible when the clip has no
+# lead-in, which is why it lands on the FIRST line of a job: measured over 3079
+# synthesized lines, a pitch-free impulse at >= 40% of the clip's own peak
+# occurs in **33% of first lines and 1% of all others**. On the reported clip it
+# ran 45 ms at 40-76% of peak, then the voice began — and at 20 ms resolution
+# the final mix jumped 31 dB into a frame with ZERO energy below 300 Hz, louder
+# than the source's own speech peak.
+#
+# Fading it does not fix it: a fade ramps the burst's amplitude but leaves its
+# spectrum, and the burst is longer than the 50 ms fade anyway (85 ms at p90
+# across affected clips, 150 ms max). So it is cut, not smoothed.
+#
+# Detection is deliberately narrow, because a word-initial voiceless fricative
+# (/s/, /ʃ/, /h/) is *also* pitch-free and must survive: the clip's very first
+# frame has to be at least `_BURST_PEAK_FRACTION` of the whole clip's peak,
+# which speech attacks are not — the median first-frame amplitude over
+# non-first lines is 0.005 of peak. The cut then stops at the first frame
+# carrying pitch, and never removes more than `_BURST_MAX_SECONDS`, so a
+# mis-detection costs a consonant rather than a word.
+_BURST_FRAME_SECONDS = 0.005
+_BURST_PEAK_FRACTION = 0.4
+_BURST_TONAL_RATIO = 0.05      # low(20-300Hz) / high(>=300Hz) power
+_BURST_QUIET_FRACTION = 0.05   # below this the head is silence, not a burst
+_BURST_MAX_SECONDS = 0.12      # p90 of measured heads is 0.085 s
+
+
+def _band_ratio(frame, sr: int) -> float:
+    """Power below 300 Hz over power above it — pitch presence, cheaply."""
+    import numpy as np
+
+    n = len(frame)
+    if n < 8:
+        return 1.0
+    spec = np.abs(np.fft.rfft(frame * np.hanning(n))) ** 2
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    high = spec[freqs >= 300.0].sum()
+    if high <= 0.0:
+        return 1.0
+    return float(spec[(freqs > 20.0) & (freqs < 300.0)].sum() / high)
+
+
+def _trim_onset_burst(audio, sr: int):
+    """Drop a loud pitch-free impulse at the very start of a synthesized clip.
+
+    Returns `audio` unchanged unless the first frame is both loud relative to
+    the clip's own peak and free of pitch — see the note above for why the test
+    is that narrow.
+    """
+    import numpy as np
+
+    n = max(8, int(_BURST_FRAME_SECONDS * sr))
+    peak = float(np.abs(audio).max()) if len(audio) else 0.0
+    if peak <= 0.0 or len(audio) < 4 * n:
+        return audio
+
+    first = audio[:n]
+    if float(np.abs(first).max()) < _BURST_PEAK_FRACTION * peak:
+        return audio
+    if _band_ratio(first, sr) >= _BURST_TONAL_RATIO:
+        return audio
+
+    limit = min(len(audio) - n, int(_BURST_MAX_SECONDS * sr))
+    cut = 0
+    while cut + n <= limit:
+        frame = audio[cut:cut + n]
+        # Stop at pitch (the voice) or at a drop into silence — either way the
+        # burst is over and everything after it is the utterance.
+        if _band_ratio(frame, sr) >= _BURST_TONAL_RATIO:
+            break
+        if float(np.abs(frame).max()) < _BURST_QUIET_FRACTION * peak:
+            break
+        cut += n
+    return audio[cut:] if cut else audio
+
+
 def _CLICK_GUARD_SAMPLES(sr: int) -> int:
     """Shortest fade that still removes a step discontinuity: 4 ms."""
     return max(1, int(0.004 * sr))
@@ -151,6 +229,7 @@ class FFmpegPadStretch:
                                          always_2d=False)
             if file_sr != sr:
                 audio = _simple_resample(audio, file_sr, sr)
+            audio = _trim_onset_burst(audio, sr)
             window = max(0.0, s.source_end - s.source_start)
             audio = _stretch_to_window(audio, sr, window, cap, probe=ctx.probe)
 

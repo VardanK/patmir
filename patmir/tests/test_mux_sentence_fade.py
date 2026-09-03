@@ -132,3 +132,100 @@ class AppliedFadeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OnsetBurstTrimTest(unittest.TestCase):
+    """A loud pitch-free impulse at the very start of a clip is cut, not faded.
+
+    Quality issue #30, second and correct diagnosis. The author's description
+    was "a muffled gun shot" before the first word. At 20 ms resolution the
+    final mix jumped 31 dB into a frame with ZERO energy below 300 Hz, louder
+    than the source's own speech peak; the raw clip carried a 45 ms pitch-free
+    head at 40-76% of its peak before the voice began.
+
+    A fade cannot fix that — it scales the burst's amplitude and leaves its
+    spectrum, and the burst is longer than the fade anyway (85 ms at p90 over
+    affected clips). So it is cut.
+
+    Measured over 3079 real lines: this fires on 33% of first lines and 2% of
+    others, median 5 ms, max 75 ms, never reaching the 120 ms cap.
+    """
+
+    def _burst(self, ms, amp=0.8):
+        n = int(ms / 1000 * SR)
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal(n).astype("float32") * amp
+        # High-passed: a decoder attack transient carries no pitch.
+        return np.diff(np.concatenate([[0.0], x])).astype("float32")
+
+    def test_a_burst_before_speech_is_removed(self):
+        from patmir.pipeline.stages.mux.ffmpeg_pad_stretch import _trim_onset_burst
+        clip = np.concatenate([self._burst(45), _tone(SR, amp=0.5, f=150.0)])
+        out = _trim_onset_burst(clip, SR)
+        removed = (len(clip) - len(out)) / SR
+        self.assertGreater(removed, 0.030)
+        self.assertLess(removed, 0.060)
+
+    def test_a_tonal_onset_is_left_alone(self):
+        # A clip that starts on a vowel has pitch in its first frame.
+        from patmir.pipeline.stages.mux.ffmpeg_pad_stretch import _trim_onset_burst
+        clip = _tone(SR, amp=0.5, f=150.0)
+        self.assertEqual(len(_trim_onset_burst(clip, SR)), len(clip))
+
+    def test_a_clip_that_starts_quietly_is_left_alone(self):
+        # The common case — median first-frame amplitude over non-first lines
+        # is 0.005 of peak. Nothing to cut.
+        from patmir.pipeline.stages.mux.ffmpeg_pad_stretch import _trim_onset_burst
+        clip = np.concatenate([np.zeros(int(0.06 * SR), dtype="float32"),
+                               _tone(SR, amp=0.5, f=150.0)])
+        self.assertEqual(len(_trim_onset_burst(clip, SR)), len(clip))
+
+    def test_a_quiet_voiceless_fricative_onset_survives(self):
+        """The safety case this detector exists to respect.
+
+        A word-initial /s/ or /ʃ/ is pitch-free too, so only the *loudness*
+        of the first frame relative to the clip's own peak separates it from
+        a decoder impulse. A fricative sits well below the following vowel.
+        """
+        from patmir.pipeline.stages.mux.ffmpeg_pad_stretch import _trim_onset_burst
+        clip = np.concatenate([self._burst(40, amp=0.05),          # quiet /s/
+                               _tone(SR, amp=0.8, f=150.0)])       # loud vowel
+        self.assertEqual(len(_trim_onset_burst(clip, SR)), len(clip))
+
+    def test_the_cut_never_exceeds_the_cap(self):
+        # A clip that is nothing but noise must not be trimmed away.
+        from patmir.pipeline.stages.mux.ffmpeg_pad_stretch import (
+            _BURST_MAX_SECONDS, _trim_onset_burst,
+        )
+        clip = self._burst(600)
+        removed = (len(clip) - len(_trim_onset_burst(clip, SR))) / SR
+        self.assertLessEqual(removed, _BURST_MAX_SECONDS + 1e-6)
+
+    def test_the_cut_stops_when_the_burst_drops_into_silence(self):
+        from patmir.pipeline.stages.mux.ffmpeg_pad_stretch import _trim_onset_burst
+        clip = np.concatenate([self._burst(20),
+                               np.zeros(int(0.05 * SR), dtype="float32"),
+                               _tone(SR, amp=0.5, f=150.0)])
+        removed = (len(clip) - len(_trim_onset_burst(clip, SR))) / SR
+        self.assertLess(removed, 0.035)
+
+    def test_degenerate_clips_are_returned_unchanged(self):
+        from patmir.pipeline.stages.mux.ffmpeg_pad_stretch import _trim_onset_burst
+        for clip in (np.zeros(0, dtype="float32"),
+                     np.zeros(200, dtype="float32"),
+                     self._burst(2)):
+            self.assertEqual(len(_trim_onset_burst(clip, SR)), len(clip))
+
+    def test_the_real_reported_clip(self):
+        """The measured case, if its artifacts are still on disk."""
+        import os
+        import soundfile as sf
+        p = "runs/ab-fade/tts/0000.wav"
+        if not os.path.exists(p):
+            self.skipTest("reference run not on disk")
+        from patmir.pipeline.stages.mux.ffmpeg_pad_stretch import _trim_onset_burst
+        x, sr = sf.read(p, dtype="float32")
+        if x.ndim > 1:
+            x = x.mean(1)
+        removed = (len(x) - len(_trim_onset_burst(x, sr))) / sr
+        self.assertAlmostEqual(removed, 0.045, places=2)
