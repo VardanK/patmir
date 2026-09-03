@@ -37,11 +37,52 @@ async function load() {
   skipAdSeekEl.checked = patmirSkipAdSeek === true;
 }
 
+/**
+ * Make sure the extension is allowed to talk to `server`.
+ *
+ * The manifest grants `http://127.0.0.1:8765/*` and nothing else, so a server
+ * on another machine is blocked inside the browser before any request leaves —
+ * and that failure is indistinguishable from a server that is down. So the
+ * permission follows the configured address: requested here, at save time,
+ * because `permissions.request` needs a user gesture and the Save click is one.
+ *
+ * Returns true when the address is usable.
+ */
+async function ensureServerPermission(server) {
+  if (PatmirServer.isLoopbackServer(server)) return true;   // already in the manifest
+  const pattern = PatmirServer.hostPermissionPattern(server);
+  if (!pattern) return true;                                 // caller already rejected it
+  try {
+    if (await chrome.permissions.contains({ origins: [pattern] })) return true;
+    return await chrome.permissions.request({ origins: [pattern] });
+  } catch (err) {
+    statusEl.textContent = `Could not request access to ${pattern}: ${err.message}`;
+    statusEl.className = "err";
+    return false;
+  }
+}
+
 async function save() {
-  const server = serverEl.value.trim() || "http://127.0.0.1:8765";
+  const raw = serverEl.value.trim();
+  const server = PatmirServer.normalizeServerUrl(raw) || (raw ? null : "http://127.0.0.1:8765");
+  if (!server) {
+    // Refuse rather than store something that cannot work. A saved-but-broken
+    // address is the state that wastes an evening.
+    statusEl.textContent = `Not a usable server URL: ${raw}`;
+    statusEl.className = "err";
+    return;
+  }
   const token = tokenEl.value.trim();
   if (!token) {
     statusEl.textContent = "Token is required.";
+    statusEl.className = "err";
+    return;
+  }
+  if (!await ensureServerPermission(server)) {
+    // Same reasoning: do NOT save a server the extension may not contact.
+    statusEl.textContent =
+      `Chrome did not grant access to ${server}. Nothing saved — the `
+      + `extension cannot reach a host it has no permission for.`;
     statusEl.className = "err";
     return;
   }

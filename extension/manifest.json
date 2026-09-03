@@ -3,14 +3,29 @@
   "name": "Patmir — Eastern Armenian dub",
   "version": "0.1.0",
   "description": "Translate the active YouTube video into Eastern Armenian using your local Patmir server.",
-  "permissions": ["activeTab", "scripting", "notifications", "storage", "tabs"],
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "notifications",
+    "storage",
+    "tabs"
+  ],
   "host_permissions": [
     "http://127.0.0.1:8765/*",
     "https://*.youtube.com/*",
     "https://youtu.be/*"
   ],
-  "background": { "service_worker": "sw.js" },
-  "action": { "default_popup": "popup.html", "default_title": "Patmir" },
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Patmir"
+  },
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
@@ -21,7 +36,12 @@
         "https://*.youtube.com/*",
         "https://youtu.be/*"
       ],
-      "js": ["lib/sync.js", "lib/session.js", "content.js", "overlay.js"],
+      "js": [
+        "lib/sync.js",
+        "lib/session.js",
+        "content.js",
+        "overlay.js"
+      ],
       "run_at": "document_idle"
     }
   ]
