@@ -322,6 +322,18 @@ def cmd_ui(port: int, runs_root: Path | None, config: Path, host: str = "127.0.0
     if runs_root is not None:
         storage = replace(storage, runs_root=runs_root.expanduser().absolute())
     token = ui_auth.ensure_token(storage.secret_path)
+
+    # One server per machine. Each prewarms the whole model set at boot and a
+    # 24 GB card holds one — a second server starves the first, and the symptom
+    # arrives as "the extension stopped working", never as anything mentioning
+    # memory. The in-process accelerator lock cannot see another process.
+    from patmir.ui.single_instance import ServerAlreadyRunning, acquire
+    try:
+        _lock = acquire(storage.server_lock, host=host, port=port)
+    except ServerAlreadyRunning as exc:
+        print(f"patmir ui: {exc}", file=sys.stderr)
+        return 2
+
     print(f"patmir ui — bind {host}:{port}", file=sys.stderr)
     if host not in ("127.0.0.1", "localhost", "::1"):
         # Say it once, plainly: the job-progress routes predate the token and
@@ -337,8 +349,14 @@ def cmd_ui(port: int, runs_root: Path | None, config: Path, host: str = "127.0.0
         print(f"  library: {storage.library_root}", file=sys.stderr)
     print(f"  token:   {token}  (paste into the Chrome extension options page)",
           file=sys.stderr)
-    serve(host=host, port=port, storage=storage, cfg=cfg, token=token,
-          config_path=config)
+    print("  startup:  prewarming models — the port does not accept "
+          "connections until this finishes (~110 s cold on CUDA)",
+          file=sys.stderr)
+    try:
+        serve(host=host, port=port, storage=storage, cfg=cfg, token=token,
+              config_path=config)
+    finally:
+        _lock.close()          # releases the flock; the kernel would anyway
     return 0
 
 

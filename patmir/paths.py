@@ -64,6 +64,17 @@ class StoragePaths:
         """The local server's bearer token (was `~/.patmir/secret`)."""
         return self.state_root / "secret"
 
+    @property
+    def server_lock(self) -> Path:
+        """Single-instance lock for `patmir ui`.
+
+        Two servers do not fit: each prewarms the whole model set at boot
+        (~16 GB on the CUDA profile), and 24 GB holds one. The in-process
+        accelerator lock cannot see a second *process*, so the second server
+        starves the first — observed 2026-09-03.
+        """
+        return self.state_root / "ui.lock"
+
 
 def defaults(config_path: Path | None = None) -> StoragePaths:
     """The pre-`[storage]` hardcoded paths.
