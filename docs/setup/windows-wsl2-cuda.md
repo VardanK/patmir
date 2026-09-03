@@ -64,6 +64,24 @@ networkingMode=mirrored
 Sized for a 32 GB / 16-thread host, leaving 8 GB and 4 threads for Windows. `networkingMode=mirrored`
 gives bidirectional localhost, which the Chrome extension needs; omit it on Windows 10.
 
+**It has to be in the WINDOWS user profile.** `C:\Users\<you>\.wslconfig`, which is
+`/mnt/c/Users/<you>/.wslconfig` seen from inside WSL — *not* `~/.wslconfig` in the Linux
+home, where it is silently ignored. Found on this box 2026-09-03: the file existed at
+`/home/vardan/.wslconfig` with all four settings, and **none of them were in effect** —
+15 GB of memory instead of 24 (the default is 50 % of the host), all 16 threads instead
+of 12, 4 GB of swap instead of 8, and NAT instead of mirrored networking, which is what
+made a LAN-bound server unreachable. Nothing warns you; every value just stays at its
+default.
+
+Verify after `wsl --shutdown`, from inside WSL — each line should match the file:
+
+```bash
+free -g | awk '/Mem:/ {print "memory " $2 " GB"}'   # 24, not 15
+nproc                                               # 12, not 16
+ip route get 1.1.1.1                                # mirrored: your LAN gateway,
+                                                    # NAT: a 172.x.x.1 address
+```
+
 ```powershell
 wsl --shutdown
 ```
@@ -517,7 +535,7 @@ LAN IP is still refused by that same check.
 | Extension stops working for no visible reason | a **second** `patmir ui` was started. Each prewarms the whole model set at boot (~16 GB on CUDA) and the card holds one, so the second starves the first — and nothing in the symptom mentions memory. A single-instance `flock` now refuses the second server by name; if you see that refusal, stop the other server rather than picking a different port |
 | Server looks dead for the first minute or two | the startup hook prewarms every model *before* uvicorn accepts connections — ~45 s warm on this box, longer cold. It prints `Application startup complete` when the port goes live |
 | Extension cannot reach a server on another host | the manifest grants `http://127.0.0.1:8765/*` only. Since 2026-09-03 the options page **requests** the host permission when you save a non-loopback address, and refuses to save if you decline — so re-save the address and accept the Chrome prompt. Reload the extension after pulling, since `optional_host_permissions` is a manifest change |
-| Extension cannot reach the server | missing `networkingMode=mirrored` |
+| Extension cannot reach the server | missing `networkingMode=mirrored` — and check *where* `.wslconfig` is: in the Linux home it is silently ignored (see Phase 2) |
 | Extension on a second machine cannot reach the server | server bound loopback — add `--host 0.0.0.0` (see Phase 10), then check Windows Firewall allows the port |
 | Mux stage fails | `rubberband-cli` not installed |
 | `uv pip install` reports transformers 4.57.6 vs >=5.5 unsatisfiable | Expected if `qwen-asr` is installed: it pins transformers exactly, and the Higgs TTS checkpoint needs >=5.5. `uv pip uninstall qwen-asr` and never reinstall it — the `qwen3_asr_1_7b` candidate reaches the same models through transformers' native `qwen3_asr` (5.13+), so the package is not needed for Qwen3-ASR on this box |
