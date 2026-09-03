@@ -144,6 +144,32 @@ class StreamRecord:
         }
 
 
+
+def _cached_opening(prior: dict[str, Any] | None,
+                    window_end: float,
+                    tolerance: float = 1.0) -> dict[str, Any] | None:
+    """The cached section that already covers the opening window, if any.
+
+    Matched on the SPAN rather than on `index == 0`, because a manifest
+    repaired by `append_section`'s index dedup (issue #22) can hold the opening
+    window under any index. The window must start at the very beginning and
+    reach `window_end`: a shorter one would leave a hole the scheduler fills
+    from the playhead, not from 0.
+    """
+    for s in (prior or {}).get("sections", []):
+        try:
+            start = float(s["start"])
+            end = float(s["end"])
+            index = int(s["index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if index < 0:
+            continue
+        if start <= tolerance and end >= window_end - tolerance:
+            return s
+    return None
+
+
 def _index_seed(prior: dict[str, Any] | None, opening_index: int) -> int:
     """Highest section index already in the cache, so a resumed stream numbers
     PAST it instead of overwriting.
@@ -507,13 +533,43 @@ class StreamManager:
         rec.window_end = prelude.window_end
         rec.speakers = prelude.speakers
 
-        # 2) Dub the prelude window (section 0), reusing the prelude analysis.
+        # 2) Dub the prelude window (section 0), reusing the prelude analysis —
+        # unless it is ALREADY CACHED, in which case re-doing it is pure loss.
+        #
+        # A restart (issue #21: a `done` stream whose manifest is not
+        # `complete` is resumed by `submit()`) used to re-translate and
+        # re-synthesize the opening window every time, on top of re-running the
+        # prelude analysis. The analysis has to happen — the `SpeakerRegistry`
+        # it builds is not persisted, and every later section resolves speaker
+        # identity against it — but the *audio* is on disk and byte-for-byte
+        # what we would produce again.
+        #
+        # The cost is not just wasted GPU: `scheduler.run()` does not start
+        # until this returns, so nothing NEW is produced for its duration and
+        # the viewer sits frozen at the edge of the audio they already have.
+        # Measured on cache key 8534a9320e5492c2 (a 3471 s video): two prelude
+        # runs 53 s apart with exactly one section cached, section 0 costing
+        # 22.4 s of that — the author reported the video "stuck at 35 sec",
+        # which is inside the 0-39.99 s the cache already held.
         rec.status = "streaming"
-        opening = dub_prelude_window(cfg, prelude, runs_root=self._runs_root,
-                                     stage_cache=stage_cache, cancel=cancel)
-        rec.opening_dub_s = opening.wall_s
-        self._emit(rec, opening)
+        cached_opening = _cached_opening(prior, prelude.window_end)
+        if cached_opening is not None:
+            rec.opening_dub_s = 0.0
+            rec.sections_done = len(prior.get("sections", []))
+            opening_index = int(cached_opening["index"])
+            log.info("Opening window %.2f-%.2f already cached (section %d) — "
+                     "skipping the re-dub and going straight to streaming.",
+                     float(cached_opening["start"]), float(cached_opening["end"]),
+                     opening_index)
+        else:
+            opening = dub_prelude_window(cfg, prelude, runs_root=self._runs_root,
+                                         stage_cache=stage_cache, cancel=cancel)
+            rec.opening_dub_s = opening.wall_s
+            self._emit(rec, opening)
+            opening_index = opening.index
         # The number the viewer actually feels: submit -> first playable audio.
+        # With a cached opening that is the prelude alone, because the audio was
+        # playable before this call started.
         rec.first_audio_s = perf_counter() - t_start
 
         # 3) Stream the rest, playhead-driven. Seed the abandon timer so the
@@ -527,7 +583,7 @@ class StreamManager:
         # at one file. Measured on cache key d5af5653d745ed66, where indices 1
         # and 2 each appeared twice with different windows, so the wrong audio
         # played at 154.9 s and 190.3 s, live and on every rewatch.
-        index_counter = {"n": _index_seed(prior, opening.index)}
+        index_counter = {"n": _index_seed(prior, opening_index)}
 
         # Analyse the next section while this one waits on the translate
         # round-trip. Translate is 29% of watch-along wall with the GPU idle
