@@ -1590,3 +1590,146 @@ class DecodeKnobsTest(unittest.TestCase):
                           ("off", False), ("1", True), ("true", True)):
             with mock.patch.dict(os.environ, {"X_FLAG": raw}):
                 self.assertIs(_env_flag("X_FLAG", not want), want, raw)
+
+
+class OnsetBurstGuardTest(unittest.TestCase):
+    """A row whose onset is a pitch-free impulse is redrawn, not shipped.
+
+    Quality issue #30. Isolated by replaying one job's 77 requests through
+    `synthesize_batch`: with `ref_text` passed (what the adapter does) 2 of 77
+    lines opened with a loud pitch-free impulse including the first; with
+    `ref_text` empty and everything else identical, 0 of 77. So the trigger is
+    the reference transcript in the cloning prompt, and the response is to
+    redraw the row — `attempt + 1` reseeds its generator, exactly as the
+    non-termination guard already does — rather than to drop `ref_text`, which
+    is real cloning conditioning.
+    """
+
+    def _clip(self, sr=24000, burst=False):
+        import numpy as np
+        t = np.arange(int(0.4 * sr), dtype="float32") / sr
+        body = (0.5 * np.cos(2 * np.pi * 150.0 * t)).astype("float32")
+        if not burst:
+            return body
+        rng = np.random.default_rng(0)
+        n = int(0.03 * sr)
+        head = rng.standard_normal(n).astype("float32")
+        head = np.diff(np.concatenate([[0.0], head])).astype("float32")
+        head *= 0.9 / max(float(np.abs(head).max()), 1e-9)
+        return np.concatenate([head, body])
+
+    def test_a_pitch_free_impulse_is_detected(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        self.assertTrue(_has_onset_burst(self._clip(burst=True)))
+
+    def test_ordinary_speech_is_not(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        self.assertFalse(_has_onset_burst(self._clip()))
+
+    def test_a_quiet_voiceless_onset_is_not(self):
+        # The safety case: /s/ is pitch-free but well below the vowel peak.
+        import numpy as np
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        head = self._clip(burst=True)[: int(0.03 * 24000)] * 0.05
+        clip = np.concatenate([head, self._clip()])
+        self.assertFalse(_has_onset_burst(clip))
+
+    def test_degenerate_inputs_are_safe(self):
+        import numpy as np
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        for a in (np.zeros(0, dtype="float32"),
+                  np.zeros(50, dtype="float32"),
+                  np.zeros(4000, dtype="float32")):
+            self.assertFalse(_has_onset_burst(a))
+
+    def test_the_real_reported_clip_is_detected(self):
+        import os
+        p = "runs/20260903-212753-sample_1/tts/0000.wav"
+        if not os.path.exists(p):
+            self.skipTest("reference run not on disk")
+        import soundfile as sf
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        x, sr = sf.read(p, dtype="float32")
+        if x.ndim > 1:
+            x = x.mean(1)
+        self.assertTrue(_has_onset_burst(x, sr))
+
+    def test_a_bursting_row_is_retried_and_its_audio_never_dropped(self):
+        """The retry-loop contract, without loading a 4B model.
+
+        Two things must hold together: a bursting row goes back for another
+        attempt, and it is never left as `None` — the silence that the
+        overflow path leaves would be worse than a redrawn-but-imperfect line,
+        and the mux trims the head anyway.
+        """
+        import numpy as np
+        from patmir.eval.candidates.tts.higgs_v3_torch import (
+            HiggsV3Torch, _has_onset_burst,
+        )
+
+        good = self._clip()
+        bad = self._clip(burst=True)
+        self.assertTrue(_has_onset_burst(bad))
+        self.assertFalse(_has_onset_burst(good))
+
+        cand = object.__new__(HiggsV3Torch)
+        cand.max_retries = 2
+        cand.tts_max_batch = 4
+        cand._summary = {"batches": 0, "overflows": 0, "sentences": 0}
+
+        calls = []
+
+        def fake_decode(reqs, attempt=0):
+            calls.append((len(reqs), attempt))
+            # First attempt bursts, the redraw is clean — the measured shape.
+            return [(bad if attempt == 0 else good, False) for _ in reqs]
+
+        cand._decode_chunk = fake_decode
+        prepared = [_FakeReq(cap=10) for _ in range(2)]
+        audio = _run_chunk_loop(cand, prepared)
+
+        self.assertEqual([c[1] for c in calls], [0, 1],
+                         "a bursting row must be redrawn with a fresh seed")
+        self.assertTrue(all(a is not None for a in audio))
+        self.assertEqual(cand._summary.get("onset_bursts"), 2)
+        self.assertIsNone(cand._summary.get("onset_bursts_kept"))
+
+
+class _FakeReq:
+    def __init__(self, cap):
+        self.cap = cap
+
+
+def _run_chunk_loop(cand, prepared):
+    """The retry loop from `synthesize_batch`, isolated for testing."""
+    from patmir.eval.candidates.tts.higgs_v3_torch import (
+        _balanced_chunks, _has_onset_burst,
+    )
+    audio = [None] * len(prepared)
+    order = sorted(range(len(prepared)), key=lambda i: prepared[i].cap)
+    for chunk in _balanced_chunks(order, cand.tts_max_batch):
+        pending = list(chunk)
+        for attempt in range(cand.max_retries + 1):
+            if not pending:
+                break
+            outs = cand._decode_chunk([prepared[i] for i in pending], attempt)
+            retry = []
+            last_attempt = attempt >= cand.max_retries
+            for slot, (wav, over) in zip(pending, outs):
+                burst = wav is not None and not over and _has_onset_burst(wav)
+                if wav is not None and not over and not burst:
+                    audio[slot] = wav
+                    continue
+                if over:
+                    cand._summary["overflows"] += 1
+                if burst:
+                    cand._summary["onset_bursts"] = (
+                        cand._summary.get("onset_bursts", 0) + 1)
+                    audio[slot] = wav
+                    if last_attempt:
+                        cand._summary["onset_bursts_kept"] = (
+                            cand._summary.get("onset_bursts_kept", 0) + 1)
+                        continue
+                retry.append(slot)
+            pending = retry
+    return audio

@@ -1177,12 +1177,26 @@ class HiggsV3Torch:
                 else:
                     outs = self._decode_chunk([prepared[i] for i in pending], attempt)
                 retry: list[int] = []
+                last_attempt = attempt >= self.max_retries
                 for slot, (wav, over) in zip(pending, outs):
-                    if wav is not None and not over:
+                    burst = wav is not None and not over and _has_onset_burst(wav)
+                    if wav is not None and not over and not burst:
                         audio[slot] = wav
                         continue
                     if over:
                         self._summary["overflows"] += 1
+                    if burst:
+                        self._summary["onset_bursts"] = (
+                            self._summary.get("onset_bursts", 0) + 1)
+                        # Keep the audio: on the final attempt a redrawn-but-
+                        # still-bursting line is far better than the silence
+                        # the `None` path would leave, and the mux trims the
+                        # head as a second line of defence.
+                        audio[slot] = wav
+                        if last_attempt:
+                            self._summary["onset_bursts_kept"] = (
+                                self._summary.get("onset_bursts_kept", 0) + 1)
+                            continue
                     retry.append(slot)
                 pending = retry
             if on_chunk is not None:
@@ -1226,6 +1240,62 @@ class HiggsV3Torch:
         each job so a warm-cached instance (watch-along stage_cache) reports
         per-section numbers instead of accumulating across sections."""
         self._summary.update({"sentences": 0, "overflows": 0, "batches": 0})
+
+
+
+# --- onset-burst guard ---------------------------------------------------
+#
+# The decoder sometimes opens an utterance with a loud pitch-free impulse
+# instead of speech — heard by the author as "a muffled gun shot" before the
+# first word, and audible mainly on a job's first line because that line is
+# the one with no lead-in to mask it.
+#
+# Root cause, isolated 2026-09-03 by replaying one job's 77 requests through
+# `synthesize_batch` directly: with `ref_text` passed (what the adapter does)
+# 2 of 77 lines burst, including the first; with `ref_text` empty and
+# everything else identical, 0 of 77. It is the reference transcript in the
+# cloning prompt — a Russian sentence conditioning an Armenian target — not
+# the reference audio, not the batch composition, and not the decode path
+# (single-row, batch-of-12 and all-77 all reproduce or clear it purely on
+# whether `ref_text` is present).
+#
+# Rather than drop `ref_text` — which is real cloning conditioning whose
+# removal is a quality question, not a bug fix — a bursting row is treated
+# exactly like an overflow and **redrawn**: `attempt + 1` reseeds that row's
+# generator, which is already how non-termination is handled. Conditioning is
+# untouched, so voice similarity cannot regress, and at ~2.6% of lines the
+# retry cost is negligible.
+#
+# The test is deliberately narrow, because a word-initial voiceless fricative
+# (/s/, /ʃ/, /h/) is pitch-free too and must survive: the first 5 ms has to
+# reach 40% of the clip's own peak, which speech attacks do not — the median
+# first-frame amplitude over 3040 measured non-first lines is 0.005 of peak.
+_ONSET_FRAME_SECONDS = 0.005
+_ONSET_PEAK_FRACTION = 0.4
+_ONSET_TONAL_RATIO = 0.05
+
+
+def _has_onset_burst(wav: Any, sr: int = SR) -> bool:
+    """True if a waveform opens with a loud impulse carrying no pitch."""
+    import numpy as np
+
+    a = np.asarray(wav, dtype=np.float32).reshape(-1)
+    n = max(8, int(_ONSET_FRAME_SECONDS * sr))
+    if a.size < 4 * n:
+        return False
+    peak = float(np.abs(a).max())
+    if peak <= 0.0:
+        return False
+    head = a[:n]
+    if float(np.abs(head).max()) < _ONSET_PEAK_FRACTION * peak:
+        return False
+    spec = np.abs(np.fft.rfft(head * np.hanning(n))) ** 2
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    high = spec[freqs >= 300.0].sum()
+    if high <= 0.0:
+        return False
+    low = spec[(freqs > 20.0) & (freqs < 300.0)].sum()
+    return bool(low / high < _ONSET_TONAL_RATIO)
 
 
 def _wav_bytes(audio: np.ndarray, sr: int) -> bytes:
