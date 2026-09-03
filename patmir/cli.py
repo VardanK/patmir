@@ -97,6 +97,12 @@ def main(argv: list[str] | None = None) -> int:
 
     p_ui = sub.add_parser("ui", help="Launch the local FastAPI progress UI.")
     p_ui.add_argument("--port", type=int, default=8765)
+    p_ui.add_argument("--host", type=str, default="127.0.0.1",
+                      help="Interface to bind. Default loopback. Use 0.0.0.0 "
+                           "to reach the server from another machine on the "
+                           "LAN — opt-in, because the /run/<job_id> progress "
+                           "routes have no token and a job id is a guessable "
+                           "timestamp.")
     p_ui.add_argument("--runs-root", type=Path, default=None,
                       help="Override [storage].runs_root for this server.")
     p_ui.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -200,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.runs_cmd == "show":
             return cmd_runs_show(args.job_id, args.config)
     if args.cmd == "ui":
-        return cmd_ui(args.port, args.runs_root, args.config)
+        return cmd_ui(args.port, args.runs_root, args.config, host=args.host)
     if args.cmd == "bench":
         return cmd_bench(args)
     if args.cmd == "submit":
@@ -301,7 +307,7 @@ def cmd_runs_show(job_id: str, config: Path) -> int:
     return 0
 
 
-def cmd_ui(port: int, runs_root: Path | None, config: Path) -> int:
+def cmd_ui(port: int, runs_root: Path | None, config: Path, host: str = "127.0.0.1") -> int:
     if not _require_config(config):
         return 2
     try:
@@ -316,7 +322,14 @@ def cmd_ui(port: int, runs_root: Path | None, config: Path) -> int:
     if runs_root is not None:
         storage = replace(storage, runs_root=runs_root.expanduser().absolute())
     token = ui_auth.ensure_token(storage.secret_path)
-    print(f"patmir ui — bind 127.0.0.1:{port}", file=sys.stderr)
+    print(f"patmir ui — bind {host}:{port}", file=sys.stderr)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        # Say it once, plainly: the job-progress routes predate the token and
+        # a job id is a timestamp, so anything on the network that can guess
+        # one can read that job's audio and transcript.
+        print("  NOTE reachable from the network. /jobs and /stream need the "
+              "token; the /run/<job_id> progress routes do NOT, and a job id "
+              "is a guessable timestamp.", file=sys.stderr)
     print(f"  config:  {config}", file=sys.stderr)
     print(f"  runs:    {storage.runs_root}", file=sys.stderr)
     print(f"  cache:   {storage.cache_root}", file=sys.stderr)
@@ -324,7 +337,8 @@ def cmd_ui(port: int, runs_root: Path | None, config: Path) -> int:
         print(f"  library: {storage.library_root}", file=sys.stderr)
     print(f"  token:   {token}  (paste into the Chrome extension options page)",
           file=sys.stderr)
-    serve(port=port, storage=storage, cfg=cfg, token=token, config_path=config)
+    serve(host=host, port=port, storage=storage, cfg=cfg, token=token,
+          config_path=config)
     return 0
 
 

@@ -463,11 +463,48 @@ so decode audio through `_audio_io` or soundfile.
 ## Phase 10 — Server reachability
 
 ```bash
-patmir ui --port 8000
+patmir ui --profile cuda --port 8000
 ```
 
 Open `http://localhost:8000` from Windows Chrome. If unreachable, add `networkingMode=mirrored`
 to `.wslconfig` and `wsl --shutdown`.
+
+`--profile cuda` matters: it exports `PATMIR_PROFILE`, so the watch-along path
+picks the profile up too. Without it the server boots the MLX candidate set and
+fails on the first job.
+
+### From another machine on the LAN (2026-09-03)
+
+The server binds loopback by default. To reach it from a second machine:
+
+```bash
+patmir ui --profile cuda --port 8000 --host 0.0.0.0
+```
+
+Then point that machine's extension at `http://<windows-host-ip>:8000` in its
+options page, with the same bearer token the server prints at startup.
+
+Three things have to line up, and only the first is ours:
+
+1. **`--host 0.0.0.0`.** Opt-in rather than the default because five
+   `/run/<job_id>` progress routes predate the bearer token and a job id is a
+   guessable timestamp — so on a shared network, anyone who guesses one can
+   read that job's audio and transcript. `/jobs`, `/stream` and `/cache` all
+   require the token. The CLI prints a one-line note when the bind is not
+   loopback.
+2. **`networkingMode=mirrored`** in `.wslconfig` (already set for this box —
+   see Phase 1). WSL2's default NAT gives the VM its own address, so binding
+   `0.0.0.0` inside it is reachable from Windows but *not* from the LAN.
+   Mirrored mode shares the host's interfaces, which is what makes the LAN
+   case work at all. Without it you would need a
+   `netsh interface portproxy` rule plus a firewall rule on Windows.
+3. **Windows Firewall** must allow inbound on the port. A private-network
+   rule is enough; the prompt on first bind usually offers it.
+
+No auth change was needed for this: `_is_loopback_origin` already allows
+`chrome-extension://`, which is the origin the extension sends, so the
+token-protected routes accept it from any machine. A *page* served from the
+LAN IP is still refused by that same check.
 
 ## Pitfalls, by likelihood
 
@@ -478,6 +515,7 @@ to `.wslconfig` and `wsl --shutdown`.
 | Everything inexplicably slow | repo or `HF_HOME` sitting on `/mnt/c/` |
 | Run dies after the first stage with `libmlx.so: cannot open shared object file` | Two compounding causes, both fixed in-tree — `git pull` if you hit it. `[local]` used to install the Apple-only `mlx-*` wheels here (now gated on `sys_platform == 'darwin'`), and `_free_accelerator_cache()`, which runs after **every** stage, probed MLX under `except ImportError` while dlopen actually raises `OSError`. It fired regardless of the active profile, so a correct `PATMIR_PROFILE=cuda` did not save you. Belt and braces: `uv pip uninstall mlx mlx-audio mlx-whisper mlx-lm` |
 | Extension cannot reach the server | missing `networkingMode=mirrored` |
+| Extension on a second machine cannot reach the server | server bound loopback — add `--host 0.0.0.0` (see Phase 10), then check Windows Firewall allows the port |
 | Mux stage fails | `rubberband-cli` not installed |
 | `uv pip install` reports transformers 4.57.6 vs >=5.5 unsatisfiable | Expected if `qwen-asr` is installed: it pins transformers exactly, and the Higgs TTS checkpoint needs >=5.5. `uv pip uninstall qwen-asr` and never reinstall it — the `qwen3_asr_1_7b` candidate reaches the same models through transformers' native `qwen3_asr` (5.13+), so the package is not needed for Qwen3-ASR on this box |
 | ASR dies with `KeyError: 'qwen3_asr'` | transformers older than 5.13, which is where native `qwen3_asr` landed. The candidate gates on this at build time and reports the fix, so you should see a `RuntimeError` naming the version instead; a raw `KeyError` means something bypassed the gate. `uv pip install -U "transformers>=5.13"` |

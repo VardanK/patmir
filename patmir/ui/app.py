@@ -7,7 +7,10 @@ Two surfaces live here:
   and the `patmir submit` CLI: `POST /jobs`, `GET /cache/lookup`,
   `GET /jobs/{id}`, `GET /cache/{key}/dub.wav`, `GET /cache/{key}/metadata.json`.
 
-Bound to `127.0.0.1` only; bearer-token auth gates every new endpoint. The
+Binds `127.0.0.1` by default; `patmir ui --host 0.0.0.0` opens it to the
+network, which is opt-in because the five `/run/...` progress routes have no
+auth and a job id is a guessable timestamp. Bearer-token auth gates every new
+endpoint. The
 existing `/`, `/run/{id}`, `/run/{id}/progress` routes stay open for the
 browser progress UI on the same loopback origin.
 """
@@ -410,6 +413,7 @@ def _is_valid_key(key: str) -> bool:
 
 def serve(
     *,
+    host: str = "127.0.0.1",
     port: int = 8765,
     storage: StoragePaths | None = None,
     cfg: PipelineConfig | None = None,
@@ -432,4 +436,4 @@ def serve(
         token=token,
         config_path=config_path,
     )
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    uvicorn.run(app, host=host, port=port)
