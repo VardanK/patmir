@@ -17,16 +17,19 @@ const DEFAULT_AUDIENCE = "teenager";
 
 async function load() {
   const {
-    patmirServer, patmirToken, patmirAutoPlayEnabled, patmirAudience, patmirSkipAds,
+    patmirServer, patmirToken, patmirTranslateEnabled, patmirAudience, patmirSkipAds,
     patmirSkipAdSeek,
   } = await chrome.storage.local.get([
-    "patmirServer", "patmirToken", "patmirAutoPlayEnabled", "patmirAudience",
+    "patmirServer", "patmirToken", "patmirTranslateEnabled", "patmirAudience",
     "patmirSkipAds", "patmirSkipAdSeek",
   ]);
   serverEl.value = patmirServer || "http://127.0.0.1:8765";
   tokenEl.value = patmirToken || "";
   // Default ON.
-  autoplayEl.checked = patmirAutoPlayEnabled !== false;
+  // One remembered choice for every video, shared with the in-page button:
+  // pressing Թարգմանել sets it, pressing Չթարգմանել / Չեղարկել clears it.
+  // Default OFF, because ON means every video you open submits GPU work.
+  autoplayEl.checked = patmirTranslateEnabled === true;
   audienceEl.value = AUDIENCE_LEVELS.includes(patmirAudience)
     ? patmirAudience : DEFAULT_AUDIENCE;
   // Default ON: clicking the skip control is just the viewer's own gesture a
@@ -131,7 +134,7 @@ async function save() {
   await chrome.storage.local.set({
     patmirServer: server,
     patmirToken: token,
-    patmirAutoPlayEnabled: autoplayEl.checked,
+    patmirTranslateEnabled: autoplayEl.checked,
     patmirAudience: audience,
     patmirSkipAds: skipAdsEl.checked,
     patmirSkipAdSeek: skipAdSeekEl.checked,

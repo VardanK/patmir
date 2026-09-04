@@ -111,20 +111,20 @@
 
   // The playback primitives, extracted from the message handlers so the
   // in-page overlay reaches EXACTLY the same code path the popup does. One
-  // implementation matters most for the opt-out bookkeeping below: a stop that
-  // skipped `setVideoDisabled(url, true)` would be undone by the auto-play
-  // listener within a tick, and the button would look broken.
+  // implementation matters most for the enabled-flag bookkeeping below: a stop
+  // that skipped `setTranslateEnabled(false)` would be undone by the
+  // auto-start within a tick, and the button would look broken.
   async function playQuality(cacheKey) {
-    // Explicit play also removes any prior opt-out for this video so the next
-    // visit auto-plays again.
-    await setVideoDisabled(window.location.href, false);
+    // Pressing play IS the global choice: every later video translates until
+    // the viewer presses stop.
+    await setTranslateEnabled(true);
     stopWatchAlong();
     await startDub(cacheKey);
     return { ok: true };
   }
 
   async function playWatchAlongFor(cacheKey) {
-    await setVideoDisabled(window.location.href, false);
+    await setTranslateEnabled(true);
     stopDub();
     waRevivesUsed = 0;          // a deliberate start earns a fresh budget
     await startWatchAlong(cacheKey);
@@ -169,17 +169,16 @@
   // control hands `video.muted` back to the viewer's own intent (so the original
   // comes back), and the picture keeps rolling. Never pauses, never seeks.
   async function stopTranslation() {
-    // Explicit stop opts this video out of future auto-play — "off" has to stay
-    // off, and it is also what stops the auto-play listener restarting the dub
-    // the moment `patmirDisabledVideos` changes.
-    await setVideoDisabled(window.location.href, true);
+    // Off means off everywhere, and it is also what stops the auto-start
+    // pressing the button again a tick later.
+    await setTranslateEnabled(false);
     stopPlayback();
     return { ok: true };
   }
 
   async function playbackStatus() {
     const url = window.location.href;
-    const disabled = await isVideoDisabled(url);
+    const disabled = !(await getTranslateEnabled());
     const isPlaying = playing || waActive;
     const mode = waActive ? "watch-along" : (playing ? "quality" : null);
     return {
@@ -241,79 +240,33 @@
     }
   }
 
-  async function isVideoDisabled(href) {
-    const key = canonicalUrl(href);
-    const { patmirDisabledVideos = [] } = await chrome.storage.local.get("patmirDisabledVideos");
-    return Array.isArray(patmirDisabledVideos) && patmirDisabledVideos.includes(key);
+  // Translation is ONE remembered choice for every video, not a per-video
+  // opt-out. Author: "should remember the last state (not for a single video),
+  // if enabled it should work for all videos, if disabled should not
+  // translate."
+  //
+  // This replaces `patmirDisabledVideos`, a per-video list that could only ever
+  // say "not this one" and had no way to express "yes, from now on". Turning
+  // translation on therefore SUBMITS work on a video that has never been
+  // dubbed — that is the requested behaviour, and it is why the default is off
+  // until the viewer presses the button once.
+  const TRANSLATE_ENABLED = "patmirTranslateEnabled";
+
+  async function getTranslateEnabled() {
+    const stored = await chrome.storage.local.get(TRANSLATE_ENABLED);
+    return stored[TRANSLATE_ENABLED] === true;
   }
 
-  async function setVideoDisabled(href, disabled) {
-    const key = canonicalUrl(href);
-    const { patmirDisabledVideos = [] } = await chrome.storage.local.get("patmirDisabledVideos");
-    const list = Array.isArray(patmirDisabledVideos) ? patmirDisabledVideos.slice() : [];
-    const idx = list.indexOf(key);
-    if (disabled && idx < 0) list.push(key);
-    if (!disabled && idx >= 0) list.splice(idx, 1);
-    // Bound the list so it doesn't grow forever.
-    while (list.length > 500) list.shift();
-    await chrome.storage.local.set({ patmirDisabledVideos: list });
+  async function setTranslateEnabled(on) {
+    await chrome.storage.local.set({ [TRANSLATE_ENABLED]: !!on });
   }
 
-  async function autoPlayIfApplicable() {
-    if (playing) return;
-    const url = window.location.href;
-    if (!/^https?:\/\//.test(url)) return;
-
-    const { patmirAutoPlayEnabled = true } = await chrome.storage.local.get("patmirAutoPlayEnabled");
-    if (!patmirAutoPlayEnabled) return;
-    if (await isVideoDisabled(url)) return;
-
-    let lookup;
-    try {
-      lookup = await chrome.runtime.sendMessage({ type: "cache:lookup", url });
-    } catch (_) { return; }
-    if (!lookup || !lookup.ok || !lookup.data || !lookup.data.cached) return;
-
-    // Wait for the player <video> element to be ready (YouTube swaps it
-    // in asynchronously after navigation).
-    const found = await waitForVideo(8000);
-    if (!found) return;
-    // Re-check the URL didn't change while we waited.
-    if (window.location.href !== url) return;
-
-    try {
-      await startDub(lookup.data.cache_key);
-    } catch (e) {
-      console.warn("[patmir] auto-play failed:", e);
-    }
-  }
-
-  function waitForVideo(timeoutMs) {
-    return new Promise((resolve) => {
-      const start = Date.now();
-      const tick = () => {
-        if (findVideo()) return resolve(true);
-        if (Date.now() - start > timeoutMs) return resolve(false);
-        setTimeout(tick, 200);
-      };
-      tick();
-    });
-  }
-
-  // Re-check on YouTube SPA navigation (covers watch-page transitions).
-  window.addEventListener("yt-navigate-finish", () => {
-    setTimeout(autoPlayIfApplicable, 250);
-  });
-  // Storage changes from the options page (e.g. user flips the global
-  // toggle on) should re-evaluate too.
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "local") return;
-    if ("patmirAutoPlayEnabled" in changes || "patmirDisabledVideos" in changes) {
-      autoPlayIfApplicable();
-    }
-  });
-  // Initial trigger on first script injection.
-  setTimeout(autoPlayIfApplicable, 500);
+  // `autoPlayIfApplicable` lived here and only ever started a dub that was
+  // ALREADY fully cached, which is why a video that had never been dubbed
+  // always played in the original language. Auto-start now lives in
+  // `overlay.js`, which owns the `Session` and so reaches the whole
+  // submit -> poll -> play path rather than just the last step of it. One
+  // mechanism: two would race to start the same video twice.
 
   // --- core playback --------------------------------------------------
 
@@ -811,8 +764,7 @@
     if (!playing) return;
     if (urlAtStart && window.location.href !== urlAtStart) {
       stopPlayback();
-      // Try auto-playing the new URL if it's also cached.
-      setTimeout(autoPlayIfApplicable, 300);
+      // The overlay's auto-start notices the new URL on its own tick.
       return;
     }
     // Recycler / element swap — the active video is no longer the one we
@@ -820,7 +772,6 @@
     const active = findVideo();
     if (!active || (video && active !== video) || (video && !document.contains(video))) {
       stopPlayback();
-      setTimeout(autoPlayIfApplicable, 300);
     }
   }
 
@@ -1238,7 +1189,6 @@
   setInterval(() => {
     if (window.location.href !== lastSeenUrl) {
       lastSeenUrl = window.location.href;
-      if (!playing) setTimeout(autoPlayIfApplicable, 300);
       for (const cb of urlChangeCallbacks.slice()) {
         try { cb(lastSeenUrl); } catch (_) { /* one bad subscriber, not all */ }
       }

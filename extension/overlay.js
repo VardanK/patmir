@@ -366,6 +366,37 @@
     }
   }
 
+  // --- auto-start ------------------------------------------------------
+  //
+  // `patmirTranslateEnabled` is one remembered choice for every video. When it
+  // is on, the surface presses its own button: the same `session.primary()`
+  // the viewer would, so a video that has never been dubbed is SUBMITTED
+  // rather than skipped. content.js's old auto-play only ever started an
+  // already-cached dub, which is why a new video always played in the
+  // original language.
+  //
+  // Latched per URL, so it fires once per video and re-arms on navigation
+  // without any listener of its own — the tick already runs.
+  let autoStartedFor = null;
+
+  async function maybeAutoStart() {
+    if (!session) return;
+    const url = window.location.href;
+    if (autoStartedFor === url) return;
+    let enabled = false;
+    try {
+      const stored = await chrome.storage.local.get("patmirTranslateEnabled");
+      enabled = stored.patmirTranslateEnabled === true;
+    } catch (_) { return; }
+    if (window.location.href !== url) return;     // navigated while awaiting
+    if (!Session.shouldAutoStart(session.view(), { enabled })) return;
+    // Latch BEFORE awaiting the press: `primary()` takes a round trip to the
+    // server, and a second tick inside that window would submit twice.
+    autoStartedFor = url;
+    try { await session.primary(); } catch (_) { /* the view shows it */ }
+    render();
+  }
+
   function onPress() {
     if (!session) return;
     session.primary().then(() => render()).catch(() => render());
@@ -448,6 +479,7 @@
     guarded("mount", ensureMounted);
     guarded("ads", handleAds);
     guarded("render", () => render());
+    guarded("auto-start", () => { maybeAutoStart(); });
     tickCount += 1;
     if (session && (tickCount % SESSION_EVERY === 0)) {
       session.tick().then(() => render()).catch((e) => {

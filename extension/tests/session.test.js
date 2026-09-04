@@ -676,3 +676,62 @@ test("NULL_PLAYER lets the popup run the same machine off-YouTube", async () => 
   assert.equal(s.getState().playback.hasVideo, null);
   assert.equal(s.view().kind, "not-cached");
 });
+
+
+// --- global auto-start --------------------------------------------------
+//
+// `patmirTranslateEnabled` is ONE remembered choice for every video. Author:
+// "should remember the last state (not for a single video), if enabled it
+// should work for all videos, if disabled should not translate."
+//
+// The old behaviour was a per-video opt-out plus an auto-play that only ever
+// started an ALREADY-cached dub, so a video that had never been dubbed always
+// played in the original language.
+
+const AUTO_VIEW = (action, disabled) => ({ action, disabled: !!disabled });
+
+test("enabled plus a startable view auto-starts", () => {
+  assert.equal(S.shouldAutoStart(AUTO_VIEW("start"), { enabled: true }), true);
+});
+
+test("an undubbed video auto-starts too — that is the point", () => {
+  // `not-cached` derives action "start", so enabling translation submits work
+  // rather than skipping the video.
+  const v = S.deriveView(base({ lookup: { cached: false, partial: false } }));
+  assert.equal(v.action, "start");
+  assert.equal(S.shouldAutoStart(v, { enabled: true }), true);
+});
+
+test("disabled never auto-starts", () => {
+  assert.equal(S.shouldAutoStart(AUTO_VIEW("start"), { enabled: false }), false);
+  assert.equal(S.shouldAutoStart(AUTO_VIEW("start"), {}), false);
+});
+
+test("a video already playing is not started again", () => {
+  assert.equal(S.shouldAutoStart(AUTO_VIEW("stop"), { enabled: true }), false);
+});
+
+test("a failed job is NOT auto-retried", () => {
+  // A failure that re-submits itself is a loop, and the failure is usually the
+  // reason the viewer needs to see the button.
+  const v = S.deriveView(base({ job: { status: "failed", job_id: "j" } }));
+  assert.equal(v.action, "retry");
+  assert.equal(S.shouldAutoStart(v, { enabled: true }), false);
+});
+
+test("a disabled view is never auto-pressed", () => {
+  // Loading, or no video yet: pressing would fail and look broken.
+  assert.equal(S.shouldAutoStart(AUTO_VIEW("start", true), { enabled: true }), false);
+});
+
+test("the tried latch stops a second press", () => {
+  // The surface latches before awaiting the round trip; without it a second
+  // tick inside that window would submit the same video twice.
+  assert.equal(S.shouldAutoStart(AUTO_VIEW("start"),
+    { enabled: true, tried: true }), false);
+});
+
+test("a missing view does not throw", () => {
+  assert.equal(S.shouldAutoStart(null, { enabled: true }), false);
+  assert.equal(S.shouldAutoStart(undefined, { enabled: true }), false);
+});

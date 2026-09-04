@@ -276,6 +276,27 @@
     return view("not-cached", TRANSLATE, { action: "start", tone: "idle", mode: s.mode });
   }
 
+  /**
+   * Should the surface press its own start button?
+   *
+   * `patmirTranslateEnabled` is a GLOBAL, remembered choice, not a per-video
+   * one: "if enabled it should work for all videos, if disabled should not
+   * translate". So this fires on any video whose view offers `start`, which
+   * includes one that has never been dubbed — that is the point, and it means
+   * enabling translation submits work.
+   *
+   * `retry` is deliberately NOT auto-pressed. A failed job that re-submits
+   * itself is a loop, and the failure is usually the reason the viewer needs
+   * to see the button.
+   */
+  function shouldAutoStart(v, opts) {
+    var o = opts || {};
+    if (!o.enabled) return false;
+    if (o.tried) return false;
+    if (!v || v.disabled) return false;
+    return v.action === "start";
+  }
+
   function view(kind, label, extra) {
     var v = {
       kind: kind,
@@ -826,6 +847,7 @@
     MOUNTS: MOUNTS,
     LABELS: { TRANSLATE: TRANSLATE, STOP: STOP, CANCEL: CANCEL, RETRY: RETRY,
               SETTINGS: SETTINGS },
+    shouldAutoStart: shouldAutoStart,
     STRINGS_HY: STRINGS_HY,
     STRINGS_EN: STRINGS_EN,
     NULL_PLAYER: NULL_PLAYER,
