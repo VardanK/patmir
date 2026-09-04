@@ -132,7 +132,18 @@
     if (!rec) return null;
     var stages = rec.stage_states || {};
     var names = Object.keys(stages);
-    if (!names.length) return null;
+    if (!names.length) {
+      // A watch-along record has no `stage_states` at all: it does not walk
+      // the pipeline once, it dubs the video in sections. So the fraction is
+      // how much of the video is dubbed. Without this the in-page progress bar
+      // showed nothing in watch-along, which was invisible until that mode
+      // became the default.
+      if (typeof rec.dubbed_s === "number" && typeof rec.duration === "number"
+          && rec.duration > 0) {
+        return clamp01(rec.dubbed_s / rec.duration);
+      }
+      return null;
+    }
     var done = 0, running = null;
     for (var i = 0; i < names.length; i++) {
       if (stages[names[i]] === "done") done++;

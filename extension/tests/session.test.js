@@ -778,3 +778,52 @@ test("an explicit quality choice is kept", () => {
 test("an unrecognised stored mode falls back to watch-along", () => {
   assert.equal(S.resolveMode({ patmirMode: "nonsense" }), S.WATCH_ALONG);
 });
+
+
+// --- watch-along progress -----------------------------------------------
+//
+// A stream record has NO `stage_states`: it does not walk the pipeline once,
+// it dubs the video in sections. `jobProgress` returned null on the empty
+// stage map, so the in-page progress bar showed nothing in watch-along —
+// invisible until watch-along became the default mode and the author noticed
+// the green fill had gone.
+
+test("a stream reports progress as the fraction of the video dubbed", () => {
+  // The measured record: two sections of a 677 s video.
+  const p = S.jobProgress({ dubbed_s: 76.2, duration: 677.161 });
+  assert.ok(p > 0.11 && p < 0.12, `got ${p}`);
+});
+
+test("a stream with nothing dubbed yet reads zero, not null", () => {
+  // Zero draws an empty bar; null hides it. At the start of a stream the bar
+  // should be there and empty.
+  assert.equal(S.jobProgress({ dubbed_s: 0, duration: 677.161 }), 0);
+});
+
+test("dubbed seconds past the duration clamp to full", () => {
+  // Sections can overshoot the reported duration by a hair (VAD snapping).
+  assert.equal(S.jobProgress({ dubbed_s: 700, duration: 677.161 }), 1);
+});
+
+test("a stream without a duration reports nothing rather than guessing", () => {
+  assert.equal(S.jobProgress({ dubbed_s: 76.2 }), null);
+  assert.equal(S.jobProgress({ dubbed_s: 76.2, duration: 0 }), null);
+});
+
+test("quality mode still measures by stage states", () => {
+  // The stage path must not change: it is the one that already worked.
+  assert.equal(S.jobProgress({
+    stage_states: { a: "done", b: "running" }, dubbed_s: 5, duration: 100,
+  }), 0.5);
+});
+
+test("a streaming view now carries a progress fraction", () => {
+  const v = S.deriveView(base({
+    phase: "job",
+    job: { status: "streaming", job_id: "j", dubbed_s: 76.2, duration: 677.161,
+           sections_done: 2 },
+  }));
+  assert.equal(v.kind, "streaming");
+  assert.equal(typeof v.progress, "number");
+  assert.ok(v.progress > 0);
+});

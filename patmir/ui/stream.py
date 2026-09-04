@@ -88,6 +88,12 @@ class StreamRecord:
     duration: float | None = None
     window_end: float | None = None       # first section boundary (prelude end)
     sections_done: int = 0
+    # Seconds of the video actually dubbed. `sections_done` alone cannot make a
+    # fraction (sections vary in length and the prelude window is its own
+    # size), and a stream record has no `stage_states` — which is why the
+    # in-page progress bar showed nothing at all in watch-along once it became
+    # the default mode.
+    dubbed_s: float = 0.0
     cached: bool = False
     # Download progress. These four names are what JobManager's yt-dlp hook
     # writes; carrying them here is what lets a watch-along stream pass `rec`
@@ -144,6 +150,23 @@ class StreamRecord:
             },
         }
 
+
+
+
+def _dubbed_seconds(prior: dict[str, Any] | None) -> float:
+    """Seconds already on disk, from a cached manifest.
+
+    Summed rather than counted: sections differ in length, and the prelude
+    window is its own size. A malformed entry is skipped rather than raising —
+    this feeds a progress bar, and a bar is never worth failing a resume for.
+    """
+    total = 0.0
+    for s in (prior or {}).get("sections", []):
+        try:
+            total += max(0.0, float(s["end"]) - float(s["start"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return total
 
 
 def _cached_opening(prior: dict[str, Any] | None,
@@ -514,6 +537,7 @@ class StreamManager:
             )
         else:
             rec.sections_done = len(prior.get("sections", []))
+            rec.dubbed_s = _dubbed_seconds(prior)
 
         # Warm-model cache: each stage model is built once and reused, killing
         # the measured 11-13% per-section rebuild tax (performance.md roadmap
@@ -557,6 +581,7 @@ class StreamManager:
         if cached_opening is not None:
             rec.opening_dub_s = 0.0
             rec.sections_done = len(prior.get("sections", []))
+            rec.dubbed_s = _dubbed_seconds(prior)
             opening_index = int(cached_opening["index"])
             log.info("Opening window %.2f-%.2f already cached (section %d) — "
                      "skipping the re-dub and going straight to streaming.",
@@ -647,6 +672,7 @@ class StreamManager:
             timing=self._section_timing(rec, result),
         )
         rec.sections_done += 1
+        rec.dubbed_s += max(0.0, float(result.end) - float(result.start))
 
     def _section_timing(self, rec: StreamRecord,
                         result: SectionResult) -> dict[str, Any] | None:
