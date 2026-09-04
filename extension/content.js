@@ -126,8 +126,43 @@
   async function playWatchAlongFor(cacheKey) {
     await setVideoDisabled(window.location.href, false);
     stopDub();
+    waRevivesUsed = 0;          // a deliberate start earns a fresh budget
     await startWatchAlong(cacheKey);
     return { ok: true };
+  }
+
+  /**
+   * Re-submit a stream that stopped producing, once.
+   *
+   * Worth trying because the server RESUMES rather than restarting: `submit()`
+   * on a `done`-but-incomplete stream picks up from the cached sections
+   * (quality issue #21) and no longer re-dubs the cached opening (#31). So a
+   * revive costs the rest of the video, not the whole of it.
+   *
+   * Bounded at one per user-initiated start, because the failure that made
+   * this necessary — a NameError on the server's stream path — was
+   * deterministic, and an unbounded retry against a deterministic failure is
+   * a loop that interrupts the picture every minute.
+   */
+  async function reviveWatchAlong() {
+    const url = window.location.href;
+    waRevivesUsed += 1;
+    console.warn(`[patmir] dub stream stopped producing — re-submitting `
+      + `(attempt ${waRevivesUsed} of ${WA_MAX_REVIVES}).`);
+    stopWatchAlong();
+    let resp;
+    try {
+      resp = await chrome.runtime.sendMessage({
+        type: "jobs:submit", url, mode: "watch-along",
+      });
+    } catch (_) { return false; }
+    if (!resp || !resp.ok || !resp.data) return false;
+    const key = resp.data.cache_key;
+    if (!key) return false;
+    if (window.location.href !== url) return false;   // navigated meanwhile
+    stopDub();
+    await startWatchAlong(key);
+    return true;
   }
 
   // Switches the AUDIO TRACK off, nothing else: the dub source stops, the mute
@@ -815,6 +850,12 @@
   // When the manifest last gained a section. A dead stream is indistinguishable
   // from a slow one except by how long nothing has arrived.
   let waLastProgressAt = 0;
+  // Automatic revives used since the viewer last pressed start. ONE, and reset
+  // only by an explicit start — not by progress. A per-stall budget would loop
+  // forever on a stream that always dies after one section, and re-submitting
+  // is not free: it wakes the GPU and interrupts the picture.
+  let waRevivesUsed = 0;
+  const WA_MAX_REVIVES = 1;
   let waLastPlayheadPost = 0;
 
   const WA_LOOKAHEAD = 15;        // seconds of sections to prefetch ahead of playhead
@@ -1053,9 +1094,23 @@
         // Without this the client re-pauses on every tick, so pressing play
         // stops the video a quarter second later — forever, with no error
         // anywhere. Hand the video back and play the original.
-        console.warn("[patmir] no new dub section for "
-          + Math.round((Date.now() - waLastProgressAt) / 1000)
-          + "s — giving up on the stream and releasing the video.");
+        const starvedFor = Math.round((Date.now() - waLastProgressAt) / 1000);
+        if (waRevivesUsed < WA_MAX_REVIVES) {
+          // Try once to get it going again; the server resumes from what is
+          // already cached. `reviveWatchAlong` restarts the stall clock.
+          reviveWatchAlong().then((ok) => {
+            if (ok) return;
+            console.warn("[patmir] re-submit failed — releasing the video.");
+            stopWatchAlong();
+            if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
+          }).catch(() => {
+            stopWatchAlong();
+            if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
+          });
+          return;
+        }
+        console.warn(`[patmir] no new dub section for ${starvedFor}s and the `
+          + `revive was already used — releasing the video.`);
         stopWatchAlong();
         if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
       } else {
