@@ -160,6 +160,13 @@
   // whose text changes every two seconds cannot be aimed at.
   var TRANSLATE = "translate";
   var STOP = "stop";
+  // `cancel`, distinct from `stop`, because the two are different acts and the
+  // words for them read differently. `Չթարգմանել` ("do not translate") is
+  // right while a dub is PLAYING: it turns the Armenian track off. While a job
+  // is being PREPARED it reads as a status — the author's report was that the
+  // button "says that it's not translating, while in reality it does" — so
+  // those states get `Չեղարկել` ("cancel"), which names the action instead.
+  var CANCEL = "cancel";
   var RETRY = "retry";
   var SETTINGS = "settings";
 
@@ -211,7 +218,11 @@
       else if (job.status === "prelude") kind = "prelude";
       else if (job.status === "streaming") kind = "streaming";
       else if (runningStage(job) === "download") kind = "downloading";
-      return view(kind, STOP, {
+      // STOP only for `streaming`: watch-along plays the dub WHILE producing
+      // it, so the viewer is listening and "turn translation off" is the
+      // honest description. Everything else here is preparation with nothing
+      // to listen to yet, so the button offers to cancel it.
+      return view(kind, kind === "streaming" ? STOP : CANCEL, {
         action: "stop", tone: "active", busy: true,
         progress: jobProgress(job),
         // `job` is null while phase is "submitting" — the request is in flight
@@ -309,6 +320,7 @@
     labels: {
       translate: "Թարգմանել",
       stop: "Չթարգմանել",
+      cancel: "Չեղարկել",
       retry: "Կրկին փորձել",
       settings: "Կարգավորել",
     },
@@ -342,6 +354,7 @@
     labels: {
       translate: "Translate this",
       stop: "Stop dub",
+      cancel: "Cancel",
       retry: "Retry",
       settings: "Open options",
     },
@@ -811,7 +824,8 @@
     ACTIVE_JOBS_KEY: ACTIVE_JOBS_KEY,
     ACTIVE_JOBS_MAX: ACTIVE_JOBS_MAX,
     MOUNTS: MOUNTS,
-    LABELS: { TRANSLATE: TRANSLATE, STOP: STOP, RETRY: RETRY, SETTINGS: SETTINGS },
+    LABELS: { TRANSLATE: TRANSLATE, STOP: STOP, CANCEL: CANCEL, RETRY: RETRY,
+              SETTINGS: SETTINGS },
     STRINGS_HY: STRINGS_HY,
     STRINGS_EN: STRINGS_EN,
     NULL_PLAYER: NULL_PLAYER,

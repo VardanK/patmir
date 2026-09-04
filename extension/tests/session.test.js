@@ -193,7 +193,13 @@ test("every job status maps to a state, and all of them offer the way out", () =
       phase: "job", job: { status, job_id: "j", stage_states: { a: "running" } },
     }));
     assert.equal(v.kind, kind, status);
-    assert.equal(v.label, S.LABELS.STOP, status);
+    // The ACTION is the same everywhere — one control, one way out. Only the
+    // WORD differs: `streaming` plays the dub while producing it, so "do not
+    // translate" is honest there; the rest are preparation with nothing to
+    // listen to yet, where that phrasing read as a status rather than an
+    // action ("it says that it's not translating, while in reality it does").
+    const expected = status === "streaming" ? S.LABELS.STOP : S.LABELS.CANCEL;
+    assert.equal(v.label, expected, status);
     assert.equal(v.action, "stop", `${status} must stay cancellable`);
   }
 });
@@ -309,16 +315,50 @@ test("no state introduces a fifth label", () => {
   }
 });
 
-test("only two labels ever appear on the primary path", () => {
-  // Everything that is not an error or a configuration problem must read as one
-  // of the two Armenian words the feature was asked for.
+test("only three labels ever appear on the primary path", () => {
+  // Everything that is not an error or a configuration problem must read as
+  // one of three Armenian words: start it, turn it off, or call it off.
   for (const st of ALL_STATES) {
     const v = S.deriveView(st);
     if (v.tone === "error" || v.kind === "no-token" || v.kind === "orphaned") continue;
     assert.ok(
-      v.label === S.LABELS.TRANSLATE || v.label === S.LABELS.STOP,
+      v.label === S.LABELS.TRANSLATE || v.label === S.LABELS.STOP
+        || v.label === S.LABELS.CANCEL,
       `${v.kind} -> ${v.label}`);
   }
+});
+
+test("a job being prepared offers Չեղարկել, a dub playing offers Չթարգմանել", () => {
+  // The reported problem: while translating, the button read `Չթարգմանել`
+  // ("do not translate"), which describes a state the viewer is not in. The
+  // fix is the word, not the action.
+  const preparing = S.deriveView(base({
+    phase: "job",
+    job: { status: "running", job_id: "j", stage_states: { a: "running" } },
+  }));
+  assert.equal(S.formatLabel(preparing, S.STRINGS_HY), "Չեղարկել");
+
+  const playing = S.deriveView(base({ playback: { playing: true, hasVideo: true } }));
+  assert.equal(S.formatLabel(playing, S.STRINGS_HY), "Չթարգմանել");
+});
+
+test("a preparing job carries the progress the bar draws", () => {
+  // The view always carried this and the DOM ignored it, which is why the
+  // percentage only ever appeared as 12 px of subtitle text.
+  const v = S.deriveView(base({
+    phase: "job",
+    job: {
+      status: "running", job_id: "j",
+      stage_states: { a: "done", b: "done", c: "running", d: "queued" },
+    },
+  }));
+  assert.equal(typeof v.progress, "number");
+  assert.ok(v.progress > 0 && v.progress < 1, `got ${v.progress}`);
+});
+
+test("cancel has both renderings, like every other label", () => {
+  assert.equal(S.STRINGS_HY.labels.cancel, "Չեղարկել");
+  assert.equal(S.STRINGS_EN.labels.cancel, "Cancel");
 });
 
 test("every state has both an Armenian and an English rendering", () => {
