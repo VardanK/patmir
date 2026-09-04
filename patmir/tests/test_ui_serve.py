@@ -41,24 +41,30 @@ class BindHostTest(unittest.TestCase):
 
         seen = {}
 
-        def fake_run(app, host=None, port=None):
-            seen.update(host=host, port=port)
+        def fake_run(app, host=None, port=None, log_config="unset"):
+            seen.update(host=host, port=port, log_config=log_config)
 
         with mock.patch.object(app_mod, "_create_app", return_value=object()), \
              mock.patch("uvicorn.run", fake_run):
             app_mod.serve(host="0.0.0.0", port=9999, storage=_storage(),
                           cfg=mock.Mock(), token="t")
-        self.assertEqual(seen, {"host": "0.0.0.0", "port": 9999})
+        # `log_config=None` is load-bearing, not incidental: it stops uvicorn
+        # installing its own handlers and setting propagate=False, which is
+        # what lets its request lines reach the rotating file log.
+        self.assertEqual(seen, {"host": "0.0.0.0", "port": 9999,
+                                "log_config": None})
 
     def test_loopback_is_still_the_default_through_serve(self):
         import patmir.ui.app as app_mod
 
         seen = {}
         with mock.patch.object(app_mod, "_create_app", return_value=object()), \
-             mock.patch("uvicorn.run", lambda app, host=None, port=None:
-                        seen.update(host=host)):
+             mock.patch("uvicorn.run", lambda app, host=None, port=None,
+                                              log_config="unset":
+                        seen.update(host=host, log_config=log_config)):
             app_mod.serve(storage=_storage(), cfg=mock.Mock(), token="t")
         self.assertEqual(seen["host"], "127.0.0.1")
+        self.assertIsNone(seen["log_config"])
 
 
 class CliFlagTest(unittest.TestCase):
