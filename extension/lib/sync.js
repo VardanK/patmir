@@ -387,6 +387,13 @@
     var s = state || {};
     if (!s.buffering) return false;              // not waiting on anything
     if (s.complete) return false;                // everything is on disk
+    // Queued behind another job is NOT dead. Only one pipeline fits on the
+    // card, so a second stream reports `waiting` and produces nothing until
+    // the first finishes — which looked exactly like a dead stream to the
+    // 60 s rule, so it was abandoned, revived, and abandoned again. Two
+    // machines watching at once is what surfaced it: submit/stop pairs
+    // seconds apart and a video that stopped mid-translation.
+    if (s.waiting) return false;
     var limit = typeof s.limitMs === "number" ? s.limitMs : STREAM_STALL_MS;
     var since = s.msSinceProgress;
     if (typeof since !== "number" || !isFinite(since)) return false;

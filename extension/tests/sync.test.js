@@ -356,3 +356,19 @@ test("no state at all is safe", () => {
   assert.equal(sync.shouldAbandonStream(), false);
   assert.equal(sync.shouldAbandonStream(null), false);
 });
+
+test("a stream queued behind another job is not abandoned", () => {
+  // Only one pipeline fits on the card, so a second stream reports `waiting`
+  // and produces nothing until the first finishes. The 60 s rule read that as
+  // a dead stream and abandoned it, the revive re-submitted, and it was
+  // abandoned again — submit/stop pairs seconds apart, and a video that
+  // stopped mid-translation. Two machines watching at once surfaced it.
+  assert.equal(sync.shouldAbandonStream(
+    { buffering: true, msSinceProgress: 70000, waiting: true }), false);
+});
+
+test("a genuinely dead stream is still abandoned", () => {
+  // The waiting exemption must not disable the release it guards.
+  assert.equal(sync.shouldAbandonStream(
+    { buffering: true, msSinceProgress: 70000, waiting: false }), true);
+});

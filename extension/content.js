@@ -807,6 +807,8 @@
   // When the manifest last gained a section. A dead stream is indistinguishable
   // from a slow one except by how long nothing has arrived.
   let waLastProgressAt = 0;
+  // Whether the server says this stream is queued behind another job.
+  let waWaitingForGpu = false;
   // Automatic revives used since the viewer last pressed start. ONE, and reset
   // only by an explicit start — not by progress. A per-stall budget would loop
   // forever on a stream that always dies after one section, and re-submitting
@@ -889,6 +891,9 @@
     if (!resp || !resp.ok || !resp.data) return;
     const data = resp.data;
     waComplete = !!data.complete;
+    // The server overlays the live record's status here. `waiting` means this
+    // stream is queued behind another job on the one GPU, not stalled.
+    waWaitingForGpu = data.status === "waiting";
     for (const s of data.sections || []) {
       const existing = waSections.get(s.index);
       if (existing) {
@@ -1050,7 +1055,7 @@
         waBuffering = false;
         reportPlayhead(false);
       } else if (S.shouldAbandonStream({
-        buffering: true, complete: waComplete,
+        buffering: true, complete: waComplete, waiting: waWaitingForGpu,
         msSinceProgress: Date.now() - waLastProgressAt,
       })) {
         // Nothing has arrived for a minute: the stream is dead, not slow.
