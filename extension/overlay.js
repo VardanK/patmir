@@ -385,8 +385,10 @@
     if (autoStartedFor === url) return;
     let enabled = false;
     try {
-      const stored = await chrome.storage.local.get("patmirTranslateEnabled");
-      enabled = stored.patmirTranslateEnabled === true;
+      const stored = await chrome.storage.local.get(Session.TRANSLATE_KEYS);
+      // Resolved, not read: the new key replaced two older ones, and reading
+      // only it reset every viewer who already had automatic dubbing.
+      enabled = Session.resolveTranslateEnabled(stored);
     } catch (_) { return; }
     if (window.location.href !== url) return;     // navigated while awaiting
     if (!Session.shouldAutoStart(session.view(), { enabled })) return;
@@ -399,7 +401,23 @@
 
   function onPress() {
     if (!session) return;
+    // Record the remembered choice HERE, on the press, not when playback
+    // eventually starts. `content.js` writes it in `playQuality` /
+    // `playWatchAlongFor`, which only run once audio actually plays — so
+    // pressing translate on a video that was not cached yet left the flag
+    // unwritten while the job ran, and switching videos mid-job started the
+    // next one in the original language. The press is the intent; whether the
+    // job succeeds is a separate question.
+    const action = session.view().action;
+    if (action === "start") rememberTranslateEnabled(true);
+    else if (action === "stop") rememberTranslateEnabled(false);
     session.primary().then(() => render()).catch(() => render());
+  }
+
+  function rememberTranslateEnabled(on) {
+    try {
+      chrome.storage.local.set({ patmirTranslateEnabled: !!on });
+    } catch (_) { /* the primitives write it too; this is the early one */ }
   }
 
   // --- ads -------------------------------------------------------------
@@ -495,7 +513,7 @@
     skipAdsEnabled = stored.patmirSkipAds !== false;
     skipAdSeekEnabled = stored.patmirSkipAdSeek === true;
     session = makeSession(
-      stored.patmirMode === Session.WATCH_ALONG ? Session.WATCH_ALONG : Session.QUALITY);
+      Session.resolveMode(stored));
     session.onChange(() => render());
     ensureMounted();
     session.refresh().then(() => render(true)).catch(() => render(true));

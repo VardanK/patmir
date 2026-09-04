@@ -165,6 +165,12 @@ async function getState() {
   return localSession.getState();
 }
 
+function rememberTranslateEnabled(on) {
+  try {
+    chrome.storage.local.set({ patmirTranslateEnabled: !!on });
+  } catch (_) { /* the primitives write it too; this is the early one */ }
+}
+
 async function command(msg) {
   try {
     if (remote) {
@@ -262,11 +268,21 @@ function render(state) {
   lastState = st;
   const v = PatmirSession.deriveView(st);
   setError(v.errorText || (st.errorKind ? st.error : null));
-  statusEl.textContent = PatmirSession.formatSubtitle(v, PatmirSession.STRINGS_EN);
+  // Armenian, like the in-page button: the surfaces the viewer touches speak
+  // one language. (Developer-facing text below stays English.)
+  statusEl.textContent = PatmirSession.formatSubtitle(v, PatmirSession.STRINGS_HY);
   setCta(
-    PatmirSession.formatLabel(v, PatmirSession.STRINGS_EN),
+    PatmirSession.formatLabel(v, PatmirSession.STRINGS_HY),
     v.disabled,
-    () => { command({ action: "primary" }).then((s) => render(s)); },
+    () => {
+      // Remember the choice on the PRESS. The playback primitives write it
+      // too, but only once audio starts — so pressing translate on an
+      // undubbed video left it unwritten while the job ran, and the next
+      // video opened in the original language.
+      if (v.action === "start") rememberTranslateEnabled(true);
+      else if (v.action === "stop") rememberTranslateEnabled(false);
+      command({ action: "primary" }).then((s) => render(s));
+    },
   );
   // Regenerate stays a popup-only, two-click-armed control: it deletes a
   // finished dub and reruns a multi-minute pipeline, which has no business
@@ -301,8 +317,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 document.addEventListener("DOMContentLoaded", async () => {
-  const { patmirMode = "quality" } = await chrome.storage.local.get("patmirMode");
-  mode = (patmirMode === "watch-along") ? "watch-along" : "quality";
+  const stored = await chrome.storage.local.get("patmirMode");
+  mode = PatmirSession.resolveMode(stored);
   renderModeToggle();
   refresh();
 });

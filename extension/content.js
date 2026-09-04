@@ -253,8 +253,14 @@
   const TRANSLATE_ENABLED = "patmirTranslateEnabled";
 
   async function getTranslateEnabled() {
-    const stored = await chrome.storage.local.get(TRANSLATE_ENABLED);
-    return stored[TRANSLATE_ENABLED] === true;
+    const stored = await chrome.storage.local.get(PatmirSession.TRANSLATE_KEYS);
+    const on = PatmirSession.resolveTranslateEnabled(stored);
+    // Write the migration through once, so the legacy key stops mattering and
+    // a later explicit "off" cannot be overridden by it.
+    if (typeof stored[TRANSLATE_ENABLED] !== "boolean") {
+      await chrome.storage.local.set({ [TRANSLATE_ENABLED]: on });
+    }
+    return on;
   }
 
   async function setTranslateEnabled(on) {

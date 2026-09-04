@@ -735,3 +735,46 @@ test("a missing view does not throw", () => {
   assert.equal(S.shouldAutoStart(null, { enabled: true }), false);
   assert.equal(S.shouldAutoStart(undefined, { enabled: true }), false);
 });
+
+
+// --- remembered choice: migration and mode default ----------------------
+
+test("an explicit translate flag always wins", () => {
+  assert.equal(S.resolveTranslateEnabled({ patmirTranslateEnabled: true }), true);
+  assert.equal(S.resolveTranslateEnabled({ patmirTranslateEnabled: false }), false);
+});
+
+test("an explicit off beats a legacy on", () => {
+  assert.equal(S.resolveTranslateEnabled(
+    { patmirTranslateEnabled: false, patmirAutoPlayEnabled: true }), false);
+});
+
+test("a legacy auto-play preference migrates once", () => {
+  // patmirAutoPlayEnabled DEFAULTED ON, so a stored true means this viewer
+  // already had automatic dubbing. Reading only the new key silently reset
+  // them: the author reloaded, opened a video, and got the original language.
+  assert.equal(S.resolveTranslateEnabled({ patmirAutoPlayEnabled: true }), true);
+  assert.equal(S.resolveTranslateEnabled({ patmirAutoPlayEnabled: false }), false);
+});
+
+test("a fresh install is off", () => {
+  // On means every video you open submits GPU work, so it is one press away
+  // rather than the default.
+  assert.equal(S.resolveTranslateEnabled({}), false);
+  assert.equal(S.resolveTranslateEnabled(null), false);
+});
+
+test("watch-along is the default mode", () => {
+  // It starts playing in about half a minute rather than after a full pass
+  // over the video.
+  assert.equal(S.resolveMode({}), S.WATCH_ALONG);
+  assert.equal(S.resolveMode(null), S.WATCH_ALONG);
+});
+
+test("an explicit quality choice is kept", () => {
+  assert.equal(S.resolveMode({ patmirMode: "quality" }), S.QUALITY);
+});
+
+test("an unrecognised stored mode falls back to watch-along", () => {
+  assert.equal(S.resolveMode({ patmirMode: "nonsense" }), S.WATCH_ALONG);
+});

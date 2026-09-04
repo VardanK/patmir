@@ -277,6 +277,44 @@
   }
 
   /**
+   * Which mode a surface should use when the viewer has not chosen one.
+   *
+   * Watch-along by default (author's call): it starts playing within about
+   * half a minute instead of after a full pass over the video, which is the
+   * difference between pressing translate and watching, and pressing
+   * translate and waiting. Quality mode stays one click away and an explicit
+   * stored choice always wins.
+   *
+   * Mode is folded into the cache key, so this changes which dubs a lookup
+   * finds: a video previously dubbed in quality mode is not the same cache
+   * entry as the same video in watch-along.
+   */
+  function resolveMode(stored) {
+    var st = stored || {};
+    return st.patmirMode === QUALITY ? QUALITY : WATCH_ALONG;
+  }
+
+  /**
+   * Resolve the remembered translate-everything choice from stored values.
+   *
+   * `patmirTranslateEnabled` replaced two older keys, and reading only the new
+   * one silently reset everybody who already had translation working: the
+   * author reloaded, opened a video and got the original language with a blue
+   * `Թարգմանել` button, because the new flag had never been written.
+   *
+   * `patmirAutoPlayEnabled` is the legacy signal and it DEFAULTED ON, so a
+   * stored `true` means "this viewer had automatic dubbing and expects it".
+   * That is honoured once; anything explicit on the new key always wins.
+   */
+  function resolveTranslateEnabled(stored) {
+    var st = stored || {};
+    if (typeof st.patmirTranslateEnabled === "boolean") {
+      return st.patmirTranslateEnabled;
+    }
+    return st.patmirAutoPlayEnabled === true;
+  }
+
+  /**
    * Should the surface press its own start button?
    *
    * `patmirTranslateEnabled` is a GLOBAL, remembered choice, not a per-video
@@ -848,6 +886,9 @@
     LABELS: { TRANSLATE: TRANSLATE, STOP: STOP, CANCEL: CANCEL, RETRY: RETRY,
               SETTINGS: SETTINGS },
     shouldAutoStart: shouldAutoStart,
+    resolveTranslateEnabled: resolveTranslateEnabled,
+    resolveMode: resolveMode,
+    TRANSLATE_KEYS: ["patmirTranslateEnabled", "patmirAutoPlayEnabled"],
     STRINGS_HY: STRINGS_HY,
     STRINGS_EN: STRINGS_EN,
     NULL_PLAYER: NULL_PLAYER,
