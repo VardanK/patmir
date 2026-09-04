@@ -341,12 +341,12 @@ def cmd_ui(port: int, runs_root: Path | None, config: Path, host: str = "127.0.0
 
     print(f"patmir ui — bind {host}:{port}", file=sys.stderr)
     if host not in ("127.0.0.1", "localhost", "::1"):
-        # Say it once, plainly: the job-progress routes predate the token and
-        # a job id is a timestamp, so anything on the network that can guess
-        # one can read that job's audio and transcript.
-        print("  NOTE reachable from the network. /jobs and /stream need the "
-              "token; the /run/<job_id> progress routes do NOT, and a job id "
-              "is a guessable timestamp.", file=sys.stderr)
+        # Say it once, plainly. Every route needs the bearer token from another
+        # machine, the progress pages included; only a browser on this machine
+        # (loopback client) may open `/` and `/run/<job_id>` without it.
+        print("  NOTE reachable from the network. Every route needs the bearer "
+              "token from another machine; the /run/<job_id> progress pages "
+              "open without it only from this machine.", file=sys.stderr)
     print(f"  config:  {config}", file=sys.stderr)
     print(f"  runs:    {storage.runs_root}", file=sys.stderr)
     print(f"  cache:   {storage.cache_root}", file=sys.stderr)

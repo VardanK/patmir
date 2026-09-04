@@ -135,6 +135,9 @@ class StreamRecord:
             "duration": self.duration,
             "window_end": self.window_end,
             "sections_done": self.sections_done,
+            # The progress bar divides this by `duration`; without it the
+            # extension read `undefined` and hid the bar in watch-along.
+            "dubbed_s": self.dubbed_s,
             "cached": self.cached,
             "speakers": self.speakers,
             "playhead": {"t": self.playhead.t, "paused": self.playhead.paused},
@@ -171,14 +174,18 @@ def _dubbed_seconds(prior: dict[str, Any] | None) -> float:
 
 def _cached_opening(prior: dict[str, Any] | None,
                     window_end: float,
-                    tolerance: float = 1.0) -> dict[str, Any] | None:
+                    tolerance: float = 1.0,
+                    start_tolerance: float = 0.05) -> dict[str, Any] | None:
     """The cached section that already covers the opening window, if any.
 
     Matched on the SPAN rather than on `index == 0`, because a manifest
     repaired by `append_section`'s index dedup (issue #22) can hold the opening
-    window under any index. The window must start at the very beginning and
-    reach `window_end`: a shorter one would leave a hole the scheduler fills
-    from the playhead, not from 0.
+    window under any index. The END may fall short of `window_end` by
+    `tolerance` (VAD snapping moves that boundary, and coverage is seeded from
+    the cached span, so the next section starts exactly where it ends). The
+    START may not: coverage is seeded from the cached span too, so a section
+    that begins at 0.9 s leaves `[0, 0.9)` uncovered and the scheduler dubs a
+    sub-second section at 0 for it. `start_tolerance` is float slack only.
     """
     for s in (prior or {}).get("sections", []):
         try:
@@ -189,7 +196,7 @@ def _cached_opening(prior: dict[str, Any] | None,
             continue
         if index < 0:
             continue
-        if start <= tolerance and end >= window_end - tolerance:
+        if start <= start_tolerance and end >= window_end - tolerance:
             return s
     return None
 
@@ -658,6 +665,11 @@ class StreamManager:
             # it rather than leaving a thread on the GPU after the stream is
             # gone — which would meet the next job holding the accelerator.
             pipeline.close()
+            # The only place the prefetch telemetry reaches production logs.
+            # `prefetch_discarded` climbing on a stream means every section is
+            # paying a wasted analysis (a resumed stream used to, see
+            # `_take_analysis`).
+            log.info("stream %s section pipeline: %s", ck, pipeline.stats)
 
         if scheduler.coverage.is_complete(rec.duration):
             cache_mod.finalize_stream(self._cache_root, ck)

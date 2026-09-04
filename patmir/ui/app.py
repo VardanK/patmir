@@ -61,6 +61,9 @@ def _create_app(
     storage = replace(storage, runs_root=runs_root, cache_root=cache_root)
 
     require_token = auth.TokenAuth(token)
+    # The browser-navigated progress pages: open from the machine itself, or
+    # with the token from anywhere else (see `auth.LoopbackOrToken`).
+    progress_auth = auth.LoopbackOrToken(require_token)
     # One warm-model cache for the whole process, shared by batch jobs and
     # streams. Keyed (stage, candidate_id) so the streaming overrides cannot
     # collide with the batch config. Without this every submission rebuilt every
@@ -142,7 +145,7 @@ def _create_app(
             raise HTTPException(status_code=404, detail="no such run")
         return candidate
 
-    @app.get("/", response_class=HTMLResponse)
+    @app.get("/", response_class=HTMLResponse, dependencies=[Depends(progress_auth)])
     def index(request: Request):
         rows = []
         if runs_root.exists():
@@ -161,7 +164,7 @@ def _create_app(
                 })
         return TEMPLATES.TemplateResponse(request, "index.html", {"runs": rows})
 
-    @app.get("/run/{job_id}", response_class=HTMLResponse)
+    @app.get("/run/{job_id}", response_class=HTMLResponse, dependencies=[Depends(progress_auth)])
     def run_detail(request: Request, job_id: str):
         job_dir = _safe_job_dir(job_id)
         m = Manifest.from_path(job_dir / "manifest.json")
@@ -181,7 +184,7 @@ def _create_app(
             },
         )
 
-    @app.get("/run/{job_id}/progress")
+    @app.get("/run/{job_id}/progress", dependencies=[Depends(progress_auth)])
     async def progress_sse(job_id: str):
         job_dir = _safe_job_dir(job_id)
         path = job_dir / "progress.jsonl"
@@ -207,7 +210,7 @@ def _create_app(
 
         return StreamingResponse(stream(), media_type="text/event-stream")
 
-    @app.get("/run/{job_id}/file/{rest:path}")
+    @app.get("/run/{job_id}/file/{rest:path}", dependencies=[Depends(progress_auth)])
     def serve_artifact(job_id: str, rest: str):
         job_dir = _safe_job_dir(job_id)
         target = (job_dir / rest).resolve()
@@ -217,7 +220,7 @@ def _create_app(
             raise HTTPException(status_code=404, detail="not found")
         return FileResponse(target)
 
-    @app.get("/run/{job_id}/transcript.json")
+    @app.get("/run/{job_id}/transcript.json", dependencies=[Depends(progress_auth)])
     def transcript(job_id: str):
         job_dir = _safe_job_dir(job_id)
         path = job_dir / "transcript.json"

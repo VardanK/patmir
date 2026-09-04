@@ -865,8 +865,6 @@ class AdapterBatchDispatchTest(unittest.TestCase):
         self.assertEqual(seen[-1], 1.0)
 
 
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
 
 
 class RequestSeedTest(unittest.TestCase):
@@ -1559,7 +1557,7 @@ class GraphedDecodeEquivalenceTest(unittest.TestCase):
 
 
 class DecodeKnobsTest(unittest.TestCase):
-    def test_build_reads_both_knobs_and_env_overrides(self):
+    def test_build_reads_both_knobs_and_only_the_non_output_env_override(self):
         import os
 
         from patmir.eval.candidates.tts import higgs_v3_torch as mod
@@ -1570,15 +1568,23 @@ class DecodeKnobsTest(unittest.TestCase):
                 seen.update(kw)
 
         with mock.patch.object(mod, "HiggsV3Torch", _Stub):
-            mod.build({"cuda_graphs": False, "decode_attention": "sdpa"})
+            mod.build({"cuda_graphs": False, "decode_attention": "sdpa", "max_batch": 12})
             self.assertFalse(seen["cuda_graphs"])
             self.assertEqual(seen["decode_attention"], "sdpa")
+            self.assertEqual(seen["max_batch"], 12)
 
+            # `cuda_graphs` is in `_NON_OUTPUT_KEYS`, so an env override cannot
+            # desynchronize a dub from its cache key. `decode_attention` and
+            # `max_batch` DO change the audio, and `config_hash` reads only the
+            # TOML entry — so those two env overrides were writing differently
+            # rendered dubs under an unchanged key and are gone.
             with mock.patch.dict(os.environ, {"PATMIR_TTS_CUDA_GRAPHS": "1",
-                                              "PATMIR_TTS_DECODE_ATTN": "gqa"}):
-                mod.build({"cuda_graphs": False, "decode_attention": "sdpa"})
+                                              "PATMIR_TTS_DECODE_ATTN": "gqa",
+                                              "PATMIR_TTS_MAX_BATCH": "16"}):
+                mod.build({"cuda_graphs": False, "decode_attention": "sdpa", "max_batch": 12})
             self.assertTrue(seen["cuda_graphs"])
-            self.assertEqual(seen["decode_attention"], "gqa")
+            self.assertEqual(seen["decode_attention"], "sdpa")
+            self.assertEqual(seen["max_batch"], 12)
 
     def test_env_flag_parsing(self):
         import os
@@ -1672,10 +1678,7 @@ class OnsetBurstGuardTest(unittest.TestCase):
         self.assertTrue(_has_onset_burst(bad))
         self.assertFalse(_has_onset_burst(good))
 
-        cand = object.__new__(HiggsV3Torch)
-        cand.max_retries = 2
-        cand.tts_max_batch = 4
-        cand._summary = {"batches": 0, "overflows": 0, "sentences": 0}
+        cand = _bare_candidate()
 
         calls = []
 
@@ -1691,8 +1694,43 @@ class OnsetBurstGuardTest(unittest.TestCase):
         self.assertEqual([c[1] for c in calls], [0, 1],
                          "a bursting row must be redrawn with a fresh seed")
         self.assertTrue(all(a is not None for a in audio))
-        self.assertEqual(cand._summary.get("onset_bursts"), 2)
-        self.assertIsNone(cand._summary.get("onset_bursts_kept"))
+        self.assertEqual(cand._summary["onset_bursts"], 2)
+        self.assertEqual(cand._summary["onset_bursts_kept"], 0)
+
+    def test_bursts_are_counted_per_line_not_per_attempt(self):
+        # A row that bursts on attempt 0 AND attempt 1 before coming clean is
+        # ONE bursting line. The ADR quotes "2 of 77 lines"; counting attempts
+        # made the emitted number something else.
+        bad, good = self._clip(burst=True), self._clip()
+        cand = _bare_candidate(max_retries=3)
+        cand._decode_chunk = lambda reqs, attempt=0: [
+            (bad if attempt < 2 else good, False) for _ in reqs]
+        audio = _run_chunk_loop(cand, [_FakeReq(cap=10)])
+        self.assertTrue(all(a is not None for a in audio))
+        self.assertEqual(cand._summary["onset_bursts"], 1)
+        self.assertEqual(cand._summary["onset_bursts_kept"], 0)
+
+    def test_a_row_still_bursting_on_the_last_attempt_is_kept_and_counted_once(self):
+        bad = self._clip(burst=True)
+        cand = _bare_candidate(max_retries=1)
+        cand._decode_chunk = lambda reqs, attempt=0: [(bad, False) for _ in reqs]
+        audio = _run_chunk_loop(cand, [_FakeReq(cap=10)])
+        self.assertIsNotNone(audio[0])
+        self.assertEqual(cand._summary["onset_bursts"], 1)
+        self.assertEqual(cand._summary["onset_bursts_kept"], 1)
+
+    def test_reset_summary_zeroes_the_burst_counters_too(self):
+        # A warm watch-along instance runs `reset_summary` per section; the
+        # burst counters were not in the reset set, so section 5 reported the
+        # whole film's bursts against its own sentence count.
+        from patmir.eval.candidates.tts.higgs_v3_torch import HiggsV3Torch
+        cand = _bare_candidate()
+        cand._summary.update({"sentences": 12, "onset_bursts": 9,
+                              "onset_bursts_kept": 2, "graph_fallbacks": 1})
+        HiggsV3Torch.reset_summary(cand)
+        for key in ("sentences", "overflows", "batches", "onset_bursts",
+                    "onset_bursts_kept", "graph_fallbacks"):
+            self.assertEqual(cand._summary[key], 0, key)
 
 
 class _FakeReq:
@@ -1701,35 +1739,31 @@ class _FakeReq:
 
 
 def _run_chunk_loop(cand, prepared):
-    """The retry loop from `synthesize_batch`, isolated for testing."""
-    from patmir.eval.candidates.tts.higgs_v3_torch import (
-        _balanced_chunks, _has_onset_burst,
-    )
+    """Drive the production retry loop (`_synthesize_chunk`) over balanced
+    chunks, without `synthesize_batch`'s model-dependent prepare/encode.
+
+    This used to be a hand-copied replica of the loop, which meant the test
+    could not catch a bug in the real one — and the real one had two
+    (`reset_summary` skipping the burst counters; bursts counted per attempt).
+    """
+    from patmir.eval.candidates.tts.higgs_v3_torch import _balanced_chunks
     audio = [None] * len(prepared)
     order = sorted(range(len(prepared)), key=lambda i: prepared[i].cap)
-    for chunk in _balanced_chunks(order, cand.tts_max_batch):
-        pending = list(chunk)
-        for attempt in range(cand.max_retries + 1):
-            if not pending:
-                break
-            outs = cand._decode_chunk([prepared[i] for i in pending], attempt)
-            retry = []
-            last_attempt = attempt >= cand.max_retries
-            for slot, (wav, over) in zip(pending, outs):
-                burst = wav is not None and not over and _has_onset_burst(wav)
-                if wav is not None and not over and not burst:
-                    audio[slot] = wav
-                    continue
-                if over:
-                    cand._summary["overflows"] += 1
-                if burst:
-                    cand._summary["onset_bursts"] = (
-                        cand._summary.get("onset_bursts", 0) + 1)
-                    audio[slot] = wav
-                    if last_attempt:
-                        cand._summary["onset_bursts_kept"] = (
-                            cand._summary.get("onset_bursts_kept", 0) + 1)
-                        continue
-                retry.append(slot)
-            pending = retry
+    for chunk_i, chunk in enumerate(_balanced_chunks(order, cand.tts_max_batch)):
+        cand._synthesize_chunk(chunk_i, list(chunk), prepared, audio)
     return audio
+
+
+def _bare_candidate(max_retries=2, max_batch=4):
+    from patmir.eval.candidates.tts.higgs_v3_torch import HiggsV3Torch
+    cand = object.__new__(HiggsV3Torch)
+    cand.max_retries = max_retries
+    cand.tts_max_batch = max_batch
+    # `probe` is a lazily-created property (disabled, no trace) — leave it.
+    cand._summary = {"batches": 0, "overflows": 0, "sentences": 0,
+                     "onset_bursts": 0, "onset_bursts_kept": 0, "graph_fallbacks": 0}
+    return cand
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

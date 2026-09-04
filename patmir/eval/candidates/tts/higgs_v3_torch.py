@@ -691,10 +691,20 @@ class HiggsV3Torch:
             "device": self.device,
             "max_batch": self.tts_max_batch,
             "cuda_graphs": self.cuda_graphs,
-            "decode_attention": self.decode_attention,
+            # The kernel that RUNS, not the one asked for: when
+            # `_register_gqa_attention` fails, `decode_attention` still reads
+            # "gqa" while sdpa is what steps, and the summary named a renderer
+            # that never ran.
+            "decode_attention": ("gqa" if self.attn_impl_decode == _GQA_ATTN
+                                 else self.attn_implementation),
             "sentences": 0,
             "overflows": 0,
             "batches": 0,
+            # Present from construction so a reader cannot confuse "no bursts"
+            # with "an older candidate that did not count them".
+            "onset_bursts": 0,
+            "onset_bursts_kept": 0,
+            "graph_fallbacks": 0,
         }
 
         self._check_audio_head_tied()
@@ -787,9 +797,19 @@ class HiggsV3Torch:
 
         Returns `(holder, hidden0, next_pos)`, or None whenever graphs are
         unavailable or capture fails — in which case the caller does an
-        ordinary prefill and steps eagerly. That fallback is bitwise identical
-        and only ~14 ms/step slower, so a failure here costs speed and never
-        correctness.
+        ordinary prefill and steps eagerly.
+
+        The fallback is EQUIVALENT, not bit-exact, and the difference used to
+        be claimed away. Two reasons it diverges: `StaticCache` is
+        `is_compileable`, so `create_causal_mask` always materializes a mask,
+        which is what routes the step through `_gqa_decode`; the `DynamicCache`
+        fallback gets `attention_mask=None` on an unpadded chunk and takes
+        plain sdpa. And the graph attends over `seq + max_cap` columns with
+        `-inf` padding against the fallback's `seq + step + 1`, so the softmax
+        reduces a different width. Same distribution, different draw. A
+        failure here therefore costs speed AND re-rolls that chunk, which is
+        why the caller counts it in the summary (`graph_fallbacks`) rather
+        than only printing it.
 
         Owning the prefill is deliberate: a `DynamicCache` prefill cannot be
         transplanted into a `StaticCache`, and doing both would pay for it
@@ -807,7 +827,11 @@ class HiggsV3Torch:
         model = self.model
         max_cache_len = mask_full.shape[1]
         try:
-            with probe.section("graph_capture_s"):
+            # Two spans, not one nested in the caller's: `prefill_s` used to
+            # wrap this whole call while `graph_capture_s` wrapped the same
+            # prefill again, so the two overlapped and summing them
+            # double-counted the prefill.
+            with probe.section("prefill_s"):
                 cache = StaticCache(
                     config=model.config.text_config, max_cache_len=max_cache_len)
                 out = model.model(
@@ -819,7 +843,7 @@ class HiggsV3Torch:
                 )
                 hidden0 = out.last_hidden_state[:, -1, :]
                 next_pos = position_ids[:, -1] + 1
-
+            with probe.section("graph_capture_s"):
                 codes_buf = torch.zeros(B, N, dtype=torch.long, device=device)
                 pos_buf = next_pos.unsqueeze(1).clone()
                 cum0 = [l.cumulative_length.clone() for l in cache.layers]
@@ -924,15 +948,17 @@ class HiggsV3Torch:
             # The graph path prefills into its own StaticCache, so only one
             # prefill runs either way.
             graph = None
-            with probe.section("prefill_s"):
-                captured = self._capture_decode_graph(
-                    embeds=embeds, mask_full=mask_full,
-                    position_ids=position_ids, seq=seq, B=B, N=N,
-                    device=device, probe=probe)
-                if captured is not None:
-                    graph, hidden, next_pos = captured
-                    past = None
-                else:
+            captured = self._capture_decode_graph(
+                embeds=embeds, mask_full=mask_full,
+                position_ids=position_ids, seq=seq, B=B, N=N,
+                device=device, probe=probe)
+            if captured is not None:
+                graph, hidden, next_pos = captured
+                past = None
+            else:
+                # A capture that failed AFTER its prefill records `prefill_s`
+                # twice, which is right: two prefills ran.
+                with probe.section("prefill_s"):
                     out = model.model(
                         inputs_embeds=embeds,
                         attention_mask=mask,
@@ -944,6 +970,12 @@ class HiggsV3Torch:
                     hidden = out.last_hidden_state[:, -1, :]      # [B, D]
                     next_pos = position_ids[:, -1] + 1             # [B]
             probe.set("cuda_graphs", graph is not None)
+            if graph is None and self.cuda_graphs and device.type == "cuda":
+                # This chunk wanted a graph and did not get one, so it renders
+                # differently from its neighbours (see `_capture_decode_graph`).
+                # A stderr line does not reach the manifest; this does.
+                self._summary["graph_fallbacks"] += 1
+                probe.bump("graph_fallback_chunks", 1)
 
             # One RNG stream per row, seeded from that request's own content, so
             # a sentence's audio cannot depend on its batch-mates or its slot.
@@ -1131,6 +1163,58 @@ class HiggsV3Torch:
         pr.set("device", self.device)
 
     # ---- public API (driven by SentenceTTS adapter) ---- #
+    def _synthesize_chunk(self, chunk_i: int, chunk: list[int],
+                          prepared: list[Any], audio: list[Any]) -> None:
+        """Decode one chunk into `audio`, redrawing rows that overflow or open
+        on a burst. A method rather than a loop body so the test that pins the
+        retry contract runs THIS code and not a hand-copied replica of it.
+
+        Overflow and onset-burst redraws share `max_retries`: `attempt` is the
+        only reseed, so a row that overflowed twice and then bursts ships
+        bursting with no redraw for the burst. Stated rather than hidden; a
+        separate budget is a policy call, not a bug fix.
+        """
+        pending = list(chunk)
+        # Slots already counted as bursting in this chunk, so the count is per
+        # LINE. Counting attempts inflated the "2 of 77" rate the ADR quotes
+        # whenever one row burst twice. `overflows` keeps counting attempts —
+        # it is a pre-existing series and older runs are compared against it.
+        burst_seen: set[int] = set()
+        for attempt in range(self.max_retries + 1):
+            if not pending:
+                break
+            self._summary["batches"] += 1
+            # A profiler trace covers the FIRST chunk only: tracing a whole
+            # job writes hundreds of MB, and every chunk runs the same loop.
+            if chunk_i == 0 and attempt == 0 and self.probe.trace_path is not None:
+                outs = self._decode_chunk_traced(
+                    [prepared[i] for i in pending], attempt)
+            else:
+                outs = self._decode_chunk([prepared[i] for i in pending], attempt)
+            retry: list[int] = []
+            last_attempt = attempt >= self.max_retries
+            for slot, (wav, over) in zip(pending, outs):
+                burst = wav is not None and not over and _has_onset_burst(wav)
+                if wav is not None and not over and not burst:
+                    audio[slot] = wav
+                    continue
+                if over:
+                    self._summary["overflows"] += 1
+                if burst:
+                    if slot not in burst_seen:
+                        burst_seen.add(slot)
+                        self._summary["onset_bursts"] += 1
+                    # Keep the audio: on the final attempt a redrawn-but-
+                    # still-bursting line is far better than the silence
+                    # the `None` path would leave, and the mux trims the
+                    # head as a second line of defence.
+                    audio[slot] = wav
+                    if last_attempt:
+                        self._summary["onset_bursts_kept"] += 1
+                        continue
+                retry.append(slot)
+            pending = retry
+
     def synthesize_batch(
         self,
         requests: list[dict[str, Any]],
@@ -1164,41 +1248,7 @@ class HiggsV3Torch:
         order = sorted(range(len(prepared)), key=lambda i: prepared[i].cap)
         for chunk_i, chunk in enumerate(_balanced_chunks(order, self.tts_max_batch)):
             started = time.perf_counter()
-            pending = list(chunk)
-            for attempt in range(self.max_retries + 1):
-                if not pending:
-                    break
-                self._summary["batches"] += 1
-                # A profiler trace covers the FIRST chunk only: tracing a whole
-                # job writes hundreds of MB, and every chunk runs the same loop.
-                if chunk_i == 0 and attempt == 0 and self.probe.trace_path is not None:
-                    outs = self._decode_chunk_traced(
-                        [prepared[i] for i in pending], attempt)
-                else:
-                    outs = self._decode_chunk([prepared[i] for i in pending], attempt)
-                retry: list[int] = []
-                last_attempt = attempt >= self.max_retries
-                for slot, (wav, over) in zip(pending, outs):
-                    burst = wav is not None and not over and _has_onset_burst(wav)
-                    if wav is not None and not over and not burst:
-                        audio[slot] = wav
-                        continue
-                    if over:
-                        self._summary["overflows"] += 1
-                    if burst:
-                        self._summary["onset_bursts"] = (
-                            self._summary.get("onset_bursts", 0) + 1)
-                        # Keep the audio: on the final attempt a redrawn-but-
-                        # still-bursting line is far better than the silence
-                        # the `None` path would leave, and the mux trims the
-                        # head as a second line of defence.
-                        audio[slot] = wav
-                        if last_attempt:
-                            self._summary["onset_bursts_kept"] = (
-                                self._summary.get("onset_bursts_kept", 0) + 1)
-                            continue
-                    retry.append(slot)
-                pending = retry
+            self._synthesize_chunk(chunk_i, chunk, prepared, audio)
             if on_chunk is not None:
                 # Retries are folded into the chunk's wall deliberately: a
                 # reseed is real time spent on these sentences.
@@ -1239,7 +1289,13 @@ class HiggsV3Torch:
         """Zero the per-job counters. Called by the TTS adapter at the start of
         each job so a warm-cached instance (watch-along stage_cache) reports
         per-section numbers instead of accumulating across sections."""
-        self._summary.update({"sentences": 0, "overflows": 0, "batches": 0})
+        # Every per-job counter, not a subset: `onset_bursts` was added later
+        # and missed here, so a warm watch-along instance reported section 5's
+        # sentence count against the whole film's burst count.
+        self._summary.update({
+            "sentences": 0, "overflows": 0, "batches": 0,
+            "onset_bursts": 0, "onset_bursts_kept": 0, "graph_fallbacks": 0,
+        })
 
 
 
@@ -1334,15 +1390,17 @@ def build(config: dict[str, Any]) -> HiggsV3Torch:
         top_k=config.get("top_k"),
         seed=int(config.get("seed", 0)),
         max_retries=int(config.get("max_retries", 2)),
-        # Bench-only override so the sweep needs no `patmir.toml` edit. Unlike
-        # the two below, `max_batch` DOES belong in the cache key when set for
-        # real: batching is not bitwise-invariant across shapes, so changing it
-        # changes the audio.
-        max_batch=int(os.environ.get("PATMIR_TTS_MAX_BATCH",
-                                     config.get("max_batch", 8))),
-        # Bench-only override so a perf A/B needs no patmir.toml edit.
+        # `max_batch` and `decode_attention` change the audio (batching is not
+        # bitwise-invariant across shapes; the gqa kernel reduces in a different
+        # order), and `ui.cache.config_hash` reads only the TOML entry — so
+        # they come from the entry and nowhere else. The env overrides they
+        # once had let a bench run write a differently rendered dub under an
+        # unchanged cache key. Sweep them by editing `patmir.toml`.
+        max_batch=int(config.get("max_batch", 8)),
+        # Bench-only override so a perf A/B needs no patmir.toml edit. Safe
+        # because `cuda_graphs` is in `_NON_OUTPUT_KEYS`: it is byte-identical
+        # to eager stepping when capture succeeds.
         cuda_graphs=_env_flag("PATMIR_TTS_CUDA_GRAPHS",
                               bool(config.get("cuda_graphs", True))),
-        decode_attention=os.environ.get(
-            "PATMIR_TTS_DECODE_ATTN", str(config.get("decode_attention", "sdpa"))),
+        decode_attention=str(config.get("decode_attention", "sdpa")),
     )

@@ -26,3 +26,25 @@ class DubbedSecondsTest(unittest.TestCase):
     def test_a_reversed_span_contributes_nothing(self):
         self.assertEqual(_dubbed_seconds(
             {"sections": [{"index": 0, "start": 50.0, "end": 10.0}]}), 0.0)
+
+
+class PublicRecordTest(unittest.TestCase):
+    def test_dubbed_s_is_in_the_public_record(self):
+        # The extension reads `rec.dubbed_s` off `GET /jobs/{id}`, which is
+        # `to_public()`. The field was maintained on the record but never
+        # emitted, so the client always saw `undefined` and hid the bar —
+        # the exact state the field was added to fix. Both halves had tests;
+        # neither crossed this seam.
+        import time
+        from patmir.ui.stream import StreamRecord
+        rec = StreamRecord(
+            job_id="j", cache_key="k", source_id="s", source_url=None,
+            source_path="/x.mkv", source_lang="ru", status="running",
+            submitted_at=time.time(), duration=677.0,
+        )
+        rec.dubbed_s = 76.2
+        pub = rec.to_public()
+        self.assertEqual(pub["dubbed_s"], 76.2)
+        self.assertEqual(pub["duration"], 677.0)
+        # The shape the client's `jobProgress` requires: both numbers present.
+        self.assertIsInstance(pub["dubbed_s"], float)

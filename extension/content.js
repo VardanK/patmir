@@ -160,6 +160,13 @@
     const key = resp.data.cache_key;
     if (!key) return false;
     if (window.location.href !== url) return false;   // navigated meanwhile
+    // The submit round-trip is long enough for the viewer to have pressed
+    // Չեղարկել (translation off) or play (a stream already running again).
+    // Either way this revive is stale: restarting here re-dubbed a video the
+    // viewer had just switched off.
+    if (waActive) return false;
+    if (!(await getTranslateEnabled())) return false;
+    if (window.location.href !== url) return false;
     stopDub();
     await startWatchAlong(key);
     return true;
@@ -1047,6 +1054,15 @@
     if (!usable) {
       stopAllNodes();
       driftSamples = [];
+      // The stall clock measures STARVATION, not "time since a new section".
+      // It only advanced when a new index arrived, so on a resumed stream —
+      // every cached section arrives in the first poll, then the viewer
+      // watches minutes of cached audio while the server preludes — the clock
+      // already read far past the limit the moment the playhead reached the
+      // coverage edge, and the single revive fired with zero grace against a
+      // live stream. Restart it when starvation begins; a section landing
+      // later moves it forward as before.
+      if (!waBuffering) waLastProgressAt = Math.max(waLastProgressAt, Date.now());
       if (S.isCovered(view, c)) {
         // A section claims this second but has no audio to give -- its WAV came
         // out shorter than its declared span. Nothing to play, but nothing to

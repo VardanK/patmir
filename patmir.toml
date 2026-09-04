@@ -143,6 +143,14 @@ timeout_seconds = 120.0
 chunk_size      = 20
 overlap         = 2
 reasoning       = { effort = "minimal" }
+# Same throughput knobs as the per-sentence candidate above, and excluded from
+# `config_hash` the same way. They reach the per-sentence FALLBACK this
+# candidate degrades to (a chunk that fails validation becomes `chunk_size`
+# single calls), which is the only place concurrency matters here — each
+# section is one chunk and makes one call. Watch-along runs this candidate.
+concurrency     = 12
+max_attempts    = 3
+retry_backoff_s = 0.5
 
 [[eval.translation.candidates]]
 id          = "openrouter_claude_opus"
@@ -956,12 +964,14 @@ id     = "htdemucs"
 module = "patmir.pipeline.stages.separate.htdemucs"
 model  = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
 device = "auto"          # auto → mps on Apple Silicon
+shifts = 0               # reproducibility — see htdemucs_mlx above, issue #28
 
 [[stages.separate.candidates]]
 id     = "htdemucs_fast"
 module = "patmir.pipeline.stages.separate.htdemucs"
 model  = "htdemucs"
 device = "auto"
+shifts = 0               # reproducibility — see htdemucs_mlx above, issue #28
 
 # PyTorch twin of htdemucs_mlx_vocals — the ft bag's vocals-specialist
 # sub-model alone (sig 04573f0d), accompaniment = mix - vocals. Same trick,

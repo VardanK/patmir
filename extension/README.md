@@ -137,7 +137,7 @@ Pure decision logic lives in `lib/` so it can be tested without a browser:
   tests drive it by hand with a fake clock.
 
 ```
-node --test extension/tests/
+node --test "extension/tests/*.test.js"
 
 ## Reaching a server on another machine
 

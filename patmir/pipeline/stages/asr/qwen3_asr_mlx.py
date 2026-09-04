@@ -31,24 +31,11 @@ from patmir.pipeline.stages.asr._sentence import (
 )
 
 
-# Qwen3-ASR labels languages with full English names ("English", "Russian", …).
-# Downstream pipeline stages expect ISO 639-1.
-_FULL_TO_ISO: dict[str, str] = {
-    "english": "en",
-    "russian": "ru",
-    "armenian": "hy",
-}
-
-
-def _to_iso(language: str | None) -> str | None:
-    if not language:
-        return None
-    key = language.strip().lower()
-    if key in _FULL_TO_ISO:
-        return _FULL_TO_ISO[key]
-    if len(key) == 2 and key.isalpha():
-        return key
-    return key.split()[0]
+# Language-tag normalization is shared with the other Qwen3-ASR candidate
+# (`_language.py`) so the two runtimes cannot disagree about what a tag
+# means. `_to_iso` returns None for anything it does not recognise —
+# the callers rely on that to fall back to a full probe.
+from patmir.pipeline.stages.asr._language import FULL_TO_ISO as _FULL_TO_ISO, to_iso as _to_iso
 
 
 def _mx_dtype(name: str):

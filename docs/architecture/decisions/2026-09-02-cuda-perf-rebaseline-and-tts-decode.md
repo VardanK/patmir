@@ -418,5 +418,6 @@ win now that §11 has removed the latency it was meant to fix.
   viewer can be buffered, now that production is well clear of realtime.
 - An ear-test that finds the gqa re-roll worse on other content, in which case
   `decode_attention = "sdpa"` reverts it and keeps the graph's 18 %.
-- `max_batch` is still unswept, and only meaningful now that the step is no
-  longer launch-bound.
+- `max_batch` was swept later the same day (8/12/16; 12 set, 16 worse —
+  see `current-models.md` and `measurements/RESULTS.md`). Splitting 8 from 12
+  more finely needs repeats, which the sweep did not have.

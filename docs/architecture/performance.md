@@ -247,6 +247,12 @@ with matching `(B, seq + max_cap)` would recover most of it. Not done.
 - **Batch `real_wall_s` / `other_s`** — `total_wall_s` is the sum of stage
   walls, so everything between stages was invisible. It is 1.9 s, 1.7 % of the
   old wall, which is why gating the per-stage accelerator free was dropped.
+- **Not done, recorded rather than silently dropped (2026-09-04):** the
+  spec's "small stages" item for `separate` — load Silero once in `build()`
+  instead of per call, and skip the `non_speech_vocals.wav` write behind a
+  knob — was never started. Separate is 7 % of batch wall and the VAD inference
+  inside it 1.3 s, so the ceiling is ~1 % of wall. Still open; measure the
+  Silero load before taking it.
 - **`cpu_s` including child processes** — four stages spawn ffmpeg and the mux
   spawns `rubberband` twice per sentence, work invisible to `RUSAGE_SELF` and
   to every GPU counter.

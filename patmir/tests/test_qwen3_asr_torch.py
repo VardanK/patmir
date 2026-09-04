@@ -148,12 +148,29 @@ def test_unparseable_version_is_treated_as_too_old(monkeypatch):
     ("russian", "ru"),
     ("Armenian", "hy"),
     ("ru", "ru"),
-    ("Chinese Mandarin", "chinese"),
+    ("Chinese Mandarin", "zh"),
+    ("German", "de"),
+    ("English asr", "en"),        # a tag with trailing text still has a name
     (None, None),
     ("", None),
+    # Anything unrecognised is None, NOT the string itself. A truncated
+    # 24-token probe output such as "Engl" used to come back as the language
+    # "engl", get forced onto every chunk, and skip the full-probe fallback
+    # because it was not None.
+    ("Engl", None),
+    ("Serbo", None),
+    ("   ", None),
+    ("language", None),
 ])
 def test_to_iso(raw, expected):
     assert _to_iso(raw) == expected
+
+
+def test_to_iso_is_shared_between_the_two_qwen3_candidates():
+    # One function, two runtimes: the Mac candidate must not drift back to a
+    # local copy that passes garbage through.
+    from patmir.pipeline.stages.asr import qwen3_asr_mlx
+    assert qwen3_asr_mlx._to_iso is _to_iso
 
 
 # --- the shared CJK-hallucination guard --------------------------------
@@ -404,6 +421,15 @@ class TestLanguageProbe:
         spy = _ProbeSpy([])
         assert spy._detect_language(_clip(0.0)) is None
         assert spy.calls == []
+
+    def test_garbage_tag_returns_none_so_the_full_probe_runs(self):
+        # The comment on the budgets promises "never a wrong language". A
+        # 24-token budget can cut the tag itself ("Engl"); that must read as
+        # no tag, so `transcribe()` pays for the full probe instead of forcing
+        # "engl" onto every chunk.
+        for garbage in ("Engl", "Rus", "<asr_text>", "   "):
+            spy = _ProbeSpy([[{"language": garbage}]])
+            assert spy._detect_language(_clip(10.0)) is None, garbage
 
     def test_full_name_is_normalized_to_iso(self):
         for name, iso in (("Russian", "ru"), ("English", "en"), ("ru", "ru")):

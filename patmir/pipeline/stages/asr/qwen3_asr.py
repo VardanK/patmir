@@ -86,29 +86,16 @@ MIN_TRANSFORMERS = (5, 13)
 LANG_PROBE_SECONDS = 8.0
 LANG_PROBE_TOKENS = 24
 
-# Qwen3-ASR reports the language as a full English name ("English", "Russian").
-# Downstream pipeline stages expect ISO 639-1.
-_FULL_TO_ISO: dict[str, str] = {
-    "english": "en",
-    "russian": "ru",
-    "armenian": "hy",
-}
+# Language-tag normalization is shared with the other Qwen3-ASR candidate
+# (`_language.py`) so the two runtimes cannot disagree about what a tag
+# means. `_to_iso` returns None for anything it does not recognise —
+# the callers rely on that to fall back to a full probe.
+from patmir.pipeline.stages.asr._language import FULL_TO_ISO as _FULL_TO_ISO, to_iso as _to_iso
 
 # The forced aligner covers a subset of the ASR languages (ISO codes for the
 # set documented on the model card). Japanese additionally needs `nagisa` and
 # Korean `soynlp`; a missing one surfaces as ImportError and is caught.
 _ALIGNER_LANGS = frozenset({"zh", "en", "yue", "fr", "de", "it", "ja", "ko", "pt", "ru", "es"})
-
-
-def _to_iso(language: str | None) -> str | None:
-    if not language:
-        return None
-    key = language.strip().lower()
-    if key in _FULL_TO_ISO:
-        return _FULL_TO_ISO[key]
-    if len(key) == 2 and key.isalpha():
-        return key
-    return key.split()[0]
 
 
 def _resolve_device(requested: str) -> str:

@@ -768,13 +768,20 @@
         .then(function () {
           // Cancel the server-side work too. Quality jobs had no path to this
           // at all from the extension, so switching translation off left the
-          // GPU grinding on a dub nobody was waiting for — the waste
-          // `stream:stop` already prevents for watch-along.
-          if (job && job.job_id && !TERMINAL[job.status] && st.mode !== WATCH_ALONG) {
-            return tx.sw({ type: "jobs:cancel", job_id: job.job_id })
+          // GPU grinding on a dub nobody was waiting for.
+          if (!job || !job.job_id || TERMINAL[job.status]) return null;
+          if (st.mode === WATCH_ALONG) {
+            // The content script's `stopWatchAlong` sends `stream:stop` too,
+            // but only once playback has ATTACHED (`waActive`). While the job
+            // is still in prelude the button already reads Չեղարկել, and
+            // pressing it stopped nothing on the server. `/stream/<key>/stop`
+            // is idempotent, so the two never fight.
+            if (!job.cache_key) return null;
+            return tx.sw({ type: "stream:stop", cache_key: job.cache_key })
               .catch(function () { return null; });
           }
-          return null;
+          return tx.sw({ type: "jobs:cancel", job_id: job.job_id })
+            .catch(function () { return null; });
         })
         .then(function () {
           if (job && job.cache_key) forgetJob(job.cache_key);

@@ -14,6 +14,7 @@ policy, which is pure and unit-testable.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 # Ordered age buckets; adjacency is used to relax a match (a `young` speaker
@@ -98,6 +99,14 @@ class SpeakerRegistry:
         self._profiles: dict[str, SpeakerProfile] = {}  # speaker_id → gender/age
         self._embeddings: dict[str, list] = {}   # speaker_id → list of ECAPA embeddings
         self._id_counter = 0                        # for minting global ids for new speakers
+        # One lock for every read and write. `SectionPipeline` runs the next
+        # section's `analyze_section` (which registers speakers here) on a
+        # worker thread WHILE the main thread's `translate_section` snapshots
+        # `assignments()` / `locked_refs()` / `profiles()` outside the GPU
+        # lock — a dict comprehension racing an insert raises "dictionary
+        # changed size during iteration" mid-section. Re-entrant because
+        # `resolve_or_register` calls the other mutators.
+        self._lock = threading.RLock()
 
     # ── ElevenLabs preset-pool path ────────────────────────────────────────
 
@@ -109,15 +118,16 @@ class SpeakerRegistry:
         tier the least-used voice wins, so distinct characters spread across
         the pool instead of clumping on one voice.
         """
-        if speaker_id in self._assigned:
-            return self._assigned[speaker_id]
+        with self._lock:
+            if speaker_id in self._assigned:
+                return self._assigned[speaker_id]
 
-        profile = profile or SpeakerProfile()
-        self._profiles[speaker_id] = profile
-        chosen = self._best_match(profile)
-        self._assigned[speaker_id] = chosen.id
-        self._use_count[chosen.id] += 1
-        return chosen.id
+            profile = profile or SpeakerProfile()
+            self._profiles[speaker_id] = profile
+            chosen = self._best_match(profile)
+            self._assigned[speaker_id] = chosen.id
+            self._use_count[chosen.id] += 1
+            return chosen.id
 
     def _best_match(self, profile: SpeakerProfile) -> VoiceEntry:
         g, a = profile.gender, profile.age
@@ -152,22 +162,25 @@ class SpeakerRegistry:
     def lock_ref(self, speaker_id: str, ref_audio: str, ref_text: str = "") -> str:
         """Lock a speaker's clone reference on first sufficient clip so the
         cloned voice doesn't shift mid-video. Returns the locked ref."""
-        locked = self._locked_ref.setdefault(speaker_id, ref_audio)
-        if locked == ref_audio:
-            self._locked_ref_text.setdefault(speaker_id, ref_text)
-        return locked
+        with self._lock:
+            locked = self._locked_ref.setdefault(speaker_id, ref_audio)
+            if locked == ref_audio:
+                self._locked_ref_text.setdefault(speaker_id, ref_text)
+            return locked
 
     def locked_ref(self, speaker_id: str) -> str | None:
-        return self._locked_ref.get(speaker_id)
+        with self._lock:
+            return self._locked_ref.get(speaker_id)
 
     def locked_refs(self) -> dict[str, dict[str, str]]:
         """All locked clone refs, JSON-shaped for `ctx.extra["locked_refs"]` —
         the TTS adapter prefers these over the per-section refs so a character
         clones from the SAME clip in every section."""
-        return {
-            spk: {"ref_audio": path, "ref_text": self._locked_ref_text.get(spk, "")}
-            for spk, path in self._locked_ref.items()
-        }
+        with self._lock:
+            return {
+                spk: {"ref_audio": path, "ref_text": self._locked_ref_text.get(spk, "")}
+                for spk, path in self._locked_ref.items()
+            }
 
     # ── cross-section identity (ECAPA embeddings) ──────────────────────────
 
@@ -175,8 +188,9 @@ class SpeakerRegistry:
         """Add a voice embedding for a character. Multiple embeddings per
         speaker (from different turns/emotions) make matching robust to vocal-
         effort variation — `resolve` scores against the best of them."""
-        if embedding is not None:
-            self._embeddings.setdefault(speaker_id, []).append(embedding)
+        with self._lock:
+            if embedding is not None:
+                self._embeddings.setdefault(speaker_id, []).append(embedding)
 
     def resolve(self, embedding, threshold: float | None = None) -> str | None:
         """Return the known speaker_id whose stored embeddings best match
@@ -185,21 +199,23 @@ class SpeakerRegistry:
         stored embeddings so an emotional clip can still match a calm one.
         `threshold=None` uses the active embedding backend's calibrated value.
         """
-        if embedding is None or not self._embeddings:
-            return None
-        from patmir.pipeline.streaming.embeddings import cosine, match_threshold
-        if threshold is None:
-            threshold = match_threshold()
+        with self._lock:
+            if embedding is None or not self._embeddings:
+                return None
+            from patmir.pipeline.streaming.embeddings import cosine, match_threshold
+            if threshold is None:
+                threshold = match_threshold()
 
-        best_id, best_score = None, -1.0
-        for spk, embs in self._embeddings.items():
-            score = max((cosine(embedding, e) for e in embs), default=-1.0)
-            if score > best_score:
-                best_id, best_score = spk, score
-        return best_id if best_score >= threshold else None
+            best_id, best_score = None, -1.0
+            for spk, embs in self._embeddings.items():
+                score = max((cosine(embedding, e) for e in embs), default=-1.0)
+                if score > best_score:
+                    best_id, best_score = spk, score
+            return best_id if best_score >= threshold else None
 
     def has_embedding(self, speaker_id: str) -> bool:
-        return bool(self._embeddings.get(speaker_id))
+        with self._lock:
+            return bool(self._embeddings.get(speaker_id))
 
     def _mint_id(self) -> str:
         while True:
@@ -225,25 +241,29 @@ class SpeakerRegistry:
         Takes an already-computed `profile`/`embedding` so the registry stays
         independent of the (heavy) profiling + embedding models.
         """
-        match = self.resolve(embedding, threshold)
-        if match is not None:
-            return match, False
-        gid = self._mint_id()
-        self.assign_voice(gid, profile)
-        self.set_embedding(gid, embedding)
-        if ref_audio is not None:
-            self.lock_ref(gid, ref_audio, ref_text)
-        return gid, True
+        with self._lock:
+            match = self.resolve(embedding, threshold)
+            if match is not None:
+                return match, False
+            gid = self._mint_id()
+            self.assign_voice(gid, profile)
+            self.set_embedding(gid, embedding)
+            if ref_audio is not None:
+                self.lock_ref(gid, ref_audio, ref_text)
+            return gid, True
 
     # ── introspection ─────────────────────────────────────────────────────
 
     def assignments(self) -> dict[str, str]:
-        return dict(self._assigned)
+        with self._lock:
+            return dict(self._assigned)
 
     def profiles(self) -> dict[str, dict[str, str]]:
         """Per-speaker gender/age, JSON-shaped for `ctx.extra["speaker_profiles"]`
         (the TTS adapter's stand-in pool matches on gender)."""
-        return {spk: {"gender": p.gender, "age": p.age} for spk, p in self._profiles.items()}
+        with self._lock:
+            return {spk: {"gender": p.gender, "age": p.age} for spk, p in self._profiles.items()}
 
     def known_speakers(self) -> list[str]:
-        return list(self._assigned.keys())
+        with self._lock:
+            return list(self._assigned.keys())

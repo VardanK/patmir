@@ -59,6 +59,16 @@ class CachedOpeningTest(unittest.TestCase):
         prior = {"sections": [{"index": 0, "start": 0.0, "end": 39.2}]}
         self.assertIsNotNone(_cached_opening(prior, 40.0))
 
+    def test_a_late_start_is_not_the_opening_even_inside_the_end_tolerance(self):
+        # Coverage is seeded from the cached span, so accepting [0.9, 40) would
+        # leave [0, 0.9) uncovered and the scheduler would dub a sub-second
+        # section at 0. The end tolerance must not apply to the start.
+        prior = {"sections": [{"index": 0, "start": 0.9, "end": 40.0}]}
+        self.assertIsNone(_cached_opening(prior, 40.0))
+        # Float slack at the start is fine.
+        prior = {"sections": [{"index": 0, "start": 0.004, "end": 40.0}]}
+        self.assertIsNotNone(_cached_opening(prior, 40.0))
+
     def test_a_malformed_entry_is_skipped_not_raised(self):
         prior = {"sections": [
             {"index": "x", "start": 0.0, "end": 40.0},

@@ -90,9 +90,12 @@ allocated / 16.98 reserved, 7.88 GB free. Peak RSS 3.9 GB on a warm repeat and
    not enough to justify invalidating a captured graph.
 
 Sentence counts differ per repeat (77 / 81 / 80) with diarization turns at
-100 / 107 / 111. That is the known Sortformer non-determinism recorded in
-quality issue #16, not an effect of anything measured here, and it is why
-per-stage numbers are quoted as ranges.
+100 / 107 / 111. That is not an effect of anything measured here, and it is
+why per-stage numbers are quoted as ranges. (At the time this was attributed
+to Sortformer non-determinism per quality issue #16; on 2026-09-03 the cause
+was traced to demucs' unseeded `shifts=1` in the separate stage and fixed —
+issue #28. Sortformer was measured deterministic. The spread in these runs is
+real; the stage blamed for it was wrong.)
 
 ### A harness bug found by taking the baseline
 

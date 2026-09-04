@@ -548,9 +548,11 @@ test("stopping a running quality job cancels it server-side", async () => {
   assert.equal(f.typesOf("jobs:cancel").length, 1);
 });
 
-test("stopping watch-along does not send jobs:cancel", async () => {
-  // The content script's own stream:stop already halts the scheduler; a second
-  // mechanism would race it.
+test("stopping watch-along sends stream:stop, not jobs:cancel", async () => {
+  // Watch-along work is stopped through the stream endpoint. The content
+  // script sends the same message once playback has attached; before that
+  // (job still in prelude) it sends nothing, so the button read Չեղարկել and
+  // stopped nothing on the server. The endpoint is idempotent.
   const f = makeFake({ submit: { job_id: "j1", cache_key: "kw", status: "streaming" } });
   const s = S.createSession({ transport: f.transport, mode: "watch-along" });
   await s.refresh();
@@ -558,6 +560,18 @@ test("stopping watch-along does not send jobs:cancel", async () => {
   await s.stop();
   assert.equal(f.typesOf("player:stop").length, 1);
   assert.equal(f.typesOf("jobs:cancel").length, 0);
+  const stops = f.typesOf("stream:stop");
+  assert.equal(stops.length, 1);
+  assert.equal(stops[0].cache_key, "kw");
+});
+
+test("stopping a finished watch-along sends nothing to the server", async () => {
+  const f = makeFake({ submit: { job_id: "j1", cache_key: "kw", status: "done" } });
+  const s = S.createSession({ transport: f.transport, mode: "watch-along" });
+  await s.refresh();
+  await s.primary();
+  await s.stop();
+  assert.equal(f.typesOf("stream:stop").length, 0);
 });
 
 test("a reply that arrives after the URL changed is discarded", async () => {

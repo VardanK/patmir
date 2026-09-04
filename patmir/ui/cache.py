@@ -36,7 +36,15 @@ from patmir.pipeline.stage import STAGE_ORDER
 
 log = logging.getLogger(__name__)
 
-CACHE_VERSION = 1
+# Bumped 1 -> 2 on 2026-09-04. `config_hash` sees the TOML entries only, and
+# four output-affecting changes landed as code constants between 2026-09-02
+# and 2026-09-03 with no key movement: the mux onset-burst trim and fade-in
+# cap (#30), `EMOTION_MAX_CLIP_SECONDS` (labels of every turn over 20 s, hence
+# ref choice and the translator prompt), the 8 s ASR language probe, and
+# `shifts = 0` on the two torch fallback separate entries that had no `shifts`
+# key. A dub cached under version 1 may carry any mix of the old behaviours;
+# one regeneration folds them all in.
+CACHE_VERSION = 2
 # Fallback for callers with no loaded config. The server takes its cache root
 # from `PipelineConfig.storage.cache_root` so `[storage]` is honored.
 DEFAULT_CACHE_ROOT = paths.defaults(None).cache_root

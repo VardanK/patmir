@@ -544,3 +544,30 @@ class CacheKeyIgnoresSchedulingKnobs(unittest.TestCase):
                       {"max_batch": 12}):
             self.assertNotEqual(config_hash(self._cfg(tts_entry=entry)), base,
                                 f"{entry} must change the cache key")
+
+
+class BuiltFallbackKnobsTest(unittest.TestCase):
+    """`build()` must hand the throughput/retry knobs to the per-sentence
+    fallback — the candidate itself makes one call per chunk, so the fallback
+    is the only place `concurrency` acts, and watch-along runs THIS candidate.
+    Before this the fallback was constructed with the class defaults whatever
+    `patmir.toml` said, so the 6 -> 12 tuning never reached watch-along."""
+
+    def test_build_forwards_knobs_to_the_fallback(self):
+        from patmir.eval.candidates.translation import openrouter_batch
+        t = openrouter_batch.build({
+            "model": "m", "concurrency": 12, "max_attempts": 4, "retry_backoff_s": 0.7,
+        })
+        self.assertEqual(t._fallback.translate_concurrency, 12)
+        self.assertEqual(t._fallback.max_attempts, 4)
+        self.assertEqual(t._fallback.retry_backoff_s, 0.7)
+        self.assertEqual(t.max_attempts, 4)
+
+    def test_the_toml_entry_carries_the_knobs(self):
+        import tomllib
+        from pathlib import Path
+        cfg = tomllib.loads((Path(__file__).resolve().parents[2] / "patmir.toml").read_text())
+        entry = next(c for c in cfg["eval"]["translation"]["candidates"]
+                     if c["id"] == "openrouter_gemini_flash_batch")
+        self.assertEqual(entry["concurrency"], 12)
+        self.assertIn("max_attempts", entry)

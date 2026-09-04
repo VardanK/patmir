@@ -128,6 +128,14 @@ class OpenRouterBatchTranslator:
         overlap: int = 2,
         max_attempts: int = 3,
         retry_backoff_s: float = 0.5,
+        # How many per-sentence calls the FALLBACK keeps in flight. This
+        # candidate itself makes one call per chunk, but every chunk that
+        # fails validation degrades to `chunk_size` per-sentence calls, and
+        # watch-along runs this candidate exclusively — so until this was
+        # forwarded the `concurrency = 12` tuning in `patmir.toml` never
+        # reached watch-along at all and its fallback stayed at the class
+        # default of 6.
+        concurrency: int | None = None,
         reasoning: dict | None = None,
         thinking: dict | None = None,
         referer: str = "https://github.com/patmir-dub",
@@ -174,6 +182,9 @@ class OpenRouterBatchTranslator:
             top_p=top_p,
             timeout_seconds=timeout_seconds,
             base_url=base_url,
+            concurrency=concurrency,
+            max_attempts=max_attempts,
+            retry_backoff_s=retry_backoff_s,
             reasoning=reasoning,
             thinking=thinking,
             referer=referer,
@@ -497,6 +508,7 @@ def build(config: dict[str, Any]) -> OpenRouterBatchTranslator:
         overlap=int(config.get("overlap", 2)),
         max_attempts=int(config.get("max_attempts", 3)),
         retry_backoff_s=float(config.get("retry_backoff_s", 0.5)),
+        concurrency=config.get("concurrency"),
         reasoning=config.get("reasoning"),
         thinking=config.get("thinking"),
         referer=config.get("referer", "https://github.com/patmir-dub"),

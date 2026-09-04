@@ -109,21 +109,39 @@ class SectionPipeline:
             "prefetch_hits": 0, "prefetch_misses": 0, "prefetch_discarded": 0,
         }
 
+    # How long `close()` and a discard wait for an in-flight analysis. A torch
+    # forward cannot be interrupted, so this is a bound on how long a hung one
+    # can hold the stream's teardown, not a normal-path number (analysis is
+    # ~4-5 s).
+    CLOSE_WAIT_S = 300.0
+
     # -- lifecycle -- #
     def close(self) -> None:
         """Drop any in-flight prefetch and stop the worker."""
         pending, self._pending = self._pending, None
         self._pending_start = None
+        timed_out = False
         if pending is not None:
             pending.cancel()
             # A running analysis cannot be interrupted (it is a torch forward),
             # so wait for it rather than leaving a thread on the GPU after the
             # stream is gone.
             try:
-                pending.result(timeout=300)
+                pending.result(timeout=self.CLOSE_WAIT_S)
+            except TimeoutError:
+                timed_out = True
             except Exception:  # noqa: BLE001
                 pass
-        self._pool.shutdown(wait=True)
+        if timed_out:
+            # The bound above was decorative when this was `wait=True`: a hung
+            # forward re-blocked here with no timeout at all. Say so and let
+            # the thread finish on its own; the accelerator lock is the
+            # caller's problem to release, and it can only do that if we return.
+            log.error("Section analysis still running after %.0f s at close; "
+                      "abandoning the wait.", self.CLOSE_WAIT_S)
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            self._pool.shutdown(wait=True)
 
     def __enter__(self) -> SectionPipeline:
         return self
@@ -166,28 +184,37 @@ class SectionPipeline:
         pending, pending_start = self._pending, self._pending_start
         self._pending, self._pending_start = None, None
 
-        usable = (
+        same_start = (
             pending is not None
-            and max_end is None
             and pending_start is not None
             and abs(pending_start - start) < 0.01
         )
-        if pending is not None and not usable:
+        if pending is not None and not same_start:
             self.stats["prefetch_discarded"] += 1
             log.debug("Discarding prefetch at %.2fs (asked %.2fs, max_end=%s)",
                       pending_start or -1.0, start, max_end)
             pending.cancel()
             try:
-                pending.result(timeout=300)   # cannot interrupt a torch forward
+                pending.result(timeout=self.CLOSE_WAIT_S)   # cannot interrupt a torch forward
             except Exception:  # noqa: BLE001
                 pass
             pending = None
 
-        if usable and pending is not None:
+        if same_start and pending is not None:
             try:
                 analyzed = pending.result()
-                self.stats["prefetch_hits"] += 1
-                return analyzed
+                # A clamp only matters if it would have moved the end. On a
+                # resumed stream the scheduler passes `max_end` for EVERY
+                # section (cached audio lies ahead), so refusing every clamped
+                # request made each section pay a wasted analysis serially.
+                # An unclamped analysis that already ends at or before the
+                # clamp is the same section the clamp would have produced.
+                if max_end is None or float(analyzed.end) <= float(max_end) + 1e-3:
+                    self.stats["prefetch_hits"] += 1
+                    return analyzed
+                self.stats["prefetch_discarded"] += 1
+                log.debug("Discarding prefetch at %.2fs: ends %.2fs past max_end %.2fs",
+                          start, analyzed.end, max_end)
             except JobCancelled:
                 raise
             except Exception:  # noqa: BLE001

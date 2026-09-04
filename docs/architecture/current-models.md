@@ -1,6 +1,6 @@
 # Currently active models
 
-Last updated: 2026-09-02
+Last updated: 2026-09-04
 
 The single source of truth is `patmir.toml [pipeline]`. This table mirrors it for quick reference; if the two ever disagree, `patmir.toml` wins and this file is stale.
 
