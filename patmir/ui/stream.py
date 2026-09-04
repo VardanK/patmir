@@ -45,6 +45,7 @@ from patmir.pipeline.context import (
     JobCancelled,
     resolve_audience,
 )
+from patmir.pipeline.streaming.pipeline import SectionPipeline
 from patmir.pipeline.streaming.prelude import run_prelude
 from patmir.pipeline.streaming.runner import source_duration
 from patmir.pipeline.streaming.scheduler import Playhead, StreamScheduler
