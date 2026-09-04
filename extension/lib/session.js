@@ -229,11 +229,13 @@
       else if (job.status === "prelude") kind = "prelude";
       else if (job.status === "streaming") kind = "streaming";
       else if (runningStage(job) === "download") kind = "downloading";
-      // STOP only for `streaming`: watch-along plays the dub WHILE producing
-      // it, so the viewer is listening and "turn translation off" is the
-      // honest description. Everything else here is preparation with nothing
-      // to listen to yet, so the button offers to cancel it.
-      return view(kind, kind === "streaming" ? STOP : CANCEL, {
+      // `Չեղարկել` for EVERY in-flight job, streaming included (author's
+      // call). Watch-along does play while producing, which is why STOP was
+      // used here at first — but the button's job is to name what pressing it
+      // does, and while work is still queued behind the playhead that is
+      // cancelling the work, not just muting a finished track. `Չթարգմանել`
+      // is left to states where nothing is being produced any more.
+      return view(kind, CANCEL, {
         action: "stop", tone: "active", busy: true,
         progress: jobProgress(job),
         // `job` is null while phase is "submitting" — the request is in flight

@@ -193,13 +193,12 @@ test("every job status maps to a state, and all of them offer the way out", () =
       phase: "job", job: { status, job_id: "j", stage_states: { a: "running" } },
     }));
     assert.equal(v.kind, kind, status);
-    // The ACTION is the same everywhere — one control, one way out. Only the
-    // WORD differs: `streaming` plays the dub while producing it, so "do not
-    // translate" is honest there; the rest are preparation with nothing to
-    // listen to yet, where that phrasing read as a status rather than an
-    // action ("it says that it's not translating, while in reality it does").
-    const expected = status === "streaming" ? S.LABELS.STOP : S.LABELS.CANCEL;
-    assert.equal(v.label, expected, status);
+    // Every in-flight job reads `Չեղարկել`, streaming included (author's
+    // call). Watch-along does play while producing, which is why STOP was
+    // used here at first — but while work is still queued behind the playhead,
+    // pressing the button cancels that work rather than muting a finished
+    // track. `Չթարգմանել` is left to states where nothing is in flight.
+    assert.equal(v.label, S.LABELS.CANCEL, status);
     assert.equal(v.action, "stop", `${status} must stay cancellable`);
   }
 });
@@ -328,7 +327,7 @@ test("only three labels ever appear on the primary path", () => {
   }
 });
 
-test("a job being prepared offers Չեղարկել, a dub playing offers Չթարգմանել", () => {
+test("an in-flight job offers Չեղարկել, a finished dub playing offers Չթարգմանել", () => {
   // The reported problem: while translating, the button read `Չթարգմանել`
   // ("do not translate"), which describes a state the viewer is not in. The
   // fix is the word, not the action.

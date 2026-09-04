@@ -118,7 +118,7 @@
     // Pressing play IS the global choice: every later video translates until
     // the viewer presses stop.
     await setTranslateEnabled(true);
-    stopWatchAlong();
+    stopWatchAlong("quality-playback-requested");
     await startDub(cacheKey);
     return { ok: true };
   }
@@ -149,7 +149,7 @@
     waRevivesUsed += 1;
     console.warn(`[patmir] dub stream stopped producing — re-submitting `
       + `(attempt ${waRevivesUsed} of ${WA_MAX_REVIVES}).`);
-    stopWatchAlong();
+    stopWatchAlong("watch-along-restart");
     let resp;
     try {
       resp = await chrome.runtime.sendMessage({
@@ -720,7 +720,7 @@
    * chunked feed). Used by every navigation/teardown path. */
   function stopPlayback() {
     stopDub();
-    stopWatchAlong();
+    stopWatchAlong("stop-playback");
   }
 
   function base64ToBytes(b64) {
@@ -847,8 +847,14 @@
     pollWatchAlongSections();
   }
 
-  function stopWatchAlong() {
+  function stopWatchAlong(reason) {
     if (!waActive) return;
+    // Named on purpose. The server log shows submit/stop pairs seconds apart —
+    // something tears a stream down right after the auto-start begins one —
+    // and `/stream/<key>/stop` records that it happened but not who asked.
+    // Every caller passes a reason so the next occurrence is evidence rather
+    // than another hypothesis.
+    console.warn(`[patmir] stopping the dub stream: ${reason || "unspecified"}`);
     // Tell the server to stop dubbing immediately — otherwise its scheduler
     // keeps running Scribe + ElevenLabs TTS over the rest of the video (paid)
     // even though we've stopped watching. Best-effort, fire-and-forget.
@@ -1058,17 +1064,17 @@
           reviveWatchAlong().then((ok) => {
             if (ok) return;
             console.warn("[patmir] re-submit failed — releasing the video.");
-            stopWatchAlong();
+            stopWatchAlong("stall-abandon");
             if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
           }).catch(() => {
-            stopWatchAlong();
+            stopWatchAlong("stall-abandon-revive-failed");
             if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
           });
           return;
         }
         console.warn(`[patmir] no new dub section for ${starvedFor}s and the `
           + `revive was already used — releasing the video.`);
-        stopWatchAlong();
+        stopWatchAlong("stall-abandon-error");
         if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
       } else {
         // Genuine underrun: the dub for this point isn't produced yet. Freeze
@@ -1150,7 +1156,7 @@
     stalled() { stopAllNodes(); resetSyncWindow(); },
     playing() { resetSyncWindow(); },
     ratechange() { stopAllNodes(); resetSyncWindow(); },
-    ended() { stopWatchAlong(); },
+    ended() { stopWatchAlong("video-ended"); },
     volumechange: onVolumeChange,
     emptied: onVideoSourceChangedWA,
     loadstart: onVideoSourceChangedWA,
@@ -1161,7 +1167,7 @@
     // Same ad exemption as the quality path — see onVideoSourceChanged.
     if (adState().showing) { updateAdState(); return; }
     const currentSrc = video ? (video.currentSrc || video.src || null) : null;
-    if (currentSrc !== videoSrcAtStart) stopWatchAlong();
+    if (currentSrc !== videoSrcAtStart) stopWatchAlong("source-changed");
   }
 
   function attachWatchAlongListeners() {
