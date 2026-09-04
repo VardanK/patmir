@@ -436,4 +436,8 @@ def serve(
         token=token,
         config_path=config_path,
     )
-    uvicorn.run(app, host=host, port=port)
+    # `log_config=None`: uvicorn otherwise installs its own handlers and sets
+    # `propagate = False`, which puts its request lines out of reach of the
+    # rotating file log. With it None, everything propagates to the root
+    # handlers `setup_file_logging` installed — one place decides.
+    uvicorn.run(app, host=host, port=port, log_config=None)

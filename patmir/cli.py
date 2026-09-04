@@ -334,6 +334,11 @@ def cmd_ui(port: int, runs_root: Path | None, config: Path, host: str = "127.0.0
         print(f"patmir ui: {exc}", file=sys.stderr)
         return 2
 
+    # Before anything else logs: a crash's last lines are the point, and the
+    # server used to log to stderr only, so they died with the terminal.
+    from patmir.ui.logs import setup_file_logging
+    log_file = setup_file_logging(storage.state_root)
+
     print(f"patmir ui — bind {host}:{port}", file=sys.stderr)
     if host not in ("127.0.0.1", "localhost", "::1"):
         # Say it once, plainly: the job-progress routes predate the token and
@@ -347,6 +352,7 @@ def cmd_ui(port: int, runs_root: Path | None, config: Path, host: str = "127.0.0
     print(f"  cache:   {storage.cache_root}", file=sys.stderr)
     if storage.library_root:
         print(f"  library: {storage.library_root}", file=sys.stderr)
+    print(f"  log:     {log_file}  (rotating, ~40 MB ceiling)", file=sys.stderr)
     print(f"  token:   {token}  (paste into the Chrome extension options page)",
           file=sys.stderr)
     print("  startup:  prewarming models — the port does not accept "
