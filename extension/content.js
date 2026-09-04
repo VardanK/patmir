@@ -100,6 +100,12 @@
   // seek: if the element we are about to seek reports this duration, whatever
   // else we believe, it is the content and we must not touch it.
   let contentDuration = null;
+  // How long a source change waits for the ad class before being believed to
+  // be a navigation. Long enough for YouTube to stamp `#movie_player`, short
+  // enough that a genuine Shorts auto-advance keeps dubbing the wrong video
+  // for well under a second.
+  const SRC_CHANGE_GRACE_MS = 1200;
+  let srcChangeGrace = null;
 
   // --- message routing ------------------------------------------------
 
@@ -665,9 +671,26 @@
     // teardown.
     if (adState().showing) { updateAdState(); return; }
     const currentSrc = video ? (video.currentSrc || video.src || null) : null;
-    if (currentSrc !== videoSrcAtStart) {
-      stopDub();
-    }
+    if (currentSrc === videoSrcAtStart) return;
+    // The src differs and no ad is showing YET -- which is not the same as no
+    // ad. `emptied`/`loadstart` fire the instant the source is swapped, and
+    // YouTube sets `ad-showing` on the player around the same moment with no
+    // guaranteed ordering. Tearing down here is what put the video back in
+    // English after a mid-roll (quality issue #26 was never confirmed on a
+    // real ad break), and issue #27 made the race more likely by tightening
+    // detection so ONLY the player class counts.
+    //
+    // So defer: re-ask once the class has had time to appear. A real
+    // navigation is still caught -- by this same check a moment later, and by
+    // the URL poll that owns navigation anyway.
+    if (srcChangeGrace !== null) return;      // already waiting on one
+    srcChangeGrace = setTimeout(() => {
+      srcChangeGrace = null;
+      if (!playing) return;
+      if (adState().showing) { updateAdState(); return; }
+      const nowSrc = video ? (video.currentSrc || video.src || null) : null;
+      if (nowSrc !== videoSrcAtStart) stopDub();
+    }, SRC_CHANGE_GRACE_MS);
   }
 
   // Every one of these invalidates the anchor, so they stop the audio and clear
@@ -789,6 +812,9 @@
   // consumed (cleared) inside the pause handler, never reset synchronously.
   let waProgrammatic = false;
   let waBuffering = false;        // want to play but the current section isn't ready yet
+  // When the manifest last gained a section. A dead stream is indistinguishable
+  // from a slow one except by how long nothing has arrived.
+  let waLastProgressAt = 0;
   let waLastPlayheadPost = 0;
 
   const WA_LOOKAHEAD = 15;        // seconds of sections to prefetch ahead of playhead
@@ -816,6 +842,7 @@
 
     attachWatchAlongListeners();
     attachNavigationListeners();
+    waLastProgressAt = Date.now();   // the clock starts when we start watching
     if (waPollHandle === null) waPollHandle = setInterval(pollWatchAlongSections, 2000);
     resetSyncWindow();
     startSyncTick();
@@ -876,6 +903,7 @@
           index: s.index, start: s.start, end: s.end, file: s.file,
           buffer: null, fetching: false, node: null, startCtx: 0, startOffset: 0, rate: 1,
         });
+        waLastProgressAt = Date.now();
       }
     }
     // Evict entries the manifest no longer lists (deduplicated away server
@@ -1017,6 +1045,19 @@
         // move past the short section before the next one becomes current.
         waBuffering = false;
         reportPlayhead(false);
+      } else if (S.shouldAbandonStream({
+        buffering: true, complete: waComplete,
+        msSinceProgress: Date.now() - waLastProgressAt,
+      })) {
+        // Nothing has arrived for a minute: the stream is dead, not slow.
+        // Without this the client re-pauses on every tick, so pressing play
+        // stops the video a quarter second later — forever, with no error
+        // anywhere. Hand the video back and play the original.
+        console.warn("[patmir] no new dub section for "
+          + Math.round((Date.now() - waLastProgressAt) / 1000)
+          + "s — giving up on the stream and releasing the video.");
+        stopWatchAlong();
+        if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
       } else {
         // Genuine underrun: the dub for this point isn't produced yet. Freeze
         // the video; a later tick resumes once the section lands.

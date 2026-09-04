@@ -300,3 +300,59 @@ test("the 50 ms lead lets a section start marginally early", () => {
   assert.equal(pickSection(secs, 79.98).index, 2, "within the lead");
   assert.equal(pickSection(secs, 79.0).index, 2, "before it: scheduled ahead, same section");
 });
+
+
+// --- dead-stream release ------------------------------------------------
+//
+// Watch-along pauses the <video> on a genuine underrun and resumes when the
+// section lands. If the server-side stream DIES no section ever lands, and the
+// client re-pauses on every 250 ms tick — so pressing play stops the video a
+// quarter second later, forever, with no error anywhere. The author's report:
+// "video hang up on me and won't continue, no errors, if I press play it
+// automatically stops."
+
+test("a starved stream is abandoned once nothing has arrived for the limit", () => {
+  assert.equal(sync.shouldAbandonStream(
+    { buffering: true, msSinceProgress: 61000 }), true);
+});
+
+test("a merely slow section is not abandoned", () => {
+  // Production runs ~2.6x realtime over ~36 s sections, so one lands roughly
+  // every 14 s. Twenty seconds of silence is a slow section, not a dead one.
+  assert.equal(sync.shouldAbandonStream(
+    { buffering: true, msSinceProgress: 20000 }), false);
+});
+
+test("exactly at the limit counts as abandoned", () => {
+  assert.equal(sync.shouldAbandonStream(
+    { buffering: true, msSinceProgress: sync.STREAM_STALL_MS }), true);
+});
+
+test("a viewer who is not starved is never abandoned", () => {
+  // Playing happily, or paused by the viewer: there is nothing to give up on.
+  assert.equal(sync.shouldAbandonStream(
+    { buffering: false, msSinceProgress: 999999 }), false);
+});
+
+test("a complete stream is never abandoned", () => {
+  // Everything is on disk; a gap here is a short section, not a dead server.
+  assert.equal(sync.shouldAbandonStream(
+    { buffering: true, complete: true, msSinceProgress: 999999 }), false);
+});
+
+test("missing timing information does not abandon", () => {
+  // Better to keep waiting than to drop the dub on a bookkeeping gap.
+  assert.equal(sync.shouldAbandonStream({ buffering: true }), false);
+  assert.equal(sync.shouldAbandonStream(
+    { buffering: true, msSinceProgress: NaN }), false);
+});
+
+test("the limit is overridable, so a caller can be stricter", () => {
+  assert.equal(sync.shouldAbandonStream(
+    { buffering: true, msSinceProgress: 5000, limitMs: 4000 }), true);
+});
+
+test("no state at all is safe", () => {
+  assert.equal(sync.shouldAbandonStream(), false);
+  assert.equal(sync.shouldAbandonStream(null), false);
+});
