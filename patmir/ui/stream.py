@@ -45,6 +45,7 @@ from patmir.pipeline.context import (
     JobCancelled,
     resolve_audience,
 )
+from patmir.pipeline.streaming.pipeline import SectionPipeline
 from patmir.pipeline.streaming.prelude import run_prelude
 from patmir.pipeline.streaming.runner import source_duration
 from patmir.pipeline.streaming.scheduler import Playhead, StreamScheduler
@@ -87,6 +88,12 @@ class StreamRecord:
     duration: float | None = None
     window_end: float | None = None       # first section boundary (prelude end)
     sections_done: int = 0
+    # Seconds of the video actually dubbed. `sections_done` alone cannot make a
+    # fraction (sections vary in length and the prelude window is its own
+    # size), and a stream record has no `stage_states` — which is why the
+    # in-page progress bar showed nothing at all in watch-along once it became
+    # the default mode.
+    dubbed_s: float = 0.0
     cached: bool = False
     # Download progress. These four names are what JobManager's yt-dlp hook
     # writes; carrying them here is what lets a watch-along stream pass `rec`
@@ -128,6 +135,9 @@ class StreamRecord:
             "duration": self.duration,
             "window_end": self.window_end,
             "sections_done": self.sections_done,
+            # The progress bar divides this by `duration`; without it the
+            # extension read `undefined` and hid the bar in watch-along.
+            "dubbed_s": self.dubbed_s,
             "cached": self.cached,
             "speakers": self.speakers,
             "playhead": {"t": self.playhead.t, "paused": self.playhead.paused},
@@ -142,6 +152,53 @@ class StreamRecord:
                 "first_audio_s": self.first_audio_s,
             },
         }
+
+
+
+
+def _dubbed_seconds(prior: dict[str, Any] | None) -> float:
+    """Seconds already on disk, from a cached manifest.
+
+    Summed rather than counted: sections differ in length, and the prelude
+    window is its own size. A malformed entry is skipped rather than raising —
+    this feeds a progress bar, and a bar is never worth failing a resume for.
+    """
+    total = 0.0
+    for s in (prior or {}).get("sections", []):
+        try:
+            total += max(0.0, float(s["end"]) - float(s["start"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return total
+
+
+def _cached_opening(prior: dict[str, Any] | None,
+                    window_end: float,
+                    tolerance: float = 1.0,
+                    start_tolerance: float = 0.05) -> dict[str, Any] | None:
+    """The cached section that already covers the opening window, if any.
+
+    Matched on the SPAN rather than on `index == 0`, because a manifest
+    repaired by `append_section`'s index dedup (issue #22) can hold the opening
+    window under any index. The END may fall short of `window_end` by
+    `tolerance` (VAD snapping moves that boundary, and coverage is seeded from
+    the cached span, so the next section starts exactly where it ends). The
+    START may not: coverage is seeded from the cached span too, so a section
+    that begins at 0.9 s leaves `[0, 0.9)` uncovered and the scheduler dubs a
+    sub-second section at 0 for it. `start_tolerance` is float slack only.
+    """
+    for s in (prior or {}).get("sections", []):
+        try:
+            start = float(s["start"])
+            end = float(s["end"])
+            index = int(s["index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if index < 0:
+            continue
+        if start <= start_tolerance and end >= window_end - tolerance:
+            return s
+    return None
 
 
 def _index_seed(prior: dict[str, Any] | None, opening_index: int) -> int:
@@ -487,6 +544,7 @@ class StreamManager:
             )
         else:
             rec.sections_done = len(prior.get("sections", []))
+            rec.dubbed_s = _dubbed_seconds(prior)
 
         # Warm-model cache: each stage model is built once and reused, killing
         # the measured 11-13% per-section rebuild tax (performance.md roadmap
@@ -507,13 +565,44 @@ class StreamManager:
         rec.window_end = prelude.window_end
         rec.speakers = prelude.speakers
 
-        # 2) Dub the prelude window (section 0), reusing the prelude analysis.
+        # 2) Dub the prelude window (section 0), reusing the prelude analysis —
+        # unless it is ALREADY CACHED, in which case re-doing it is pure loss.
+        #
+        # A restart (issue #21: a `done` stream whose manifest is not
+        # `complete` is resumed by `submit()`) used to re-translate and
+        # re-synthesize the opening window every time, on top of re-running the
+        # prelude analysis. The analysis has to happen — the `SpeakerRegistry`
+        # it builds is not persisted, and every later section resolves speaker
+        # identity against it — but the *audio* is on disk and byte-for-byte
+        # what we would produce again.
+        #
+        # The cost is not just wasted GPU: `scheduler.run()` does not start
+        # until this returns, so nothing NEW is produced for its duration and
+        # the viewer sits frozen at the edge of the audio they already have.
+        # Measured on cache key 8534a9320e5492c2 (a 3471 s video): two prelude
+        # runs 53 s apart with exactly one section cached, section 0 costing
+        # 22.4 s of that — the author reported the video "stuck at 35 sec",
+        # which is inside the 0-39.99 s the cache already held.
         rec.status = "streaming"
-        opening = dub_prelude_window(cfg, prelude, runs_root=self._runs_root,
-                                     stage_cache=stage_cache, cancel=cancel)
-        rec.opening_dub_s = opening.wall_s
-        self._emit(rec, opening)
+        cached_opening = _cached_opening(prior, prelude.window_end)
+        if cached_opening is not None:
+            rec.opening_dub_s = 0.0
+            rec.sections_done = len(prior.get("sections", []))
+            rec.dubbed_s = _dubbed_seconds(prior)
+            opening_index = int(cached_opening["index"])
+            log.info("Opening window %.2f-%.2f already cached (section %d) — "
+                     "skipping the re-dub and going straight to streaming.",
+                     float(cached_opening["start"]), float(cached_opening["end"]),
+                     opening_index)
+        else:
+            opening = dub_prelude_window(cfg, prelude, runs_root=self._runs_root,
+                                         stage_cache=stage_cache, cancel=cancel)
+            rec.opening_dub_s = opening.wall_s
+            self._emit(rec, opening)
+            opening_index = opening.index
         # The number the viewer actually feels: submit -> first playable audio.
+        # With a cached opening that is the prelude alone, because the audio was
+        # playable before this call started.
         rec.first_audio_s = perf_counter() - t_start
 
         # 3) Stream the rest, playhead-driven. Seed the abandon timer so the
@@ -527,17 +616,25 @@ class StreamManager:
         # at one file. Measured on cache key d5af5653d745ed66, where indices 1
         # and 2 each appeared twice with different windows, so the wrong audio
         # played at 154.9 s and 190.3 s, live and on every rewatch.
-        index_counter = {"n": _index_seed(prior, opening.index)}
+        index_counter = {"n": _index_seed(prior, opening_index)}
+
+        # Analyse the next section while this one waits on the translate
+        # round-trip. Translate is 29% of watch-along wall with the GPU idle
+        # throughout, and analysis is the GPU work that fits in that gap. One
+        # lock inside the driver keeps GPU phases serialized, which the TTS
+        # CUDA-graph capture requires. `section_prefetch = false` restores the
+        # fully serial path.
+        pipeline = SectionPipeline(
+            local_path, cfg, prelude.registry,
+            runs_root=self._runs_root, stage_cache=stage_cache, cancel=cancel,
+            source_lang=prelude.source_lang, duration=rec.duration,
+            prefetch=bool(getattr(cfg.options, "section_prefetch", True)),
+            index_start=index_counter["n"],
+        )
 
         def _process(start: float, max_end: float | None = None) -> SectionResult | None:
-            index_counter["n"] += 1
             try:
-                return process_section(
-                    local_path, cfg, prelude.registry,
-                    index=index_counter["n"], start=start, runs_root=self._runs_root,
-                    stage_cache=stage_cache, cancel=cancel,
-                    source_lang=prelude.source_lang, max_end=max_end,
-                )
+                return pipeline.process(start, max_end)
             except JobCancelled:
                 # MUST propagate. This except-Exception used to swallow it and
                 # report a failed section, so Stop would be silently downgraded
@@ -560,7 +657,19 @@ class StreamManager:
             for s in prior.get("sections", []):
                 scheduler.coverage.add(float(s["start"]), float(s["end"]))
         rec._scheduler = scheduler
-        scheduler.run()
+        try:
+            scheduler.run()
+        finally:
+            # Drop any in-flight prefetch before returning. A running analysis
+            # cannot be interrupted (it is a torch forward), so this waits for
+            # it rather than leaving a thread on the GPU after the stream is
+            # gone — which would meet the next job holding the accelerator.
+            pipeline.close()
+            # The only place the prefetch telemetry reaches production logs.
+            # `prefetch_discarded` climbing on a stream means every section is
+            # paying a wasted analysis (a resumed stream used to, see
+            # `_take_analysis`).
+            log.info("stream %s section pipeline: %s", ck, pipeline.stats)
 
         if scheduler.coverage.is_complete(rec.duration):
             cache_mod.finalize_stream(self._cache_root, ck)
@@ -575,6 +684,7 @@ class StreamManager:
             timing=self._section_timing(rec, result),
         )
         rec.sections_done += 1
+        rec.dubbed_s += max(0.0, float(result.end) - float(result.start))
 
     def _section_timing(self, rec: StreamRecord,
                         result: SectionResult) -> dict[str, Any] | None:

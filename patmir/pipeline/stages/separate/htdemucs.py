@@ -40,7 +40,7 @@ class HTDemucs:
     id = "htdemucs"
 
     def __init__(self, model_name: str = "htdemucs_ft", device: str = "auto",
-                 vocals_only: bool = False) -> None:
+                 vocals_only: bool = False, shifts: int = 0) -> None:
         from demucs.pretrained import get_model  # lazy import (heavy)
 
         # Vocals-only mode: `model_name` is the bare signature of htdemucs_ft's
@@ -52,6 +52,27 @@ class HTDemucs:
         # model's own non-vocals stems are not trusted. Mirrors the MLX
         # candidate; ADR 2026-06-19-vocals-only-separation.
         self.vocals_only = vocals_only
+        # `shifts` is demucs' random-shift test-time augmentation, and 0 is
+        # deliberate — it is the whole reason this pipeline was reproducible
+        # from `separate` down. `apply_model` DEFAULTS TO shifts=1, and at
+        # `demucs/apply.py:245` it draws `random.randint(0, 0.5 * samplerate)`
+        # from the unseeded global `random`, shifts the mix by that offset,
+        # separates, and shifts back. With shifts=1 the loop runs once and
+        # divides by 1 — so there is **no averaging**: it is one prediction at
+        # an arbitrary offset, which buys nothing and costs `max_shift` of
+        # extra padded audio through the model.
+        #
+        # Measured consequence of the default: ten runs of one file at one
+        # config produced eight distinct `vocals.wav` files, and every stage
+        # below inherited it — VAD intervals, diarization turns (91-117),
+        # which window became each speaker's reference clip (so a character's
+        # cloned voice changed run to run), emotion labels, and therefore the
+        # translator's prompt. Quality issue #28.
+        #
+        # Averaging needs shifts >= 2, which is a quality/throughput trade
+        # nobody has measured here; if it is ever wanted, seed `random` at the
+        # same time or the reproducibility comes straight back.
+        self.shifts = int(shifts)
         self.device = _resolve_device(device)
         self.model_name = model_name
         self.model = get_model(model_name)
@@ -73,15 +94,16 @@ class HTDemucs:
         # we don't need any resampling step in the Python path.
         full_audio = ctx.job_dir / "full_audio.wav"
         if not full_audio.exists():
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", str(source_video),
-                "-vn",
-                "-ac", str(self.channels),
-                "-ar", str(self.sample_rate),
-                "-c:a", "pcm_s16le",
-                str(full_audio),
-            ], check=True, capture_output=True)
+            with ctx.probe.section("extract_s"):
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-i", str(source_video),
+                    "-vn",
+                    "-ac", str(self.channels),
+                    "-ar", str(self.sample_rate),
+                    "-c:a", "pcm_s16le",
+                    str(full_audio),
+                ], check=True, capture_output=True)
         ctx.progress("separate", 0.05, "extracted full-quality audio")
 
         # soundfile returns (samples, channels); demucs wants (batch, channels, samples).
@@ -92,12 +114,13 @@ class HTDemucs:
         wav = wav.unsqueeze(0).to(self.device)
         ctx.progress("separate", 0.10, f"running demucs ({self.model_name}) on {self.device}")
 
-        with torch.no_grad():
+        with torch.no_grad(), ctx.probe.section("model_s"):
             sources = apply_model(
                 self.model,
                 wav,
                 device=self.device,
                 split=True,
+                shifts=self.shifts,
                 progress=False,
             )
         # sources shape: (batch=1, n_sources, channels, samples).
@@ -148,12 +171,15 @@ class HTDemucs:
         vad_intervals: list[tuple[float, float]] | None = None
         if vocals is not None:
             ctx.progress("separate", 0.9, "running Silero VAD on vocals")
-            speech_path, non_speech_path, vad_intervals = _split_vocals_with_vad(
-                vocals_path=vocals_path,
-                accompaniment_shape=accompaniment.shape,
-                sample_rate=self.sample_rate,
-                job_dir=ctx.job_dir,
-            )
+            with ctx.probe.section("vad_s"):
+                speech_path, non_speech_path, vad_intervals = _split_vocals_with_vad(
+                    vocals_path=vocals_path,
+                    accompaniment_shape=accompaniment.shape,
+                    sample_rate=self.sample_rate,
+                    job_dir=ctx.job_dir,
+                    probe=ctx.probe,
+                )
+            ctx.probe.bump("n_vad_intervals", len(vad_intervals or []))
 
         meta = {
             "accompaniment": str(accomp_path),
@@ -165,6 +191,7 @@ class HTDemucs:
             "channels": self.channels,
             "model": self.model_name,
             "vocals_only": self.vocals_only,
+            "shifts": self.shifts,
             "device": self.device,
         }
         (ctx.job_dir / "separated.meta.json").write_text(json.dumps(meta, indent=2))
@@ -186,6 +213,7 @@ def _split_vocals_with_vad(
     accompaniment_shape: tuple[int, int],
     sample_rate: int,
     job_dir: Path,
+    probe: Any = None,
 ) -> tuple[Path, Path, list[tuple[float, float]]]:
     """Run Silero VAD on `vocals_path` and write speech-only / non-speech-only stems.
 
@@ -203,7 +231,13 @@ def _split_vocals_with_vad(
     import torch  # type: ignore[import-not-found]
     from silero_vad import get_speech_timestamps, load_silero_vad
 
-    model = load_silero_vad(onnx=False)
+    from patmir.pipeline.probe import Probe
+    probe = probe if probe is not None else Probe()
+
+    # Loaded per call and never cached: it is not part of `stage_cache`, so a
+    # warm run still pays this. Measured separately for exactly that reason.
+    with probe.section("vad_load_s"):
+        model = load_silero_vad(onnx=False)
 
     # 1) Load the vocals at the original SR via soundfile (no torchaudio).
     vocals_np, sr = sf.read(str(vocals_path), dtype="float32", always_2d=True)
@@ -225,16 +259,17 @@ def _split_vocals_with_vad(
     # vocal stem retains some background energy and Silero misses most
     # utterances at 0.3. 0.2 is the floor below which background music
     # starts firing as speech.
-    intervals = get_speech_timestamps(
-        wav16,
-        model,
-        sampling_rate=16000,
-        return_seconds=True,
-        threshold=0.2,
-        min_speech_duration_ms=100,
-        min_silence_duration_ms=200,
-        speech_pad_ms=500,
-    )
+    with probe.section("vad_infer_s"):
+        intervals = get_speech_timestamps(
+            wav16,
+            model,
+            sampling_rate=16000,
+            return_seconds=True,
+            threshold=0.2,
+            min_speech_duration_ms=100,
+            min_silence_duration_ms=200,
+            speech_pad_ms=500,
+        )
 
     # 3) Build a per-sample float32 speech mask at the original (Demucs) sample rate.
     vocals = vocals_np
@@ -259,8 +294,9 @@ def _split_vocals_with_vad(
 
     speech_path = job_dir / "speech_vocals.wav"
     non_speech_path = job_dir / "non_speech_vocals.wav"
-    sf.write(str(speech_path), speech, sr, subtype="PCM_16")
-    sf.write(str(non_speech_path), non_speech, sr, subtype="PCM_16")
+    with probe.section("stem_write_s"):
+        sf.write(str(speech_path), speech, sr, subtype="PCM_16")
+        sf.write(str(non_speech_path), non_speech, sr, subtype="PCM_16")
     interval_list = [(float(iv["start"]), float(iv["end"])) for iv in intervals]
     return speech_path, non_speech_path, interval_list
 
@@ -270,4 +306,5 @@ def build(config: dict[str, Any]) -> HTDemucs:
         model_name=config.get("model", "htdemucs_ft"),
         device=config.get("device", "auto"),
         vocals_only=bool(config.get("vocals_only", False)),
+        shifts=int(config.get("shifts", 0)),
     )

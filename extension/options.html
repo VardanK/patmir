@@ -13,31 +13,32 @@
     .hint { color: #666; font-size: 12px; margin-top: 6px; }
     .ok { color: #1e8e3e; }
     .err { color: #c5221f; }
+    .warn { color: #b06000; }
   </style>
 </head>
 <body>
-  <h1>Patmir extension — options</h1>
+  <h1>Patmir — կարգավորումներ</h1>
   <p>Connect this extension to your local Patmir server. The token is auto-generated the first time you run <code>patmir ui</code> and printed on stderr.</p>
 
-  <label for="server">Server URL</label>
+  <label for="server">Սերվերի հասցե</label>
   <input id="server" type="text" placeholder="http://127.0.0.1:8765" />
   <div class="hint">Loopback only. Defaults to <code>http://127.0.0.1:8765</code>.</div>
 
-  <label for="token">Bearer token</label>
+  <label for="token">Token</label>
   <input id="token" type="text" placeholder="paste the hex token printed by `patmir ui`" />
   <div class="hint">Stored locally in <code>chrome.storage.local</code>. Never sent to anywhere but your local server.</div>
 
   <label style="display:flex;align-items:center;gap:8px;margin-top:18px;font-weight:normal;">
     <input id="autoplay" type="checkbox" />
-    <span>Auto-play cached dubs</span>
+    <span>Թարգմանել բոլոր վիդեոները</span>
   </label>
-  <div class="hint">When a YouTube video has already been translated, play the dub automatically. You can still stop it from the popup; the choice is remembered per video.</div>
+  <div class="hint">One remembered choice for every video: when on, opening a YouTube video starts the Armenian dub, submitting a job if that video has not been dubbed yet. The in-page button sets this too — pressing it to start turns this on, pressing it to stop turns it off. Off by default, because on means every video you open puts work on the GPU.</div>
 
-  <label for="audience">Audience</label>
+  <label for="audience">Լսարան</label>
   <select id="audience">
-    <option value="child">Child (about 5-10)</option>
-    <option value="teenager">Teenager (about 11-15)</option>
-    <option value="adult">Adult — no softening</option>
+    <option value="child">Երեխա (մոտ 5-10 տ.)</option>
+    <option value="teenager">Դեռահաս (մոտ 11-15 տ.)</option>
+    <option value="adult">Չափահաս — առանց մեղմացման</option>
   </select>
   <div class="hint">
     Steers the Armenian toward age-appropriate wording. <strong>Nothing is ever cut,
@@ -47,7 +48,7 @@
 
   <label style="display:flex;align-items:center;gap:8px;margin-top:18px;font-weight:normal;">
     <input id="skipads" type="checkbox" />
-    <span>Auto-skip YouTube ads</span>
+    <span>Ավտոմատ բաց թողնել գովազդը</span>
   </label>
   <div class="hint">
     Presses <em>Skip Ad</em> as soon as it appears. The dub pauses for an ad and
@@ -57,7 +58,7 @@
 
   <label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-weight:normal;">
     <input id="skipadseek" type="checkbox" />
-    <span>Also jump to the end of unskippable ads</span>
+    <span>Նաև անցնել չբացթողնվող գովազդի վերջը</span>
   </label>
   <div class="hint">
     <strong>Off by default, and the only setting here that can affect playback.</strong>
@@ -68,9 +69,11 @@
     checkbox above, and this is the half that isn't.
   </div>
 
-  <button id="save">Save</button>
+  <button id="save">Պահպանել</button>
   <span id="status" style="margin-left:10px;"></span>
 
+  <!-- lib/server.js FIRST: options.js calls PatmirServer at save time. -->
+  <script src="lib/server.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

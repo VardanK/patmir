@@ -17,7 +17,7 @@ The runs root defaults to `runs/` next to `patmir.toml` and is set by `[storage]
 | `accompaniment.wav`   | separate | Music + sound-effects bed (drums + bass + other stems summed). What mux mixes under the AR voice. |
 | `speech_vocals.wav`   | separate | VAD-masked vocals with 20 ms cosine fades. What `ref_picker` slices ref clips from. Cleaner than `vocals.wav`. |
 | `non_speech_vocals.wav` | separate | Inverse VAD mask — atmospheric vocals only. Mixed back into the bed at mux time so cartoon screams/laughs survive. |
-| `separated.meta.json` | separate | Sample rate, channels, VAD intervals list, paths.                                        |
+| `separated.meta.json` | separate | Sample rate, channels, VAD intervals list, paths, and `shifts` (0 — demucs' random-shift augmentation, off for reproducibility; issue #28). |
 | `transcript.json`     | asr      | Word-level ASR output: `language`, full `words` list (each with `start`/`end`/`text`), and grouped `sentences` (each with `speaker_id` + Phase-2.x `emotion`). |
 | `sentences.json`      | asr      | Same sentences as in `transcript.json` but flat (legacy convenience).                    |
 | `translated.json`     | translate | `TranslatedTranscript` — source + target text per sentence + timing + speaker_id (+ emotion). |
@@ -28,6 +28,8 @@ The runs root defaults to `runs/` next to `patmir.toml` and is set by `[storage]
 | `mux_placements.json` | mux      | Where each synthesized line was actually placed — the record to read when a line sounds early, late, rippled by `voice_no_overlap`, or compressed by `voice_max_compress`. |
 | `out.mkv`             | output   | Final MKV — Armenian default audio, original retained as secondary, Armenian SRT as default subtitle track. |
 | `out.hy.srt`          | output   | Standalone subtitle file (also muxed into `out.mkv`).                                    |
+| `<stage>/bench_probe.json` | any | **Benchmark only** (2026-09-02). Intra-stage timing: where a stage's own wall went, which the manifest cannot say. Written by any stage with spans, plus the runner's own post-stage work (`pick_refs_s` under emotion, `tag_s` under asr). Spans and counters sit at the top level and ADD across a stream's sections; non-additive identities and derived ratios live under `values` — summing those is what once reported a `max_batch` of 88. Absent unless the job ran under `patmir bench`, where the probe syncs the device on each span edge; disabled it is a no-op. See `patmir/pipeline/probe.py`. |
+| `tts/trace_tts.json`  | tts      | **Benchmark only, opt-in** (`patmir bench --tts-trace`). A `torch.profiler` chrome trace of the FIRST decode chunk. One chunk only: a whole-job trace runs to hundreds of MB and every chunk runs the same loop. |
 
 ## Published deliverables (`[storage].library_root`)
 

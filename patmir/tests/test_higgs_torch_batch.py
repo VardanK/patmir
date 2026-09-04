@@ -29,6 +29,7 @@ import os
 import unittest
 import wave
 from pathlib import Path
+from unittest import mock
 
 from patmir.eval.candidates.tts import higgs_v3_torch
 from patmir.eval.candidates.tts.higgs_v3_torch import (
@@ -73,6 +74,28 @@ def _snapshot() -> Path | None:
         if (child / "config.json").exists() and (child / "tokenizer.json").exists():
             return child
     return None
+
+
+def _upstream_module():
+    """The checkpoint's own `modeling_higgs_multimodal_qwen3` module.
+
+    Resolved through transformers' dynamic-module machinery — the same path the
+    candidate takes (`sys.modules[type(self.model).__module__]`) — so the state
+    machine used below as an oracle is the one the model would actually run,
+    not a second transcription of it.
+    """
+    import sys
+
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    snap = _snapshot()
+    if snap is None:
+        raise RuntimeError("Higgs checkpoint snapshot not in the HF cache")
+    cls = get_class_from_dynamic_module(
+        "modeling_higgs_multimodal_qwen3.HiggsMultimodalQwen3ForConditionalGeneration",
+        str(snap),
+    )
+    return sys.modules[cls.__module__]
 
 
 def _tiny_model(snapshot: str):
@@ -842,8 +865,6 @@ class AdapterBatchDispatchTest(unittest.TestCase):
         self.assertEqual(seen[-1], 1.0)
 
 
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
 
 
 class RequestSeedTest(unittest.TestCase):
@@ -1010,3 +1031,739 @@ class ChunkLoopCancellationTest(unittest.TestCase):
                                     on_chunk=lambda idx, w: None)
         self.assertEqual(len(out), 8)
         self.assertEqual(len(calls), 4)
+
+
+class BatchedFilterEquivalenceTest(unittest.TestCase):
+    """`_filter_probs` over a chunk must equal it applied to each row alone.
+
+    This is the load-bearing claim behind vectorizing the sampler. The DRAW
+    stays per row from that row's own generator, so if the filtering is
+    identical then the whole sampling path is, and no line's audio can move.
+    Every operation involved is independent along the last dim; these tests pin
+    that it stays true, including on the tie-heavy logits a bf16 audio head
+    actually produces, where a sort's tie-break order is the thing that could
+    in principle depend on batch shape.
+    """
+
+    def _check(self, logits, *, temperature, top_p, top_k):
+        import torch
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import _filter_probs
+        batched = _filter_probs(logits, temperature=temperature, top_p=top_p,
+                                top_k=top_k)
+        for b in range(logits.shape[0]):
+            alone = _filter_probs(logits[b], temperature=temperature,
+                                  top_p=top_p, top_k=top_k)
+            self.assertTrue(torch.equal(batched[b], alone),
+                            f"row {b} diverged batched vs alone")
+
+    def test_top_p_only_matches_per_row(self):
+        import torch
+        for seed in range(20):
+            torch.manual_seed(seed)
+            self._check(torch.randn(8, 8, 1026), temperature=0.8, top_p=0.95,
+                        top_k=None)
+
+    def test_top_k_and_top_p_match_per_row(self):
+        import torch
+        for seed in range(10):
+            torch.manual_seed(100 + seed)
+            self._check(torch.randn(8, 8, 1026), temperature=0.8, top_p=0.95,
+                        top_k=50)
+
+    def test_bf16_valued_logits_with_many_ties_match(self):
+        import torch
+        for seed in range(10):
+            torch.manual_seed(200 + seed)
+            logits = torch.randn(8, 8, 1026).to(torch.bfloat16).to(torch.float32)
+            self._check(logits, temperature=0.8, top_p=0.95, top_k=None)
+
+    def test_single_row_batch_matches_unbatched(self):
+        import torch
+        torch.manual_seed(7)
+        self._check(torch.randn(1, 8, 1026), temperature=0.8, top_p=0.95,
+                    top_k=None)
+
+    def test_sample_codes_delegates_to_the_same_filter(self):
+        import torch
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import (
+            _filter_probs,
+            _sample_codes,
+        )
+        torch.manual_seed(0)
+        logits = torch.randn(8, 1026)
+        probs = _filter_probs(logits, temperature=0.8, top_p=0.95, top_k=None)
+        g1 = torch.Generator().manual_seed(11)
+        g2 = torch.Generator().manual_seed(11)
+        via_helper = _sample_codes(logits, temperature=0.8, top_p=0.95,
+                                   top_k=None, generator=g1)
+        direct = probs.multinomial(num_samples=1, generator=g2).squeeze(-1)
+        self.assertTrue(torch.equal(via_helper, direct))
+
+    def test_zero_temperature_is_argmax_and_consumes_no_randomness(self):
+        # The equivalence test compares batched against standalone rows at
+        # temperature 0, which only works if the argmax path leaves the
+        # generator untouched — as upstream's does.
+        import torch
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import _sample_codes
+        torch.manual_seed(0)
+        logits = torch.randn(8, 1026)
+        g = torch.Generator().manual_seed(5)
+        before = g.get_state()
+        out = _sample_codes(logits, temperature=0.0, top_p=0.95, top_k=None,
+                            generator=g)
+        self.assertTrue(torch.equal(out, logits.argmax(dim=-1)))
+        self.assertTrue(torch.equal(g.get_state(), before))
+
+
+class SamplerStateVectorizationTest(unittest.TestCase):
+    """`_DelayState` must match the checkpoint's `_sampler_step`, exactly.
+
+    The decode loop used to call upstream's function once per row per step. It
+    mutates a `_SamplerState` and reads `codes_N[0].item()` — a device->host
+    sync per row per step, ~8 on each of ~1300 steps.
+
+    Forking a state machine costs more than copying a sampler, which is why the
+    module docstring used to say the machine stays upstream's. So `_DelayState`
+    is the ONE implementation the decode loop runs, and it is driven here
+    against upstream's own function as an oracle: random code streams, EOC
+    injected at random steps INCLUDING inside the delay ramp where upstream
+    ignores it, and random caps. A checkpoint that changes the machine fails
+    this test rather than silently changing every dub.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.up = _upstream_module()
+        except Exception as exc:  # noqa: BLE001
+            raise unittest.SkipTest(f"checkpoint snapshot unavailable: {exc}")
+
+    def _oracle(self, streams, caps, N):
+        """Upstream's machine, driven row by row exactly as the old loop did."""
+        import torch
+
+        rows, overflow = [], []
+        for stream, cap in zip(streams, caps):
+            state = self.up._SamplerState(num_codebooks=N)
+            emitted, over = [], False
+            for step in range(len(stream)):
+                # A one-hot at temperature 0 sends `_sampler_step` down its
+                # argmax path, so it returns exactly these codes and then runs
+                # its own bookkeeping — which is how the old loop drove it.
+                onehot = torch.zeros(N, 1026)
+                onehot.scatter_(-1, stream[step].unsqueeze(-1).long(), 1.0)
+                out = self.up._sampler_step(onehot, state, temperature=0.0,
+                                            top_p=None, top_k=None)
+                if state.generation_done:
+                    break
+                emitted.append(out.clone())
+                if len(emitted) >= cap:
+                    over = True
+                    break
+            rows.append(emitted)
+            overflow.append(over)
+        return rows, overflow
+
+    def _vectorized(self, streams, caps, N):
+        """`_DelayState` as `_decode_chunk` drives it."""
+        import torch
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import _DelayState
+        B = len(streams)
+        max_cap = max(caps)
+        state = _DelayState(
+            batch=B, num_codebooks=N,
+            caps=torch.tensor(caps, dtype=torch.long),
+            boc_id=self.up.BOC_ID, eoc_id=self.up.EOC_ID, device=None)
+        emitted = torch.zeros(B, max_cap, N, dtype=torch.long)
+        for step in range(max_cap):
+            codes = torch.stack([s[step].long() for s in streams])
+            state.step(codes, step)
+            emitted[:, step] = codes
+            if state.all_done():
+                break
+        return emitted, state.length.tolist(), state.overflowed.tolist()
+
+    def _compare(self, streams, caps, N):
+        import torch
+        ref_rows, ref_over = self._oracle(streams, caps, N)
+        emitted, lengths, over = self._vectorized(streams, caps, N)
+        for b, ref in enumerate(ref_rows):
+            self.assertEqual(lengths[b], len(ref),
+                             f"row {b}: emitted {lengths[b]}, upstream {len(ref)}")
+            for s, frame in enumerate(ref):
+                self.assertTrue(torch.equal(emitted[b, s], frame),
+                                f"row {b} frame {s} differs from upstream")
+        self.assertEqual(over, ref_over)
+
+    def test_random_streams_with_eoc_anywhere(self):
+        import torch
+        N = 8
+        for seed in range(60):
+            torch.manual_seed(seed)
+            B = int(torch.randint(1, 5, (1,)).item())
+            caps = [int(torch.randint(N + 2, 40, (1,)).item()) for _ in range(B)]
+            width = max(caps) + 2
+            streams = []
+            for cap in caps:
+                st = torch.randint(0, 1000, (width, N))
+                if bool(torch.rand(1) < 0.8):
+                    at = int(torch.randint(0, cap, (1,)).item())
+                    st[at, 0] = self.up.EOC_ID
+                streams.append(st)
+            self._compare(streams, caps, N)
+
+    def test_eoc_during_the_delay_ramp_is_ignored(self):
+        import torch
+        N = 8
+        st = torch.randint(0, 1000, (32, N))
+        st[2, 0] = self.up.EOC_ID          # inside the ramp
+        self._compare([st], [30], N)
+        _e, lengths, over = self._vectorized([st], [30], N)
+        self.assertEqual(lengths[0], 30)   # ran to its cap, did not stop at 8
+        self.assertTrue(over[0])
+
+    def test_eoc_after_the_ramp_retires_the_row_six_steps_later(self):
+        import torch
+        N = 8
+        st = torch.randint(0, 1000, (40, N))
+        st[10, 0] = self.up.EOC_ID
+        self._compare([st], [35], N)
+        _e, lengths, over = self._vectorized([st], [35], N)
+        # Detected at step 10 and still emitted, then five more, retiring at 16.
+        self.assertEqual(lengths[0], 16)
+        self.assertFalse(over[0])
+
+    def test_boc_masking_matches_the_ramp_position(self):
+        import torch
+        N = 8
+        st = torch.randint(0, 1000, (12, N))
+        emitted, lengths, _ = self._vectorized([st], [12], N)
+        for step in range(N - 1):
+            self.assertTrue(
+                bool((emitted[0, step, step + 1:] == self.up.BOC_ID).all()),
+                f"step {step} did not mask codebooks past the ramp position")
+        self.assertEqual(lengths[0], 12)
+
+    def test_rows_retire_independently(self):
+        import torch
+        N = 8
+        a = torch.randint(0, 1000, (40, N))
+        b = torch.randint(0, 1000, (40, N))
+        a[9, 0] = self.up.EOC_ID
+        self._compare([a, b], [35, 35], N)
+
+    def test_cap_is_exact_not_inferred_from_length(self):
+        import torch
+        N = 8
+        st = torch.randint(0, 1000, (40, N))   # no EOC at all
+        self._compare([st], [N + 3], N)
+        _e, lengths, over = self._vectorized([st], [N + 3], N)
+        self.assertEqual(lengths[0], N + 3)
+        self.assertTrue(over[0])
+
+
+def _cuda_or_skip():
+    try:
+        import torch
+    except ImportError:  # pragma: no cover
+        raise unittest.SkipTest("torch unavailable")
+    if not torch.cuda.is_available():
+        raise unittest.SkipTest("no CUDA device")
+    return torch
+
+
+class GqaDecodeAttentionTest(unittest.TestCase):
+    """The grouped-query decode kernel: right answer, right scope.
+
+    transformers sets `use_gqa_in_sdpa` False whenever a mask is present, so
+    `repeat_kv` expands 8 KV heads to 32 on every layer of every decode step.
+    This kernel keeps them grouped. It is NOT bitwise against sdpa — the
+    reduction order differs — so what is pinned here is that it computes
+    attention correctly, and that it only ever touches the single-token case.
+    """
+
+    def _register(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import (
+            _GQA_ATTN,
+            _register_gqa_attention,
+        )
+        if not _register_gqa_attention():
+            self.skipTest("transformers AttentionInterface unavailable")
+        from transformers import AttentionInterface
+        return AttentionInterface._global_mapping[_GQA_ATTN]
+
+    class _Mod:
+        num_key_value_groups = 4
+
+    def test_matches_a_reference_attention_for_one_token(self):
+        import torch
+        fn = self._register()
+        torch.manual_seed(0)
+        B, KVH, G, D, L = 2, 8, 4, 128, 40
+        H = KVH * G
+        q = torch.randn(B, H, 1, D)
+        k = torch.randn(B, KVH, L, D)
+        v = torch.randn(B, KVH, L, D)
+        mask = torch.ones(B, 1, 1, L, dtype=torch.bool)
+        mask[:, :, :, L // 2:] = False          # half the keys masked out
+
+        out, _ = fn(self._Mod(), q, k, v, mask, scaling=D ** -0.5)
+
+        # Reference: expand the KV heads the way transformers' repeat_kv does.
+        kx = k.repeat_interleave(G, dim=1)
+        vx = v.repeat_interleave(G, dim=1)
+        scores = (q @ kx.transpose(-1, -2)).float() * D ** -0.5
+        scores = scores.masked_fill(~mask, float("-inf"))
+        ref = (scores.softmax(-1).to(v.dtype) @ vx).transpose(1, 2)
+        self.assertEqual(out.shape, ref.shape)
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+    def test_ragged_per_row_masks_at_batch_12(self):
+        """Each row masks a different prefix, which is what left-padding is.
+
+        The uniform-mask test above cannot see a bug that mixes rows: with one
+        shared mask, borrowing another row's keys is indistinguishable from
+        using your own. `max_batch = 12` widens the length spread inside a
+        chunk, so the padding is both larger and more ragged than at 8 — if
+        this kernel indexed the mask wrongly, wider batches would degrade and
+        narrow ones would not, which is exactly the shape of a report that
+        batch 12 sounds worse than batch 8.
+        """
+        import torch
+        fn = self._register()
+        torch.manual_seed(3)
+        B, KVH, G, D, L = 12, 8, 4, 128, 96
+        H = KVH * G
+        q = torch.randn(B, H, 1, D)
+        k = torch.randn(B, KVH, L, D)
+        v = torch.randn(B, KVH, L, D)
+        mask = torch.ones(B, 1, 1, L, dtype=torch.bool)
+        for b in range(B):
+            mask[b, :, :, : b * 7] = False     # a different left pad per row
+        mask[:, :, :, L - 1] = True            # the current token, always live
+
+        out, _ = fn(self._Mod(), q, k, v, mask, scaling=D ** -0.5)
+
+        kx = k.repeat_interleave(G, dim=1)
+        vx = v.repeat_interleave(G, dim=1)
+        scores = (q @ kx.transpose(-1, -2)).float() * D ** -0.5
+        ref = (scores.masked_fill(~mask, float("-inf")).softmax(-1).to(v.dtype)
+               @ vx).transpose(1, 2)
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+        # And a row must not be reachable from another row's keys: zeroing
+        # row 0's values may not move row 11's output.
+        v2 = v.clone()
+        v2[0] = 0.0
+        out2, _ = fn(self._Mod(), q, k, v2, mask, scaling=D ** -0.5)
+        torch.testing.assert_close(out2[1:], out[1:], rtol=0, atol=0)
+
+    def test_group_axis_is_not_transposed(self):
+        # A wrong view() here silently permutes heads: attention still runs,
+        # audio still comes out, and it is noise. So check a head-asymmetric
+        # case rather than trusting the shape.
+        import torch
+        fn = self._register()
+        B, KVH, G, D, L = 1, 2, 3, 4, 5
+        H = KVH * G
+        q = torch.zeros(B, H, 1, D)
+        for h in range(H):
+            q[0, h, 0, h % D] = 1.0
+        k = torch.randn(B, KVH, L, D)
+        v = torch.randn(B, KVH, L, D)
+        mask = torch.ones(B, 1, 1, L, dtype=torch.bool)
+        out, _ = fn(self._Mod(), q, k, v, mask, scaling=1.0)
+        kx = k.repeat_interleave(G, dim=1)
+        vx = v.repeat_interleave(G, dim=1)
+        ref = ((q @ kx.transpose(-1, -2)).float().softmax(-1).to(v.dtype) @ vx
+               ).transpose(1, 2)
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+    def test_prefill_is_delegated_untouched(self):
+        # q_len > 1 must go to transformers' own forward: the long path is
+        # where the numerics matter and it is not ours to reimplement.
+        import torch
+        fn = self._register()
+        called = {"n": 0}
+        import transformers.integrations.sdpa_attention as sdpa_mod
+        real = sdpa_mod.sdpa_attention_forward
+
+        def _spy(*a, **kw):
+            called["n"] += 1
+            return real(*a, **kw)
+
+        import patmir.eval.candidates.tts.higgs_v3_torch as cand
+        with mock.patch.object(sdpa_mod, "sdpa_attention_forward", _spy):
+            # Re-register so the closure picks up the patched symbol.
+            cand._gqa_registered = False
+            fn2 = self._register()
+            q = torch.randn(1, 8, 6, 16)       # q_len 6 -> prefill
+            k = torch.randn(1, 2, 6, 16)
+            v = torch.randn(1, 2, 6, 16)
+            fn2(self._Mod(), q, k, v, torch.ones(1, 1, 6, 6, dtype=torch.bool),
+                scaling=0.25)
+        self.assertEqual(called["n"], 1)
+        cand._gqa_registered = False
+
+    def test_no_mask_is_delegated(self):
+        import torch
+        fn = self._register()
+        q = torch.randn(1, 8, 1, 16)
+        k = torch.randn(1, 2, 4, 16)
+        v = torch.randn(1, 2, 4, 16)
+        out, _ = fn(self._Mod(), q, k, v, None, scaling=0.25)
+        self.assertEqual(out.shape, (1, 1, 8, 16))
+
+
+class GraphedDecodeEquivalenceTest(unittest.TestCase):
+    """A captured decode step must equal an eager one, bitwise.
+
+    This is what let the graph ship as a byte-identical change rather than one
+    needing an ear-test, and it was measured rather than assumed: both the
+    `StaticCache` swap and the graph replay came out bitwise equal to the
+    `DynamicCache` eager path over ragged left-padded prompts. If a future
+    torch or transformers breaks that, this fails instead of quietly re-rolling
+    every line in the dub.
+    """
+
+    def test_static_cache_matches_dynamic_cache(self):
+        torch = _cuda_or_skip()
+        from transformers import AutoConfig, DynamicCache, StaticCache
+        from transformers.models.qwen3 import Qwen3Model
+
+        cfg = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B")
+        cfg.num_hidden_layers = 2
+        cfg.hidden_size = 256; cfg.num_attention_heads = 8
+        cfg.num_key_value_heads = 2; cfg.head_dim = 32
+        cfg.intermediate_size = 512
+        cfg._attn_implementation = "sdpa"
+        torch.manual_seed(0)
+        m = Qwen3Model(cfg).to("cuda", torch.bfloat16).eval()
+
+        B, seq, L, steps = 4, 24, 40, 6
+        torch.manual_seed(1)
+        emb = torch.randn(B, seq, 256, device="cuda", dtype=torch.bfloat16)
+        toks = torch.randn(steps, B, 1, 256, device="cuda", dtype=torch.bfloat16)
+        pad = torch.zeros(B, seq, dtype=torch.long, device="cuda")
+        for b in range(B):
+            pad[b, b * 2:] = 1                 # ragged left padding
+
+        def run(static):
+            cache = (StaticCache(config=cfg, max_cache_len=L) if static
+                     else DynamicCache())
+            with torch.no_grad():
+                pos = (pad.cumsum(-1) - 1).clamp(min=0)
+                m(inputs_embeds=emb, attention_mask=pad, position_ids=pos,
+                  use_cache=True, past_key_values=cache)
+                pb = (pos[:, -1] + 1).unsqueeze(1).clone()
+                mask = (torch.zeros(B, L, dtype=torch.long, device="cuda")
+                        if static else pad.clone())
+                if static:
+                    mask[:, :seq] = pad
+                hs = []
+                for i in range(steps):
+                    if static:
+                        mask[:, seq + i] = 1
+                        mk = mask
+                    else:
+                        mask = torch.cat(
+                            [mask, torch.ones(B, 1, dtype=torch.long, device="cuda")], 1)
+                        mk = mask
+                    o = m(inputs_embeds=toks[i], attention_mask=mk,
+                          position_ids=pb, use_cache=True, past_key_values=cache)
+                    hs.append(o.last_hidden_state[:, -1, :].clone())
+                    pb = pb + 1
+            return torch.stack(hs)
+
+        self.assertTrue(torch.equal(run(False), run(True)),
+                        "StaticCache diverged from DynamicCache")
+
+    def test_graph_replay_matches_eager_stepping(self):
+        torch = _cuda_or_skip()
+        from transformers import AutoConfig, StaticCache
+        from transformers.models.qwen3 import Qwen3Model
+
+        cfg = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B")
+        cfg.num_hidden_layers = 2
+        cfg.hidden_size = 256; cfg.num_attention_heads = 8
+        cfg.num_key_value_heads = 2; cfg.head_dim = 32
+        cfg.intermediate_size = 512
+        cfg._attn_implementation = "sdpa"
+        torch.manual_seed(0)
+        m = Qwen3Model(cfg).to("cuda", torch.bfloat16).eval()
+
+        B, seq, L, steps = 4, 24, 40, 6
+        torch.manual_seed(1)
+        emb = torch.randn(B, seq, 256, device="cuda", dtype=torch.bfloat16)
+        toks = torch.randn(steps, B, 1, 256, device="cuda", dtype=torch.bfloat16)
+
+        def run(graphed):
+            cache = StaticCache(config=cfg, max_cache_len=L)
+            mask = torch.zeros(B, L, dtype=torch.long, device="cuda")
+            mask[:, :seq] = 1
+            with torch.no_grad():
+                pos = (mask[:, :seq].cumsum(-1) - 1).clamp(min=0)
+                m(inputs_embeds=emb, attention_mask=mask[:, :seq],
+                  position_ids=pos, use_cache=True, past_key_values=cache)
+                cb = torch.zeros(B, 1, 256, device="cuda", dtype=torch.bfloat16)
+                pb = (pos[:, -1] + 1).unsqueeze(1).clone()
+                cum0 = [l.cumulative_length.clone() for l in cache.layers]
+                pos0 = pb.clone()
+
+                def step():
+                    return m(inputs_embeds=cb, attention_mask=mask,
+                             position_ids=pb, use_cache=True,
+                             past_key_values=cache)
+
+                def rewind():
+                    for layer, saved in zip(cache.layers, cum0):
+                        layer.cumulative_length.copy_(saved)
+                    pb.copy_(pos0)
+                    mask[:, seq:] = 0
+
+                hs = []
+                if graphed:
+                    side = torch.cuda.Stream()
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        for _ in range(3):
+                            step()
+                    torch.cuda.current_stream().wait_stream(side)
+                    rewind()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
+                        out = step()
+                        h_static = out.last_hidden_state[:, -1, :]
+                        pb += 1
+                    rewind()
+                    for i in range(steps):
+                        cb.copy_(toks[i]); mask[:, seq + i] = 1
+                        g.replay()
+                        hs.append(h_static.clone())
+                else:
+                    for i in range(steps):
+                        cb.copy_(toks[i]); mask[:, seq + i] = 1
+                        o = step()
+                        hs.append(o.last_hidden_state[:, -1, :].clone())
+                        pb += 1
+            return torch.stack(hs)
+
+        self.assertTrue(torch.equal(run(False), run(True)),
+                        "graph replay diverged from eager stepping")
+
+
+class DecodeKnobsTest(unittest.TestCase):
+    def test_build_reads_both_knobs_and_only_the_non_output_env_override(self):
+        import os
+
+        from patmir.eval.candidates.tts import higgs_v3_torch as mod
+        seen = {}
+
+        class _Stub:
+            def __init__(self, **kw):
+                seen.update(kw)
+
+        with mock.patch.object(mod, "HiggsV3Torch", _Stub):
+            mod.build({"cuda_graphs": False, "decode_attention": "sdpa", "max_batch": 12})
+            self.assertFalse(seen["cuda_graphs"])
+            self.assertEqual(seen["decode_attention"], "sdpa")
+            self.assertEqual(seen["max_batch"], 12)
+
+            # `cuda_graphs` is in `_NON_OUTPUT_KEYS`, so an env override cannot
+            # desynchronize a dub from its cache key. `decode_attention` and
+            # `max_batch` DO change the audio, and `config_hash` reads only the
+            # TOML entry — so those two env overrides were writing differently
+            # rendered dubs under an unchanged key and are gone.
+            with mock.patch.dict(os.environ, {"PATMIR_TTS_CUDA_GRAPHS": "1",
+                                              "PATMIR_TTS_DECODE_ATTN": "gqa",
+                                              "PATMIR_TTS_MAX_BATCH": "16"}):
+                mod.build({"cuda_graphs": False, "decode_attention": "sdpa", "max_batch": 12})
+            self.assertTrue(seen["cuda_graphs"])
+            self.assertEqual(seen["decode_attention"], "sdpa")
+            self.assertEqual(seen["max_batch"], 12)
+
+    def test_env_flag_parsing(self):
+        import os
+
+        from patmir.eval.candidates.tts.higgs_v3_torch import _env_flag
+        self.assertTrue(_env_flag("NOPE_MISSING", True))
+        self.assertFalse(_env_flag("NOPE_MISSING", False))
+        for raw, want in (("0", False), ("false", False), ("no", False),
+                          ("off", False), ("1", True), ("true", True)):
+            with mock.patch.dict(os.environ, {"X_FLAG": raw}):
+                self.assertIs(_env_flag("X_FLAG", not want), want, raw)
+
+
+class OnsetBurstGuardTest(unittest.TestCase):
+    """A row whose onset is a pitch-free impulse is redrawn, not shipped.
+
+    Quality issue #30. Isolated by replaying one job's 77 requests through
+    `synthesize_batch`: with `ref_text` passed (what the adapter does) 2 of 77
+    lines opened with a loud pitch-free impulse including the first; with
+    `ref_text` empty and everything else identical, 0 of 77. So the trigger is
+    the reference transcript in the cloning prompt, and the response is to
+    redraw the row — `attempt + 1` reseeds its generator, exactly as the
+    non-termination guard already does — rather than to drop `ref_text`, which
+    is real cloning conditioning.
+    """
+
+    def _clip(self, sr=24000, burst=False):
+        import numpy as np
+        t = np.arange(int(0.4 * sr), dtype="float32") / sr
+        body = (0.5 * np.cos(2 * np.pi * 150.0 * t)).astype("float32")
+        if not burst:
+            return body
+        rng = np.random.default_rng(0)
+        n = int(0.03 * sr)
+        head = rng.standard_normal(n).astype("float32")
+        head = np.diff(np.concatenate([[0.0], head])).astype("float32")
+        head *= 0.9 / max(float(np.abs(head).max()), 1e-9)
+        return np.concatenate([head, body])
+
+    def test_a_pitch_free_impulse_is_detected(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        self.assertTrue(_has_onset_burst(self._clip(burst=True)))
+
+    def test_ordinary_speech_is_not(self):
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        self.assertFalse(_has_onset_burst(self._clip()))
+
+    def test_a_quiet_voiceless_onset_is_not(self):
+        # The safety case: /s/ is pitch-free but well below the vowel peak.
+        import numpy as np
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        head = self._clip(burst=True)[: int(0.03 * 24000)] * 0.05
+        clip = np.concatenate([head, self._clip()])
+        self.assertFalse(_has_onset_burst(clip))
+
+    def test_degenerate_inputs_are_safe(self):
+        import numpy as np
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        for a in (np.zeros(0, dtype="float32"),
+                  np.zeros(50, dtype="float32"),
+                  np.zeros(4000, dtype="float32")):
+            self.assertFalse(_has_onset_burst(a))
+
+    def test_the_real_reported_clip_is_detected(self):
+        import os
+        p = "runs/20260903-212753-sample_1/tts/0000.wav"
+        if not os.path.exists(p):
+            self.skipTest("reference run not on disk")
+        import soundfile as sf
+        from patmir.eval.candidates.tts.higgs_v3_torch import _has_onset_burst
+        x, sr = sf.read(p, dtype="float32")
+        if x.ndim > 1:
+            x = x.mean(1)
+        self.assertTrue(_has_onset_burst(x, sr))
+
+    def test_a_bursting_row_is_retried_and_its_audio_never_dropped(self):
+        """The retry-loop contract, without loading a 4B model.
+
+        Two things must hold together: a bursting row goes back for another
+        attempt, and it is never left as `None` — the silence that the
+        overflow path leaves would be worse than a redrawn-but-imperfect line,
+        and the mux trims the head anyway.
+        """
+        import numpy as np
+        from patmir.eval.candidates.tts.higgs_v3_torch import (
+            HiggsV3Torch, _has_onset_burst,
+        )
+
+        good = self._clip()
+        bad = self._clip(burst=True)
+        self.assertTrue(_has_onset_burst(bad))
+        self.assertFalse(_has_onset_burst(good))
+
+        cand = _bare_candidate()
+
+        calls = []
+
+        def fake_decode(reqs, attempt=0):
+            calls.append((len(reqs), attempt))
+            # First attempt bursts, the redraw is clean — the measured shape.
+            return [(bad if attempt == 0 else good, False) for _ in reqs]
+
+        cand._decode_chunk = fake_decode
+        prepared = [_FakeReq(cap=10) for _ in range(2)]
+        audio = _run_chunk_loop(cand, prepared)
+
+        self.assertEqual([c[1] for c in calls], [0, 1],
+                         "a bursting row must be redrawn with a fresh seed")
+        self.assertTrue(all(a is not None for a in audio))
+        self.assertEqual(cand._summary["onset_bursts"], 2)
+        self.assertEqual(cand._summary["onset_bursts_kept"], 0)
+
+    def test_bursts_are_counted_per_line_not_per_attempt(self):
+        # A row that bursts on attempt 0 AND attempt 1 before coming clean is
+        # ONE bursting line. The ADR quotes "2 of 77 lines"; counting attempts
+        # made the emitted number something else.
+        bad, good = self._clip(burst=True), self._clip()
+        cand = _bare_candidate(max_retries=3)
+        cand._decode_chunk = lambda reqs, attempt=0: [
+            (bad if attempt < 2 else good, False) for _ in reqs]
+        audio = _run_chunk_loop(cand, [_FakeReq(cap=10)])
+        self.assertTrue(all(a is not None for a in audio))
+        self.assertEqual(cand._summary["onset_bursts"], 1)
+        self.assertEqual(cand._summary["onset_bursts_kept"], 0)
+
+    def test_a_row_still_bursting_on_the_last_attempt_is_kept_and_counted_once(self):
+        bad = self._clip(burst=True)
+        cand = _bare_candidate(max_retries=1)
+        cand._decode_chunk = lambda reqs, attempt=0: [(bad, False) for _ in reqs]
+        audio = _run_chunk_loop(cand, [_FakeReq(cap=10)])
+        self.assertIsNotNone(audio[0])
+        self.assertEqual(cand._summary["onset_bursts"], 1)
+        self.assertEqual(cand._summary["onset_bursts_kept"], 1)
+
+    def test_reset_summary_zeroes_the_burst_counters_too(self):
+        # A warm watch-along instance runs `reset_summary` per section; the
+        # burst counters were not in the reset set, so section 5 reported the
+        # whole film's bursts against its own sentence count.
+        from patmir.eval.candidates.tts.higgs_v3_torch import HiggsV3Torch
+        cand = _bare_candidate()
+        cand._summary.update({"sentences": 12, "onset_bursts": 9,
+                              "onset_bursts_kept": 2, "graph_fallbacks": 1})
+        HiggsV3Torch.reset_summary(cand)
+        for key in ("sentences", "overflows", "batches", "onset_bursts",
+                    "onset_bursts_kept", "graph_fallbacks"):
+            self.assertEqual(cand._summary[key], 0, key)
+
+
+class _FakeReq:
+    def __init__(self, cap):
+        self.cap = cap
+
+
+def _run_chunk_loop(cand, prepared):
+    """Drive the production retry loop (`_synthesize_chunk`) over balanced
+    chunks, without `synthesize_batch`'s model-dependent prepare/encode.
+
+    This used to be a hand-copied replica of the loop, which meant the test
+    could not catch a bug in the real one — and the real one had two
+    (`reset_summary` skipping the burst counters; bursts counted per attempt).
+    """
+    from patmir.eval.candidates.tts.higgs_v3_torch import _balanced_chunks
+    audio = [None] * len(prepared)
+    order = sorted(range(len(prepared)), key=lambda i: prepared[i].cap)
+    for chunk_i, chunk in enumerate(_balanced_chunks(order, cand.tts_max_batch)):
+        cand._synthesize_chunk(chunk_i, list(chunk), prepared, audio)
+    return audio
+
+
+def _bare_candidate(max_retries=2, max_batch=4):
+    from patmir.eval.candidates.tts.higgs_v3_torch import HiggsV3Torch
+    cand = object.__new__(HiggsV3Torch)
+    cand.max_retries = max_retries
+    cand.tts_max_batch = max_batch
+    # `probe` is a lazily-created property (disabled, no trace) — leave it.
+    cand._summary = {"batches": 0, "overflows": 0, "sentences": 0,
+                     "onset_bursts": 0, "onset_bursts_kept": 0, "graph_fallbacks": 0}
+    return cand
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

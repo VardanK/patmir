@@ -206,7 +206,27 @@ def dub_prelude_window(
     )
 
 
-def process_section(
+@dataclass
+class AnalyzedSection:
+    """A section whose analysis is done and whose translation has not started.
+
+    The hand-off point of the pipelined driver (`streaming/pipeline.py`). It
+    exists because the three phases of a section want different resources:
+    analysis and TTS are GPU-bound, translate is a network round-trip with the
+    GPU completely idle — measured 44.2 s of a 153.9 s watch-along wall, with
+    individual calls between 1.75 s and 13.34 s.
+    """
+    index: int
+    start: float
+    end: float                   # global, VAD-snapped
+    end_rel: float               # slice-relative
+    job_dir: Path
+    local_to_global: dict[str, str]
+    new_speakers: list[str]
+    started_at: float            # perf_counter at analysis start, for wall_s
+
+
+def analyze_section(
     source: Path,
     cfg: PipelineConfig,
     registry: SpeakerRegistry,
@@ -221,7 +241,14 @@ def process_section(
     bench: bool = False,
     source_lang: str | None = None,
     max_end: float | None = None,
-) -> SectionResult:
+) -> AnalyzedSection:
+    """Phase 1: slice, analyze (ingest→asr), snap the end, resolve identities.
+
+    All GPU work, plus the ffmpeg slice and the ECAPA/age-gender profiling that
+    no stage owns. Mutates the shared `registry` (resolve-or-register), so
+    callers must serialize this against other `analyze_section` calls — the
+    pipelined driver does it with the same lock it uses for the GPU.
+    """
     runs_root = runs_root or cfg.storage.runs_root
     t0 = perf_counter()
     slice_len = target_seconds + pad_seconds
@@ -266,38 +293,119 @@ def process_section(
     _remap_and_trim_transcript(job_dir, mapping, end_rel)
     _remap_refs(job_dir, mapping)
 
-    # translate → tts → mux on the (remapped) transcript, with registry voices.
-    # On resume the `source` arg is unused (earlier stages load from disk).
-    run_job(
-        job_dir,
-        cfg,
-        runs_root=runs_root,
-        resume_job_dir=job_dir,
-        resume_from="translate",
-        stop_after="mux",
-        extra={
-            "voice_assignments": registry.assignments(),
-            "locked_refs": registry.locked_refs(),
-            "speaker_profiles": registry.profiles(),
-            **({"bench": True} if bench else {}),
-        },
-        stage_cache=stage_cache,
+    return AnalyzedSection(
+        index=index, start=start, end=start + end_rel, end_rel=end_rel,
+        job_dir=job_dir, local_to_global=mapping, new_speakers=new_speakers,
+        started_at=t0,
     )
 
-    dub = job_dir / "dub.wav"
-    out_chunk = job_dir / "section_dub.wav"
+
+def translate_section(
+    analyzed: AnalyzedSection,
+    cfg: PipelineConfig,
+    registry: SpeakerRegistry,
+    *,
+    runs_root: Path | None = None,
+    stage_cache: dict | None = None,
+    cancel: threading.Event | None = None,
+    bench: bool = False,
+) -> None:
+    """Phase 2: translate only. A network round-trip; the GPU is idle.
+
+    Split out so the pipelined driver can hold no GPU lock across it and let
+    the NEXT section's analysis use the device meanwhile. This is the entire
+    source of the pipelining win.
+    """
+    runs_root = runs_root or cfg.storage.runs_root
+    run_job(
+        analyzed.job_dir, cfg, runs_root=runs_root,
+        resume_job_dir=analyzed.job_dir,
+        resume_from="translate", stop_after="translate",
+        extra=_dub_extra(registry, bench),
+        stage_cache=stage_cache, cancel=cancel,
+    )
+
+
+def speak_section(
+    analyzed: AnalyzedSection,
+    cfg: PipelineConfig,
+    registry: SpeakerRegistry,
+    *,
+    runs_root: Path | None = None,
+    stage_cache: dict | None = None,
+    cancel: threading.Event | None = None,
+    bench: bool = False,
+) -> SectionResult:
+    """Phase 3: tts → mux, then trim to the snapped end. GPU work again."""
+    runs_root = runs_root or cfg.storage.runs_root
+    run_job(
+        analyzed.job_dir, cfg, runs_root=runs_root,
+        resume_job_dir=analyzed.job_dir,
+        resume_from="tts", stop_after="mux",
+        extra=_dub_extra(registry, bench),
+        stage_cache=stage_cache, cancel=cancel,
+    )
+
+    dub = analyzed.job_dir / "dub.wav"
+    out_chunk = analyzed.job_dir / "section_dub.wav"
     if dub.exists():
-        _trim_wav(dub, end_rel, out_chunk)
+        _trim_wav(dub, analyzed.end_rel, out_chunk)
     else:
         out_chunk = None  # type: ignore[assignment]
 
     return SectionResult(
-        index=index,
-        start=start,
-        end=start + end_rel,
+        index=analyzed.index,
+        start=analyzed.start,
+        end=analyzed.end,
         dub_wav=out_chunk,
-        job_dir=job_dir,
-        local_to_global=mapping,
-        new_speakers=new_speakers,
-        wall_s=perf_counter() - t0,
+        job_dir=analyzed.job_dir,
+        local_to_global=analyzed.local_to_global,
+        new_speakers=analyzed.new_speakers,
+        wall_s=perf_counter() - analyzed.started_at,
     )
+
+
+def _dub_extra(registry: SpeakerRegistry, bench: bool) -> dict:
+    """The registry hand-off both dub phases need. One definition so translate
+    and tts cannot be handed different voice assignments."""
+    return {
+        "voice_assignments": registry.assignments(),
+        "locked_refs": registry.locked_refs(),
+        "speaker_profiles": registry.profiles(),
+        **({"bench": True} if bench else {}),
+    }
+
+
+def process_section(
+    source: Path,
+    cfg: PipelineConfig,
+    registry: SpeakerRegistry,
+    *,
+    index: int,
+    start: float,
+    target_seconds: float = DEFAULT_SECTION_SECONDS,
+    pad_seconds: float = DEFAULT_PAD_SECONDS,
+    runs_root: Path | None = None,
+    stage_cache: dict | None = None,
+    cancel: threading.Event | None = None,
+    bench: bool = False,
+    source_lang: str | None = None,
+    max_end: float | None = None,
+) -> SectionResult:
+    """One section, start to finish, serially.
+
+    The three phases run back to back, which is what watch-along did before the
+    pipelined driver existed. Kept as the simple path: `stream_sections`, the
+    bench forward-loop and the tests all use it, and it is the fallback when
+    prefetching is disabled.
+    """
+    analyzed = analyze_section(
+        source, cfg, registry, index=index, start=start,
+        target_seconds=target_seconds, pad_seconds=pad_seconds,
+        runs_root=runs_root, stage_cache=stage_cache, cancel=cancel,
+        bench=bench, source_lang=source_lang, max_end=max_end,
+    )
+    translate_section(analyzed, cfg, registry, runs_root=runs_root,
+                      stage_cache=stage_cache, cancel=cancel, bench=bench)
+    return speak_section(analyzed, cfg, registry, runs_root=runs_root,
+                         stage_cache=stage_cache, cancel=cancel, bench=bench)

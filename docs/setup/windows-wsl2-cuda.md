@@ -64,6 +64,24 @@ networkingMode=mirrored
 Sized for a 32 GB / 16-thread host, leaving 8 GB and 4 threads for Windows. `networkingMode=mirrored`
 gives bidirectional localhost, which the Chrome extension needs; omit it on Windows 10.
 
+**It has to be in the WINDOWS user profile.** `C:\Users\<you>\.wslconfig`, which is
+`/mnt/c/Users/<you>/.wslconfig` seen from inside WSL — *not* `~/.wslconfig` in the Linux
+home, where it is silently ignored. Found on this box 2026-09-03: the file existed at
+`/home/vardan/.wslconfig` with all four settings, and **none of them were in effect** —
+15 GB of memory instead of 24 (the default is 50 % of the host), all 16 threads instead
+of 12, 4 GB of swap instead of 8, and NAT instead of mirrored networking, which is what
+made a LAN-bound server unreachable. Nothing warns you; every value just stays at its
+default.
+
+Verify after `wsl --shutdown`, from inside WSL — each line should match the file:
+
+```bash
+free -g | awk '/Mem:/ {print "memory " $2 " GB"}'   # 24, not 15
+nproc                                               # 12, not 16
+ip route get 1.1.1.1                                # mirrored: your LAN gateway,
+                                                    # NAT: a 172.x.x.1 address
+```
+
 ```powershell
 wsl --shutdown
 ```
@@ -185,6 +203,12 @@ If it refuses to build at all, the pipeline still runs: flip the profile's `diar
 ```bash
 echo 'export HF_HOME=$HOME/.cache/huggingface' >> ~/.bashrc
 ```
+
+**This is done, and it mattered more than expected.** With `HF_HOME` on the 9p
+Windows mount, cold model builds cost **154 s** and `performance.md` attributed
+53 % of a cold run to them. On the ext4 virtual disk the same builds cost
+**22-26 s**. Any cold-start figure in the docs older than 2026-09-01 was
+measured across the slow mount.
 
 The test suite locates the model cache through `HF_HUB_CACHE` / `HF_HOME` too, so a cache on another
 drive is fine — but if those are unset in the shell running `pytest`, the eight batched-decode
@@ -457,11 +481,48 @@ so decode audio through `_audio_io` or soundfile.
 ## Phase 10 — Server reachability
 
 ```bash
-patmir ui --port 8000
+patmir ui --profile cuda --port 8000
 ```
 
 Open `http://localhost:8000` from Windows Chrome. If unreachable, add `networkingMode=mirrored`
 to `.wslconfig` and `wsl --shutdown`.
+
+`--profile cuda` matters: it exports `PATMIR_PROFILE`, so the watch-along path
+picks the profile up too. Without it the server boots the MLX candidate set and
+fails on the first job.
+
+### From another machine on the LAN (2026-09-03)
+
+The server binds loopback by default. To reach it from a second machine:
+
+```bash
+patmir ui --profile cuda --port 8000 --host 0.0.0.0
+```
+
+Then point that machine's extension at `http://<windows-host-ip>:8000` in its
+options page, with the same bearer token the server prints at startup.
+
+Three things have to line up, and only the first is ours:
+
+1. **`--host 0.0.0.0`.** Opt-in rather than the default because five
+   `/run/<job_id>` progress routes predate the bearer token and a job id is a
+   guessable timestamp — so on a shared network, anyone who guesses one can
+   read that job's audio and transcript. `/jobs`, `/stream` and `/cache` all
+   require the token. The CLI prints a one-line note when the bind is not
+   loopback.
+2. **`networkingMode=mirrored`** in `.wslconfig` (already set for this box —
+   see Phase 1). WSL2's default NAT gives the VM its own address, so binding
+   `0.0.0.0` inside it is reachable from Windows but *not* from the LAN.
+   Mirrored mode shares the host's interfaces, which is what makes the LAN
+   case work at all. Without it you would need a
+   `netsh interface portproxy` rule plus a firewall rule on Windows.
+3. **Windows Firewall** must allow inbound on the port. A private-network
+   rule is enough; the prompt on first bind usually offers it.
+
+No auth change was needed for this: `_is_loopback_origin` already allows
+`chrome-extension://`, which is the origin the extension sends, so the
+token-protected routes accept it from any machine. A *page* served from the
+LAN IP is still refused by that same check.
 
 ## Pitfalls, by likelihood
 
@@ -471,7 +532,11 @@ to `.wslconfig` and `wsl --shutdown`.
 | `nvidia-smi` works but torch sees no GPU | a Linux driver package was installed inside WSL |
 | Everything inexplicably slow | repo or `HF_HOME` sitting on `/mnt/c/` |
 | Run dies after the first stage with `libmlx.so: cannot open shared object file` | Two compounding causes, both fixed in-tree — `git pull` if you hit it. `[local]` used to install the Apple-only `mlx-*` wheels here (now gated on `sys_platform == 'darwin'`), and `_free_accelerator_cache()`, which runs after **every** stage, probed MLX under `except ImportError` while dlopen actually raises `OSError`. It fired regardless of the active profile, so a correct `PATMIR_PROFILE=cuda` did not save you. Belt and braces: `uv pip uninstall mlx mlx-audio mlx-whisper mlx-lm` |
-| Extension cannot reach the server | missing `networkingMode=mirrored` |
+| Extension stops working for no visible reason | a **second** `patmir ui` was started. Each prewarms the whole model set at boot (~16 GB on CUDA) and the card holds one, so the second starves the first — and nothing in the symptom mentions memory. A single-instance `flock` now refuses the second server by name; if you see that refusal, stop the other server rather than picking a different port |
+| Server looks dead for the first minute or two | the startup hook prewarms every model *before* uvicorn accepts connections — ~45 s warm on this box, longer cold. It prints `Application startup complete` when the port goes live |
+| Extension cannot reach a server on another host | the manifest grants `http://127.0.0.1:8765/*` only. Since 2026-09-03 the options page **requests** the host permission when you save a non-loopback address, and refuses to save if you decline — so re-save the address and accept the Chrome prompt. Reload the extension after pulling, since `optional_host_permissions` is a manifest change |
+| Extension cannot reach the server | missing `networkingMode=mirrored` — and check *where* `.wslconfig` is: in the Linux home it is silently ignored (see Phase 2) |
+| Extension on a second machine cannot reach the server | server bound loopback — add `--host 0.0.0.0` (see Phase 10), then check Windows Firewall allows the port |
 | Mux stage fails | `rubberband-cli` not installed |
 | `uv pip install` reports transformers 4.57.6 vs >=5.5 unsatisfiable | Expected if `qwen-asr` is installed: it pins transformers exactly, and the Higgs TTS checkpoint needs >=5.5. `uv pip uninstall qwen-asr` and never reinstall it — the `qwen3_asr_1_7b` candidate reaches the same models through transformers' native `qwen3_asr` (5.13+), so the package is not needed for Qwen3-ASR on this box |
 | ASR dies with `KeyError: 'qwen3_asr'` | transformers older than 5.13, which is where native `qwen3_asr` landed. The candidate gates on this at build time and reports the fix, so you should see a `RuntimeError` naming the version instead; a raw `KeyError` means something bypassed the gate. `uv pip install -U "transformers>=5.13"` |
@@ -484,7 +549,26 @@ to `.wslconfig` and `wsl --shutdown`.
 
 ## GPU power limit
 
-**Set it on the Windows side, not in WSL.** The GPU is owned by the Windows driver and WSL only gets
+**Current state (2026-09-02): the card runs at its stock 350 W and is NOT
+limited.** The cooling was fixed and the 80 % mitigation below was removed.
+This section is kept because it describes how to re-apply one, and because the
+history matters: every CUDA figure in `performance.md` before 2026-09-02 was
+measured under that limit while nothing in the repo recorded it, and the bench
+captured no power or thermal state, so a throttled run could not be told from a
+clean one. `patmir bench` now samples power, clocks, temperature and throttle
+reasons every second (`patmir/telemetry.py`) and distinguishes a card at its
+own stock ceiling — normal under load — from one capped below it, which makes a
+run incomparable.
+
+What removing the limit was worth, measured: **warm batch agg RTF 0.393 ->
+0.377, about 4 %**, inside the run-to-run spread and exactly what the last
+paragraph of this section predicted. Two of three repeats still logged **one
+second each** of thermal slowdown at 80-81 C core, which is a transient rather
+than sustained throttling but is the first thermal number this repo has had.
+Worth re-checking on a feature-length dub, which runs 10-20x longer at the same
+duty cycle.
+
+**If you do re-apply one: set it on the Windows side, not in WSL.** The GPU is owned by the Windows driver and WSL only gets
 a stub (`libcuda.so` is stubbed in, and `nvidia-smi` lives at `/usr/lib/wsl/lib/nvidia-smi`).
 NVIDIA's CUDA-on-WSL guide states that "modifiable state features (ECC, Compute mode, Persistence
 mode) will not be supported" — it does not name the power limit specifically, but that is the

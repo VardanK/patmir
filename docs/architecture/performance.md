@@ -1,7 +1,277 @@
 # Pipeline performance — baseline + roadmap
 
-Last updated: 2026-08-25 (watch-along startup/stall causes; **watch-along rows
-below are pre-fix and need re-measuring**)
+Last updated: 2026-09-02 (350 W re-baseline + decode-loop work; see the section
+directly below, which supersedes every CUDA figure further down)
+
+## 2026-09-02 — CUDA re-baseline at 350 W, and a 43 % faster batch pipeline
+
+**Every CUDA number below this section is void, not merely stale.** The 3090
+had been running the 80 % / 280 W thermal mitigation from
+`docs/setup/windows-wsl2-cuda.md` through all of those measurements, nothing in
+the repo recorded it, and `patmir bench` captured no power, clock, temperature
+or throttle state — so a throttled run and a clean one were indistinguishable
+after the fact. The driver's since-boot counters showed 337 s of SW power-cap
+and 203 s of SW thermal slowdown, so the throttling was real. Telemetry is now
+part of every run.
+
+Removing the limit was worth **~4 %** (warm agg RTF 0.393 -> 0.377), inside the
+run-to-run spread and exactly what the setup doc predicted for a
+bandwidth-bound workload. **The limit was never the bottleneck.** Everything
+below came from code.
+
+### Batch, `sample_1` (301.11 s), warm, cuda profile
+
+| | before (2026-09-01, capped) | 350 W baseline | **after** |
+| --- | ---: | ---: | ---: |
+| agg RTF | 0.393 | 0.377 | **0.2135** (0.216 / 0.211) |
+| wall | 118.3 s | 113.3 s | **64.2 s** |
+| cold agg RTF | 0.482 | 0.499 | **0.339** |
+
+**43 % off the pipeline.** Per-stage warm, baseline -> after:
+
+| stage | before | after | what changed |
+| --- | ---: | ---: | --- |
+| tts | 60.55 s | **22.47 s** | decode step 45.55 -> 17.9 ms; CUDA graph + gqa kernel + `max_batch` 12 |
+| asr | 15.24 s | **11.77 s** | language probe 4.63 -> 0.71 s |
+| translate | 16.02 s | **8.21 s** | concurrency 6 -> 12 |
+| separate | 8.36 s | 8.91 s | unchanged (noise) |
+| output | 5.35 s | 5.53 s | unchanged — 5.5 s of AAC re-encode, still an open option |
+| mux | 4.12 s | 4.07 s | unchanged |
+| emotion | 1.94 s | **1.54 s** | funasr calls batched |
+| diarize | 1.29 s | 1.31 s | unchanged |
+| ingest | 0.41 s | 0.42 s | unchanged |
+
+GPU during the final run: 214.5 W avg / 349.1 W max of 350, 78 C max, at its
+stock ceiling in 31 samples, **no thermal slowdown and nothing capped below
+stock**. Peak VRAM 16.7 GB of 24.
+
+### Watch-along at 350 W
+
+Greedy playhead, `--prewarm`, real `StreamScheduler`, before and after the same
+optimizations (the streaming path shares every one of them):
+
+| | 350 W baseline | **after** |
+| --- | ---: | ---: |
+| agg RTF (per dubbed second) | 0.623 | **0.511** |
+| wall | 205.8 s | **153.9 s** |
+| time to first audio | 27.8 s | **23.0 s** |
+| worst single section | **1.053** | **0.676** |
+| stalls | 0 | 0 |
+
+| stage | before | after |
+| --- | ---: | ---: |
+| tts | 81.4 s | **32.4 s** |
+| **translate** | 46.6 s | **44.2 s** |
+| asr | 29.1 s | 27.8 s |
+| separate | 10.9 s | 10.6 s |
+| `other_s` | 21.0 s | 20.9 s |
+
+**No section exceeds realtime any more** — the worst fell from 1.053 to 0.676,
+so the buffer grows monotonically instead of being clawed back on two sections
+of ten.
+
+**Translate is now the largest watch-along stage, at 29 % of wall**, and it
+barely moved (46.6 -> 44.2 s). That is expected and was checked rather than
+assumed: sections carry 3-16 sentences against `chunk_size = 20`, so **each
+section is a single chunk making exactly one call**. There is no serial chunk
+walk to parallelize and raising concurrency cannot help — the cost is one
+structured cloud round-trip per section, 1.9-3.8 s each. The remaining lever is
+overlapping a section's translate with the previous section's TTS, i.e.
+cross-stage pipelining, which this work excluded.
+
+ASR also barely moved (29.1 -> 27.8 s) for a related reason: sections already
+receive `source_lang` from the prelude, so only the prelude ever paid the
+language probe. The 4 s saving is a batch-mode win.
+
+`other_s` is unchanged at ~2.3 s per section — the ffmpeg slice/trim, ECAPA
+embed and age/gender profile that no stage owns. It is now 14 % of watch-along
+wall and nothing in this work touched it.
+
+**Not comparable with the 2026-09-01 watch-along row** further down: that run
+had no `--prewarm` and used `--forward-loop` (it had to — the scheduler driver
+could not terminate), so its 45.4 s to first audio describes a different
+configuration rather than a slower version of this one.
+
+### Realtime playhead — a viewer advancing with the clock
+
+| | 350 W baseline | **after** |
+| --- | ---: | ---: |
+| agg RTF | 0.725 | **0.484** |
+| wall | 239.3 s | **145.7 s** |
+| time to first audio | 38.9 s | **22.2 s** |
+| worst single section | 1.416 | **0.635** |
+| **stalls** | 0 | **0** |
+
+**0 stalls in both**, and this is the measurement that matters for watch-along:
+it is the only driver whose synthetic viewer advances with the wall clock and
+can therefore outrun production. It had never been run on this box before
+2026-09-02 — the greedy driver cannot stall by construction, and the
+`--forward-loop` driver every stored baseline used cannot either.
+
+Before, two sections of ten individually exceeded realtime (1.416, 1.011) and
+the buffer had to claw the time back. Now the worst is 0.635, so the buffer
+grows monotonically.
+
+### Why translate dominates watch-along, measured
+
+Per-section translate calls in the after run, one call per section:
+
+| sentences | 4 | 5 | 6 | 9 | 9 | 9 | 12 | 12 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| seconds | 1.75 | 2.23 | 1.89 | 2.96 | **12.20** | **13.34** | 3.62 | **10.83** | 4.06 |
+
+**Three of nine calls account for 36 of the 44 s.** All 43 API responses in that
+run were HTTP 200 on the first attempt, so this is neither the retry logic
+added the same day nor rate limiting — it is provider-side latency on the
+JSON-schema-constrained decode. The per-sentence path shows nothing like it:
+p90 1.46 s, max 1.63 s over 78 calls.
+
+Three compounding causes:
+
+1. **No parallelism.** Batch mode fires 78 calls 12-at-a-time, compressing
+   89.9 s of latency into 8.0 s of wall (11.2x). Watch-along makes one call per
+   section and sections are serial, so there is nothing to overlap.
+2. **One call writes everything.** Output tokens scale with the section's
+   sentence count, and generation is token-bound.
+3. **That call's latency is erratic**, per the table.
+
+**An option that inverts an old decision.** `streaming_config()` selects the
+batched translator because, when the per-sentence path was *serial*, batching
+was faster — that is what its docstring says. It no longer holds: per-sentence
+now runs at concurrency 12, and a section has 4-16 sentences, so all of them fit
+inside one round-trip of wall (~1.2-1.6 s) against 2-13 s for one batched call.
+Estimated **44 s -> ~15 s, ~19 % of watch-along wall.**
+
+Not done, because it is a real trade rather than a free win: the batched
+candidate exists so the model sees a whole scene at once plus the previous
+chunk's translations, which is what keeps character register and pronouns
+consistent across a section. Switching buys latency with scene coherence and
+wants an ear verdict.
+
+### Translate prefetch: measured 14 % slower, reverted
+
+Section pipelining overlaps the next section's **analysis** with this one's
+translate. The obvious extension — have that same background worker also
+*translate* the section it analysed, so a prefetch hit arrives ready to speak —
+is a **regression** and was reverted (report
+`measurements/pipelined-tr-greedy.json`, ADR §13):
+
+| greedy driver | agg RTF | wall | mean section wall | mean `other_s` |
+| --- | ---: | ---: | ---: | ---: |
+| analysis prefetch (shipped) | **0.396** | **119.3 s** | 12.21 s | 0.67 s |
+| + translate prefetch | 0.439 | 132.2 s | 13.55 s | 2.70 s |
+
+The prefetch itself worked (7 of 8 sections pre-translated, 0 discarded) and
+every phase was individually as fast or faster. What broke is the overlap:
+translate is the **only** phase that does not hold the GPU lock, so the main
+thread translating *is* the window the background analysis runs in. Take it
+away and the main thread holds the GPU back to back, the analysis is pushed to
+the end of the cycle, and the translate chained behind it finishes after the
+next cycle already needed it — so the main thread waits for both. Per-section
+walls oscillate (4.73 s then 21.18 s) where the shipped pipeline's are steady.
+
+**The floor it exposes:** analyse + speak is **8.5 s of serialized GPU work per
+section** against 3.2-5.5 s of network, so ~8.5 s/section is the ceiling for
+any arrangement of these three phases — about **30 % below** the shipped
+12.2 s. Getting there needs the main thread to yield the GPU to a pending
+analysis before speaking (or a second lookahead level), trading ~4.6 s of
+per-section delivery latency for throughput. Left alone: production is 2.5x
+realtime with 0 stalls, so there is no stall budget to spend it on.
+
+### Where the TTS time went, and the two things worth remembering
+
+The decode step measured 45.5 ms where the card's bandwidth allows ~9-12. The
+tempting reading — a bandwidth problem — was wrong: a 36-layer model with
+*negligible widths* costs **42.9 ms/step** on this box, so ~93 % of the step was
+the CPU issuing kernels.
+
+1. **A kept negative result.** Removing ~10,000 device-to-host syncs per chunk,
+   batching the sampler and vectorizing the delay/EOC state machine moved the
+   step 45.55 -> 45.88 ms. Nothing. They stayed because CUDA graph capture
+   requires exactly what they provide: static addresses, no host reads inside
+   the region, no `.item()` in the state machine.
+2. **Ordering was load-bearing.** CPU launch (~43 ms) and GPU execution
+   (~33 ms) **pipeline**, so the step sits at the max of the two. Swapping in a
+   cheaper attention kernel *first* would also have measured ~0 — it lowers a
+   floor that is not binding. The graph had to land first to expose the GPU
+   floor. Check which is binding before optimizing either.
+
+| step | ms/step | tts stage | agg RTF | output |
+| --- | ---: | ---: | ---: | --- |
+| eager baseline | 45.55 | 60.55 s | 0.377 | — |
+| sync/sampler/state-machine | 45.88 | 61.38 s | 0.377 | **byte-identical** |
+| + CUDA graph | 27.15 | 39.51 s | 0.309 | **byte-identical** |
+| + gqa attention | 17.33 | 29.27 s | 0.277 | re-rolls all 80 lines |
+| + `max_batch` 12 | 18.11 | 23.84 s | 0.218 | re-rolls again |
+
+The graph shipped with **no quality question attached**, which was measured
+rather than assumed: `StaticCache` is bitwise equal to `DynamicCache` even with
+ragged left-padded prompts, and graph replay is bitwise equal to eager
+stepping. Both are pinned by CUDA-gated tests. The gqa kernel and `max_batch`
+do change the draw; both were ear-approved and both correctly move
+`config_hash` (2cc3dd87 -> 4a56ed45 -> 3f421293), sequenced so the library
+regenerates once rather than twice.
+
+### `max_batch` swept, and 16 measured worse
+
+| B | ms/step | tts wall | capture | chunks | steps | live rows | ovf | agg RTF |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 17.19 | 29.14 s | 7.34 s | 10 | 1160 | 0.647 | 0 | 0.234 |
+| **12** | 18.11 | **23.84 s** | 5.96 s | 7 | 888 | 0.592 | 0 | **0.218** |
+| 16 | 19.14 | 27.03 s | 5.31 s | 6 | 1032 | 0.468 | 1 | 0.228 |
+
+Per-step cost rises monotonically with B, so all the gain must come from fewer
+chunks — but **a chunk costs `max(steps)` over its rows**, so a wider batch
+widens the token-cap spread inside it. At 16 total steps went *up* (888 ->
+1032) despite one fewer chunk, over half of all row-steps went to retired rows,
+and it produced the only TTS overflow measured in this work. VRAM was never
+binding (16.5-17.4 GB peak, ~7.5 GB free); the plan expected memory to decide
+this and chunk shape decided it.
+
+### The largest remaining piece of TTS waste is graph capture
+
+At B=12 capture costs **5.96 s of a 23.84 s stage — 25 %**, ~0.85 s per chunk.
+It pays for itself many times over, but reusing a captured graph across chunks
+with matching `(B, seq + max_cap)` would recover most of it. Not done.
+
+### Instrumentation added, because the old numbers could not be defended
+
+- **GPU telemetry** at 1 Hz (`patmir/telemetry.py`), separating a card at its
+  own stock ceiling (normal under load) from one capped below it (which makes a
+  run incomparable). `GpuIdle` is not throttling and is reported separately.
+- **Intra-stage probes** (`patmir/pipeline/probe.py`), free when disabled,
+  device-synced when enabled, written to `<stage>/bench_probe.json`. Spans and
+  counters add across a stream's sections; identities and derived ratios do not
+  and are kept apart, after an early report summed 11 job dirs into a
+  `max_batch` of 88.
+- **Batch `real_wall_s` / `other_s`** — `total_wall_s` is the sum of stage
+  walls, so everything between stages was invisible. It is 1.9 s, 1.7 % of the
+  old wall, which is why gating the per-stage accelerator free was dropped.
+- **Not done, recorded rather than silently dropped (2026-09-04):** the
+  spec's "small stages" item for `separate` — load Silero once in `build()`
+  instead of per call, and skip the `non_speech_vocals.wav` write behind a
+  knob — was never started. Separate is 7 % of batch wall and the VAD inference
+  inside it 1.3 s, so the ceiling is ~1 % of wall. Still open; measure the
+  Silero load before taking it.
+- **`cpu_s` including child processes** — four stages spawn ffmpeg and the mux
+  spawns `rubberband` twice per sentence, work invisible to `RUSAGE_SELF` and
+  to every GPU counter.
+- **`patmir bench --mode watch-along` had never terminated** under its own
+  default driver: no `alive_fn`, and the synthetic viewer keeps the abandon
+  timer fed. That is why every stored watch-along row used `--forward-loop`.
+
+Reports: `agent-os/specs/2026-09-02-2123-cuda-perf-rebaseline-and-optimization/measurements/`
+(copied there because `runs/` is gitignored, which is how the 2026-08-24 CUDA
+reports were lost). ADR
+`decisions/2026-09-02-cuda-perf-rebaseline-and-tts-decode.md`.
+
+---
+
+## Historical rows (pre-2026-09-02)
+
+Everything below predates the re-baseline. The CUDA figures were measured on a
+power-limited card with no telemetry; the Apple-Silicon rows are unaffected by
+that but describe a different machine.
 
 > **Watch-along rows here predate the 2026-08-25 fixes and describe a path that
 > no longer exists.** ADR

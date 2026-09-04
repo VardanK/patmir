@@ -97,6 +97,12 @@ def main(argv: list[str] | None = None) -> int:
 
     p_ui = sub.add_parser("ui", help="Launch the local FastAPI progress UI.")
     p_ui.add_argument("--port", type=int, default=8765)
+    p_ui.add_argument("--host", type=str, default="127.0.0.1",
+                      help="Interface to bind. Default loopback. Use 0.0.0.0 "
+                           "to reach the server from another machine on the "
+                           "LAN — opt-in, because the /run/<job_id> progress "
+                           "routes have no token and a job id is a guessable "
+                           "timestamp.")
     p_ui.add_argument("--runs-root", type=Path, default=None,
                       help="Override [storage].runs_root for this server.")
     p_ui.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -151,6 +157,17 @@ def main(argv: list[str] | None = None) -> int:
                          action="store_false", default=True,
                          help="watch-along only: skip the per-sentence tts/translate "
                               "timings.jsonl traces.")
+    p_bench.add_argument("--tts-probe", choices=["chunk", "step"], default="chunk",
+                         help="Granularity of the TTS intra-stage probe. chunk (default) "
+                              "times prefill / decode / codec once per decode chunk. step "
+                              "additionally splits forward vs sample per decode step, "
+                              "which needs a device sync per step and so inflates the "
+                              "very total it explains — use it to attribute, not to "
+                              "quote a wall.")
+    p_bench.add_argument("--tts-trace", action="store_true", default=False,
+                         help="Write a torch.profiler chrome trace for the FIRST TTS "
+                              "decode chunk to <job>/tts/trace_tts.json. One chunk only: "
+                              "a whole-job trace is hundreds of MB.")
     p_bench.add_argument("--report", type=Path, default=None,
                          help="Write machine-readable bench.json to this path.")
     p_bench.add_argument("--label", type=str, default=None)
@@ -189,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.runs_cmd == "show":
             return cmd_runs_show(args.job_id, args.config)
     if args.cmd == "ui":
-        return cmd_ui(args.port, args.runs_root, args.config)
+        return cmd_ui(args.port, args.runs_root, args.config, host=args.host)
     if args.cmd == "bench":
         return cmd_bench(args)
     if args.cmd == "submit":
@@ -290,7 +307,7 @@ def cmd_runs_show(job_id: str, config: Path) -> int:
     return 0
 
 
-def cmd_ui(port: int, runs_root: Path | None, config: Path) -> int:
+def cmd_ui(port: int, runs_root: Path | None, config: Path, host: str = "127.0.0.1") -> int:
     if not _require_config(config):
         return 2
     try:
@@ -305,15 +322,47 @@ def cmd_ui(port: int, runs_root: Path | None, config: Path) -> int:
     if runs_root is not None:
         storage = replace(storage, runs_root=runs_root.expanduser().absolute())
     token = ui_auth.ensure_token(storage.secret_path)
-    print(f"patmir ui — bind 127.0.0.1:{port}", file=sys.stderr)
+
+    # One server per machine. Each prewarms the whole model set at boot and a
+    # 24 GB card holds one — a second server starves the first, and the symptom
+    # arrives as "the extension stopped working", never as anything mentioning
+    # memory. The in-process accelerator lock cannot see another process.
+    from patmir.ui.single_instance import ServerAlreadyRunning, acquire
+    try:
+        _lock = acquire(storage.server_lock, host=host, port=port)
+    except ServerAlreadyRunning as exc:
+        print(f"patmir ui: {exc}", file=sys.stderr)
+        return 2
+
+    # Before anything else logs: a crash's last lines are the point, and the
+    # server used to log to stderr only, so they died with the terminal.
+    from patmir.ui.logs import setup_file_logging
+    log_file = setup_file_logging(storage.state_root)
+
+    print(f"patmir ui — bind {host}:{port}", file=sys.stderr)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        # Say it once, plainly. Every route needs the bearer token from another
+        # machine, the progress pages included; only a browser on this machine
+        # (loopback client) may open `/` and `/run/<job_id>` without it.
+        print("  NOTE reachable from the network. Every route needs the bearer "
+              "token from another machine; the /run/<job_id> progress pages "
+              "open without it only from this machine.", file=sys.stderr)
     print(f"  config:  {config}", file=sys.stderr)
     print(f"  runs:    {storage.runs_root}", file=sys.stderr)
     print(f"  cache:   {storage.cache_root}", file=sys.stderr)
     if storage.library_root:
         print(f"  library: {storage.library_root}", file=sys.stderr)
+    print(f"  log:     {log_file}  (rotating, ~40 MB ceiling)", file=sys.stderr)
     print(f"  token:   {token}  (paste into the Chrome extension options page)",
           file=sys.stderr)
-    serve(port=port, storage=storage, cfg=cfg, token=token, config_path=config)
+    print("  startup:  prewarming models — the port does not accept "
+          "connections until this finishes (~110 s cold on CUDA)",
+          file=sys.stderr)
+    try:
+        serve(host=host, port=port, storage=storage, cfg=cfg, token=token,
+              config_path=config)
+    finally:
+        _lock.close()          # releases the flock; the kernel would anyway
     return 0
 
 
@@ -370,6 +419,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
             args.clip, cfg, runs_root=runs_root,
             repeat=args.repeat, label=args.label,
             warm_cache=args.warm_cache,
+            probe_level=args.tts_probe,
+            trace_stage="tts" if args.tts_trace else None,
         )
     else:
         results = benchmod.bench_watch_along(

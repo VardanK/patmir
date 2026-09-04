@@ -100,45 +100,92 @@
   // seek: if the element we are about to seek reports this duration, whatever
   // else we believe, it is the content and we must not touch it.
   let contentDuration = null;
+  // How long a source change waits for the ad class before being believed to
+  // be a navigation. Long enough for YouTube to stamp `#movie_player`, short
+  // enough that a genuine Shorts auto-advance keeps dubbing the wrong video
+  // for well under a second.
+  const SRC_CHANGE_GRACE_MS = 1200;
+  let srcChangeGrace = null;
 
   // --- message routing ------------------------------------------------
 
   // The playback primitives, extracted from the message handlers so the
   // in-page overlay reaches EXACTLY the same code path the popup does. One
-  // implementation matters most for the opt-out bookkeeping below: a stop that
-  // skipped `setVideoDisabled(url, true)` would be undone by the auto-play
-  // listener within a tick, and the button would look broken.
+  // implementation matters most for the enabled-flag bookkeeping below: a stop
+  // that skipped `setTranslateEnabled(false)` would be undone by the
+  // auto-start within a tick, and the button would look broken.
   async function playQuality(cacheKey) {
-    // Explicit play also removes any prior opt-out for this video so the next
-    // visit auto-plays again.
-    await setVideoDisabled(window.location.href, false);
-    stopWatchAlong();
+    // Pressing play IS the global choice: every later video translates until
+    // the viewer presses stop.
+    await setTranslateEnabled(true);
+    stopWatchAlong("quality-playback-requested");
     await startDub(cacheKey);
     return { ok: true };
   }
 
   async function playWatchAlongFor(cacheKey) {
-    await setVideoDisabled(window.location.href, false);
+    await setTranslateEnabled(true);
     stopDub();
+    waRevivesUsed = 0;          // a deliberate start earns a fresh budget
     await startWatchAlong(cacheKey);
     return { ok: true };
+  }
+
+  /**
+   * Re-submit a stream that stopped producing, once.
+   *
+   * Worth trying because the server RESUMES rather than restarting: `submit()`
+   * on a `done`-but-incomplete stream picks up from the cached sections
+   * (quality issue #21) and no longer re-dubs the cached opening (#31). So a
+   * revive costs the rest of the video, not the whole of it.
+   *
+   * Bounded at one per user-initiated start, because the failure that made
+   * this necessary — a NameError on the server's stream path — was
+   * deterministic, and an unbounded retry against a deterministic failure is
+   * a loop that interrupts the picture every minute.
+   */
+  async function reviveWatchAlong() {
+    const url = window.location.href;
+    waRevivesUsed += 1;
+    console.warn(`[patmir] dub stream stopped producing — re-submitting `
+      + `(attempt ${waRevivesUsed} of ${WA_MAX_REVIVES}).`);
+    stopWatchAlong("watch-along-restart");
+    let resp;
+    try {
+      resp = await chrome.runtime.sendMessage({
+        type: "jobs:submit", url, mode: "watch-along",
+      });
+    } catch (_) { return false; }
+    if (!resp || !resp.ok || !resp.data) return false;
+    const key = resp.data.cache_key;
+    if (!key) return false;
+    if (window.location.href !== url) return false;   // navigated meanwhile
+    // The submit round-trip is long enough for the viewer to have pressed
+    // Չեղարկել (translation off) or play (a stream already running again).
+    // Either way this revive is stale: restarting here re-dubbed a video the
+    // viewer had just switched off.
+    if (waActive) return false;
+    if (!(await getTranslateEnabled())) return false;
+    if (window.location.href !== url) return false;
+    stopDub();
+    await startWatchAlong(key);
+    return true;
   }
 
   // Switches the AUDIO TRACK off, nothing else: the dub source stops, the mute
   // control hands `video.muted` back to the viewer's own intent (so the original
   // comes back), and the picture keeps rolling. Never pauses, never seeks.
   async function stopTranslation() {
-    // Explicit stop opts this video out of future auto-play — "off" has to stay
-    // off, and it is also what stops the auto-play listener restarting the dub
-    // the moment `patmirDisabledVideos` changes.
-    await setVideoDisabled(window.location.href, true);
+    // Off means off everywhere, and it is also what stops the auto-start
+    // pressing the button again a tick later.
+    await setTranslateEnabled(false);
     stopPlayback();
     return { ok: true };
   }
 
   async function playbackStatus() {
     const url = window.location.href;
-    const disabled = await isVideoDisabled(url);
+    const disabled = !(await getTranslateEnabled());
     const isPlaying = playing || waActive;
     const mode = waActive ? "watch-along" : (playing ? "quality" : null);
     return {
@@ -200,79 +247,39 @@
     }
   }
 
-  async function isVideoDisabled(href) {
-    const key = canonicalUrl(href);
-    const { patmirDisabledVideos = [] } = await chrome.storage.local.get("patmirDisabledVideos");
-    return Array.isArray(patmirDisabledVideos) && patmirDisabledVideos.includes(key);
-  }
+  // Translation is ONE remembered choice for every video, not a per-video
+  // opt-out. Author: "should remember the last state (not for a single video),
+  // if enabled it should work for all videos, if disabled should not
+  // translate."
+  //
+  // This replaces `patmirDisabledVideos`, a per-video list that could only ever
+  // say "not this one" and had no way to express "yes, from now on". Turning
+  // translation on therefore SUBMITS work on a video that has never been
+  // dubbed — that is the requested behaviour, and it is why the default is off
+  // until the viewer presses the button once.
+  const TRANSLATE_ENABLED = "patmirTranslateEnabled";
 
-  async function setVideoDisabled(href, disabled) {
-    const key = canonicalUrl(href);
-    const { patmirDisabledVideos = [] } = await chrome.storage.local.get("patmirDisabledVideos");
-    const list = Array.isArray(patmirDisabledVideos) ? patmirDisabledVideos.slice() : [];
-    const idx = list.indexOf(key);
-    if (disabled && idx < 0) list.push(key);
-    if (!disabled && idx >= 0) list.splice(idx, 1);
-    // Bound the list so it doesn't grow forever.
-    while (list.length > 500) list.shift();
-    await chrome.storage.local.set({ patmirDisabledVideos: list });
-  }
-
-  async function autoPlayIfApplicable() {
-    if (playing) return;
-    const url = window.location.href;
-    if (!/^https?:\/\//.test(url)) return;
-
-    const { patmirAutoPlayEnabled = true } = await chrome.storage.local.get("patmirAutoPlayEnabled");
-    if (!patmirAutoPlayEnabled) return;
-    if (await isVideoDisabled(url)) return;
-
-    let lookup;
-    try {
-      lookup = await chrome.runtime.sendMessage({ type: "cache:lookup", url });
-    } catch (_) { return; }
-    if (!lookup || !lookup.ok || !lookup.data || !lookup.data.cached) return;
-
-    // Wait for the player <video> element to be ready (YouTube swaps it
-    // in asynchronously after navigation).
-    const found = await waitForVideo(8000);
-    if (!found) return;
-    // Re-check the URL didn't change while we waited.
-    if (window.location.href !== url) return;
-
-    try {
-      await startDub(lookup.data.cache_key);
-    } catch (e) {
-      console.warn("[patmir] auto-play failed:", e);
+  async function getTranslateEnabled() {
+    const stored = await chrome.storage.local.get(PatmirSession.TRANSLATE_KEYS);
+    const on = PatmirSession.resolveTranslateEnabled(stored);
+    // Write the migration through once, so the legacy key stops mattering and
+    // a later explicit "off" cannot be overridden by it.
+    if (typeof stored[TRANSLATE_ENABLED] !== "boolean") {
+      await chrome.storage.local.set({ [TRANSLATE_ENABLED]: on });
     }
+    return on;
   }
 
-  function waitForVideo(timeoutMs) {
-    return new Promise((resolve) => {
-      const start = Date.now();
-      const tick = () => {
-        if (findVideo()) return resolve(true);
-        if (Date.now() - start > timeoutMs) return resolve(false);
-        setTimeout(tick, 200);
-      };
-      tick();
-    });
+  async function setTranslateEnabled(on) {
+    await chrome.storage.local.set({ [TRANSLATE_ENABLED]: !!on });
   }
 
-  // Re-check on YouTube SPA navigation (covers watch-page transitions).
-  window.addEventListener("yt-navigate-finish", () => {
-    setTimeout(autoPlayIfApplicable, 250);
-  });
-  // Storage changes from the options page (e.g. user flips the global
-  // toggle on) should re-evaluate too.
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "local") return;
-    if ("patmirAutoPlayEnabled" in changes || "patmirDisabledVideos" in changes) {
-      autoPlayIfApplicable();
-    }
-  });
-  // Initial trigger on first script injection.
-  setTimeout(autoPlayIfApplicable, 500);
+  // `autoPlayIfApplicable` lived here and only ever started a dub that was
+  // ALREADY fully cached, which is why a video that had never been dubbed
+  // always played in the original language. Auto-start now lives in
+  // `overlay.js`, which owns the `Session` and so reaches the whole
+  // submit -> poll -> play path rather than just the last step of it. One
+  // mechanism: two would race to start the same video twice.
 
   // --- core playback --------------------------------------------------
 
@@ -665,9 +672,26 @@
     // teardown.
     if (adState().showing) { updateAdState(); return; }
     const currentSrc = video ? (video.currentSrc || video.src || null) : null;
-    if (currentSrc !== videoSrcAtStart) {
-      stopDub();
-    }
+    if (currentSrc === videoSrcAtStart) return;
+    // The src differs and no ad is showing YET -- which is not the same as no
+    // ad. `emptied`/`loadstart` fire the instant the source is swapped, and
+    // YouTube sets `ad-showing` on the player around the same moment with no
+    // guaranteed ordering. Tearing down here is what put the video back in
+    // English after a mid-roll (quality issue #26 was never confirmed on a
+    // real ad break), and issue #27 made the race more likely by tightening
+    // detection so ONLY the player class counts.
+    //
+    // So defer: re-ask once the class has had time to appear. A real
+    // navigation is still caught -- by this same check a moment later, and by
+    // the URL poll that owns navigation anyway.
+    if (srcChangeGrace !== null) return;      // already waiting on one
+    srcChangeGrace = setTimeout(() => {
+      srcChangeGrace = null;
+      if (!playing) return;
+      if (adState().showing) { updateAdState(); return; }
+      const nowSrc = video ? (video.currentSrc || video.src || null) : null;
+      if (nowSrc !== videoSrcAtStart) stopDub();
+    }, SRC_CHANGE_GRACE_MS);
   }
 
   // Every one of these invalidates the anchor, so they stop the audio and clear
@@ -703,7 +727,7 @@
    * chunked feed). Used by every navigation/teardown path. */
   function stopPlayback() {
     stopDub();
-    stopWatchAlong();
+    stopWatchAlong("stop-playback");
   }
 
   function base64ToBytes(b64) {
@@ -753,8 +777,7 @@
     if (!playing) return;
     if (urlAtStart && window.location.href !== urlAtStart) {
       stopPlayback();
-      // Try auto-playing the new URL if it's also cached.
-      setTimeout(autoPlayIfApplicable, 300);
+      // The overlay's auto-start notices the new URL on its own tick.
       return;
     }
     // Recycler / element swap — the active video is no longer the one we
@@ -762,7 +785,6 @@
     const active = findVideo();
     if (!active || (video && active !== video) || (video && !document.contains(video))) {
       stopPlayback();
-      setTimeout(autoPlayIfApplicable, 300);
     }
   }
 
@@ -789,6 +811,17 @@
   // consumed (cleared) inside the pause handler, never reset synchronously.
   let waProgrammatic = false;
   let waBuffering = false;        // want to play but the current section isn't ready yet
+  // When the manifest last gained a section. A dead stream is indistinguishable
+  // from a slow one except by how long nothing has arrived.
+  let waLastProgressAt = 0;
+  // Whether the server says this stream is queued behind another job.
+  let waWaitingForGpu = false;
+  // Automatic revives used since the viewer last pressed start. ONE, and reset
+  // only by an explicit start — not by progress. A per-stall budget would loop
+  // forever on a stream that always dies after one section, and re-submitting
+  // is not free: it wakes the GPU and interrupts the picture.
+  let waRevivesUsed = 0;
+  const WA_MAX_REVIVES = 1;
   let waLastPlayheadPost = 0;
 
   const WA_LOOKAHEAD = 15;        // seconds of sections to prefetch ahead of playhead
@@ -816,14 +849,21 @@
 
     attachWatchAlongListeners();
     attachNavigationListeners();
+    waLastProgressAt = Date.now();   // the clock starts when we start watching
     if (waPollHandle === null) waPollHandle = setInterval(pollWatchAlongSections, 2000);
     resetSyncWindow();
     startSyncTick();
     pollWatchAlongSections();
   }
 
-  function stopWatchAlong() {
+  function stopWatchAlong(reason) {
     if (!waActive) return;
+    // Named on purpose. The server log shows submit/stop pairs seconds apart —
+    // something tears a stream down right after the auto-start begins one —
+    // and `/stream/<key>/stop` records that it happened but not who asked.
+    // Every caller passes a reason so the next occurrence is evidence rather
+    // than another hypothesis.
+    console.warn(`[patmir] stopping the dub stream: ${reason || "unspecified"}`);
     // Tell the server to stop dubbing immediately — otherwise its scheduler
     // keeps running Scribe + ElevenLabs TTS over the rest of the video (paid)
     // even though we've stopped watching. Best-effort, fire-and-forget.
@@ -858,6 +898,9 @@
     if (!resp || !resp.ok || !resp.data) return;
     const data = resp.data;
     waComplete = !!data.complete;
+    // The server overlays the live record's status here. `waiting` means this
+    // stream is queued behind another job on the one GPU, not stalled.
+    waWaitingForGpu = data.status === "waiting";
     for (const s of data.sections || []) {
       const existing = waSections.get(s.index);
       if (existing) {
@@ -876,6 +919,7 @@
           index: s.index, start: s.start, end: s.end, file: s.file,
           buffer: null, fetching: false, node: null, startCtx: 0, startOffset: 0, rate: 1,
         });
+        waLastProgressAt = Date.now();
       }
     }
     // Evict entries the manifest no longer lists (deduplicated away server
@@ -1010,6 +1054,15 @@
     if (!usable) {
       stopAllNodes();
       driftSamples = [];
+      // The stall clock measures STARVATION, not "time since a new section".
+      // It only advanced when a new index arrived, so on a resumed stream —
+      // every cached section arrives in the first poll, then the viewer
+      // watches minutes of cached audio while the server preludes — the clock
+      // already read far past the limit the moment the playhead reached the
+      // coverage edge, and the single revive fired with zero grace against a
+      // live stream. Restart it when starvation begins; a section landing
+      // later moves it forward as before.
+      if (!waBuffering) waLastProgressAt = Math.max(waLastProgressAt, Date.now());
       if (S.isCovered(view, c)) {
         // A section claims this second but has no audio to give -- its WAV came
         // out shorter than its declared span. Nothing to play, but nothing to
@@ -1017,6 +1070,33 @@
         // move past the short section before the next one becomes current.
         waBuffering = false;
         reportPlayhead(false);
+      } else if (S.shouldAbandonStream({
+        buffering: true, complete: waComplete, waiting: waWaitingForGpu,
+        msSinceProgress: Date.now() - waLastProgressAt,
+      })) {
+        // Nothing has arrived for a minute: the stream is dead, not slow.
+        // Without this the client re-pauses on every tick, so pressing play
+        // stops the video a quarter second later — forever, with no error
+        // anywhere. Hand the video back and play the original.
+        const starvedFor = Math.round((Date.now() - waLastProgressAt) / 1000);
+        if (waRevivesUsed < WA_MAX_REVIVES) {
+          // Try once to get it going again; the server resumes from what is
+          // already cached. `reviveWatchAlong` restarts the stall clock.
+          reviveWatchAlong().then((ok) => {
+            if (ok) return;
+            console.warn("[patmir] re-submit failed — releasing the video.");
+            stopWatchAlong("stall-abandon");
+            if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
+          }).catch(() => {
+            stopWatchAlong("stall-abandon-revive-failed");
+            if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
+          });
+          return;
+        }
+        console.warn(`[patmir] no new dub section for ${starvedFor}s and the `
+          + `revive was already used — releasing the video.`);
+        stopWatchAlong("stall-abandon-error");
+        if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
       } else {
         // Genuine underrun: the dub for this point isn't produced yet. Freeze
         // the video; a later tick resumes once the section lands.
@@ -1097,7 +1177,7 @@
     stalled() { stopAllNodes(); resetSyncWindow(); },
     playing() { resetSyncWindow(); },
     ratechange() { stopAllNodes(); resetSyncWindow(); },
-    ended() { stopWatchAlong(); },
+    ended() { stopWatchAlong("video-ended"); },
     volumechange: onVolumeChange,
     emptied: onVideoSourceChangedWA,
     loadstart: onVideoSourceChangedWA,
@@ -1108,7 +1188,7 @@
     // Same ad exemption as the quality path — see onVideoSourceChanged.
     if (adState().showing) { updateAdState(); return; }
     const currentSrc = video ? (video.currentSrc || video.src || null) : null;
-    if (currentSrc !== videoSrcAtStart) stopWatchAlong();
+    if (currentSrc !== videoSrcAtStart) stopWatchAlong("source-changed");
   }
 
   function attachWatchAlongListeners() {
@@ -1142,7 +1222,6 @@
   setInterval(() => {
     if (window.location.href !== lastSeenUrl) {
       lastSeenUrl = window.location.href;
-      if (!playing) setTimeout(autoPlayIfApplicable, 300);
       for (const cb of urlChangeCallbacks.slice()) {
         try { cb(lastSeenUrl); } catch (_) { /* one bad subscriber, not all */ }
       }

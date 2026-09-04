@@ -50,6 +50,21 @@ async function getAudience() {
   return patmirAudience || DEFAULT_AUDIENCE;
 }
 
+/** Host match pattern for a server URL.
+ *
+ * Mirrors `hostPermissionPattern` in lib/server.js, which cannot be imported
+ * here — the service worker is a classic script, not a module. Kept to one
+ * line so the duplication is obvious rather than subtle.
+ */
+function hostPatternFor(server) {
+  try {
+    const u = new URL(server);
+    return `${u.protocol}//${u.hostname}/*`;
+  } catch (_) {
+    return "";
+  }
+}
+
 async function api(path, opts = {}) {
   const [token, server] = await Promise.all([getToken(), getServer()]);
   const headers = Object.assign({}, opts.headers || {}, {
@@ -58,9 +73,42 @@ async function api(path, opts = {}) {
   if (opts.body && !headers["Content-Type"]) {
     headers["Content-Type"] = "application/json";
   }
-  const res = await fetch(server + path, { ...opts, headers });
+  const method = opts.method || "GET";
+  let res;
+  try {
+    res = await fetch(server + path, { ...opts, headers });
+  } catch (cause) {
+    // `fetch` rejects the same way for a server that is down and for a host
+    // this extension has no permission for, and the message does not
+    // distinguish them — which is exactly how a LAN server spent an evening
+    // looking like a dead server on 2026-09-03. So ask.
+    let hint = "";
+    const pattern = hostPatternFor(server);
+    if (pattern) {
+      const allowed = await chrome.permissions
+        .contains({ origins: [pattern] })
+        .catch(() => null);
+      if (allowed === false) {
+        hint = ` The extension has no permission for ${pattern} — open the`
+             + ` options page, re-save the server address, and accept Chrome's`
+             + ` prompt.`;
+      }
+    }
+    // This module had ZERO console calls, so every failure below was silent
+    // and the only symptom was "it does not connect".
+    console.warn(`[patmir] ${method} ${server}${path} failed: ${cause.message}.${hint}`);
+    const err = new Error(
+      `Cannot reach the Patmir server at ${server}: ${cause.message}.${hint}`);
+    err.cause = cause;
+    throw err;
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    console.warn(`[patmir] ${method} ${server}${path} -> HTTP ${res.status}`
+                 + (res.status === 401
+                    ? " (token mismatch: re-copy the one `patmir ui` printed)"
+                    : "")
+                 + ` ${text.slice(0, 200)}`);
     const err = new Error("HTTP " + res.status + " " + path + ": " + text.slice(0, 200));
     err.status = res.status;
     throw err;

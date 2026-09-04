@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from patmir.pipeline.context import JobContext
+from patmir.pipeline.probe import probe_from_ctx
 from patmir.pipeline.stage import (
     Diarization,
     SpeakerRef,
@@ -32,6 +33,12 @@ from patmir.pipeline.stage import (
     SynthesizedSentence,
     TranslatedTranscript,
 )
+
+
+
+def _ref_seconds(ref: Any) -> float:
+    """Length of a reference clip's source window, in seconds."""
+    return float(ref.source_end - ref.source_start)
 
 
 class SentenceTTS:
@@ -100,7 +107,8 @@ class SentenceTTS:
         return r.ref_text.strip() != ""
 
     def _lookup_ref(self, diarization: Diarization | None, speaker_id: str | None, emotion: str | None,
-                    pin_speaker_ref: bool = False):
+                    pin_speaker_ref: bool = False,
+                    neutral_fraction: float = 0.5):
         """Fallback chain (Phase 2.x): preserve speaker identity first,
         emotion match second.
 
@@ -120,19 +128,46 @@ class SentenceTTS:
         if diarization is None or not speaker_id:
             return None
 
-        # Any usable ref for this speaker, longest source window first.
-        same_speaker = [
-            r for (spk, _bin), r in diarization.refs.items()
+        # Any usable ref for this speaker, keeping the emotion bin: the pin
+        # below needs it, and `refs` is keyed by `(speaker, bin)`.
+        same_binned = [
+            (bin_, r) for (spk, bin_), r in diarization.refs.items()
             if spk == speaker_id and self._usable(r)
         ]
-        # Pin one ref per speaker: ignore emotion entirely, always use the
-        # longest/cleanest same-speaker clip so the cloned voice never swaps
-        # mid-character. (Emotion varies via the TTS candidate's own emotion
-        # control — an inline `<|emotion:..|>` tag on the Higgs candidates.)
+        same_speaker = [r for _bin, r in same_binned]
+        # Pin one ref per speaker so the cloned voice never swaps mid-character
+        # (quality issue #11). Emotion varies via the TTS candidate's own
+        # control — an inline `<|emotion:..|>` tag on the Higgs candidates.
+        #
+        # Which clip, though, is not emotion-neutral. Higgs clones *prosody*
+        # from the reference, so pinning an angry clip makes a character
+        # deliver every line in the film angrily, calm ones included — and
+        # plain `max(duration)` picked a non-neutral clip in **26 of 34**
+        # speaker-runs measured (angry 10, happy 13, sad 3, neutral 8), because
+        # nothing was looking at the bin. That is a much larger contributor to
+        # "the characters are overdoing it" (quality issue #15) than the
+        # emotion tag, which by then reached only ~9% of sentences.
+        #
+        # So: prefer the neutral clip, but not at any price. A much shorter ref
+        # clones worse (the timbre drift noted on issue #24), so neutral has to
+        # be within `neutral_fraction` of the longest clip to win. One number,
+        # and it says what it means: never trade more than that share of
+        # reference length for neutrality. A value above 1.0 disables the
+        # preference, since a neutral clip cannot exceed the longest one — the
+        # same "out of range disables it" convention as
+        # `duplicate_containment`.
         if pin_speaker_ref:
-            if same_speaker:
-                return max(same_speaker, key=lambda r: r.source_end - r.source_start)
-            return None
+            if not same_binned:
+                return None
+            longest = max(same_speaker, key=_ref_seconds)
+            neutral = next((r for b, r in same_binned if b == "neutral"), None)
+            if (
+                neutral is not None
+                and neutral is not longest
+                and _ref_seconds(neutral) >= neutral_fraction * _ref_seconds(longest)
+            ):
+                return neutral
+            return longest
 
         emo = emotion or "neutral"
         ref = diarization.refs.get((speaker_id, emo))
@@ -230,6 +265,7 @@ class SentenceTTS:
         reset = getattr(self.inner, "reset_summary", None)
         if callable(reset):
             reset()
+        _maybe_arm_probe(ctx, self.inner)
         sentences: list[SynthesizedSentence] = []
         sample_rate = 0
 
@@ -248,11 +284,16 @@ class SentenceTTS:
             if not s.target_text.strip():
                 continue
             pin_ref = bool(getattr(ctx.options, "tts_pin_speaker_ref", True))
+            neutral_frac = float(getattr(ctx.options, "tts_pin_neutral_fraction", 0.5))
             ref = None
             if self._supports_ref:
                 ref = self._locked_ref(locked_refs, s.speaker_id)
                 if ref is None:
-                    ref = self._lookup_ref(diarization, s.speaker_id, s.emotion, pin_speaker_ref=pin_ref)
+                    ref = self._lookup_ref(
+                        diarization, s.speaker_id, s.emotion,
+                        pin_speaker_ref=pin_ref,
+                        neutral_fraction=neutral_frac,
+                    )
                 if ref is None:
                     ref = self._pool_ref(diarization, s.speaker_id, ref_pool_cfg, speaker_profiles)
             ref_audio = ref.ref_audio if ref is not None else None
@@ -392,6 +433,7 @@ class SentenceTTS:
         out = SynthesizedAudio(sentences=sentences, sample_rate=sample_rate)
         _write_index(ctx.job_dir, out)
         _maybe_write_cloning_summary(out_dir, self.inner)
+        _maybe_dump_probe(out_dir, self.inner)
         # Per-sentence latency trace — only when running under `patmir bench`
         # (ctx.extra["bench"]); a normal `patmir dub` leaves no timings file.
         if ctx.extra.get("bench") and bench_rows:
@@ -424,6 +466,31 @@ def _write_index(job_dir: Path, synth: SynthesizedAudio) -> None:
         ],
     }
     (job_dir / "synthesized.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _maybe_arm_probe(ctx: Any, inner: Any) -> None:
+    """Arm the candidate's intra-stage probe when running under `patmir bench`.
+
+    Duck-typed on a `probe` attribute, like `summarize()` next door: a candidate
+    without one is simply not instrumented. The probe lives on the candidate,
+    which lives in the warm `stage_cache` across jobs, so it must be re-armed
+    (and reset) per job rather than at construction.
+    """
+    probe = getattr(inner, "probe", None)
+    if probe is None:
+        return
+    try:
+        probe_from_ctx(ctx, probe, stage="tts")
+    except Exception as exc:  # noqa: BLE001
+        print(f"tts: probe arm failed ({type(exc).__name__}: {exc})")
+
+
+def _maybe_dump_probe(tts_dir: Path, inner: Any) -> None:
+    """Write `tts/bench_probe.json` if the candidate carries an armed probe."""
+    probe = getattr(inner, "probe", None)
+    if probe is None:
+        return
+    probe.dump(tts_dir / "bench_probe.json")
 
 
 def _maybe_write_cloning_summary(tts_dir: Path, inner: Any) -> None:

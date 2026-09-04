@@ -1,0 +1,270 @@
+{
+  "results": [
+    {
+      "clip": "samples/sample_1.mkv",
+      "mode": "batch",
+      "label": "probe",
+      "repeat_index": 0,
+      "job_id": "20260901-020038-sample_1",
+      "source_s": 301.11,
+      "total_wall_s": 150.16,
+      "agg_rtf": 0.499,
+      "stages": [
+        {
+          "name": "ingest",
+          "state": "done",
+          "wall_s": 0.42,
+          "build_s": 0.0,
+          "rtf": 0.001,
+          "pct": 0.3
+        },
+        {
+          "name": "separate",
+          "state": "done",
+          "wall_s": 9.51,
+          "build_s": 0.57,
+          "rtf": 0.032,
+          "pct": 6.3
+        },
+        {
+          "name": "diarize",
+          "state": "done",
+          "wall_s": 8.9,
+          "build_s": 7.31,
+          "rtf": 0.03,
+          "pct": 5.9
+        },
+        {
+          "name": "emotion",
+          "state": "done",
+          "wall_s": 6.86,
+          "build_s": 4.48,
+          "rtf": 0.023,
+          "pct": 4.6
+        },
+        {
+          "name": "asr",
+          "state": "done",
+          "wall_s": 21.37,
+          "build_s": 5.43,
+          "rtf": 0.071,
+          "pct": 14.2
+        },
+        {
+          "name": "translate",
+          "state": "done",
+          "wall_s": 14.44,
+          "build_s": 0.01,
+          "rtf": 0.048,
+          "pct": 9.6
+        },
+        {
+          "name": "tts",
+          "state": "done",
+          "wall_s": 78.09,
+          "build_s": 4.27,
+          "rtf": 0.259,
+          "pct": 52.0
+        },
+        {
+          "name": "mux",
+          "state": "done",
+          "wall_s": 4.69,
+          "build_s": 0.0,
+          "rtf": 0.016,
+          "pct": 3.1
+        },
+        {
+          "name": "output",
+          "state": "done",
+          "wall_s": 5.88,
+          "build_s": 0.0,
+          "rtf": 0.02,
+          "pct": 3.9
+        }
+      ],
+      "sentence_count": 75,
+      "tts": {
+        "unit": "chunk",
+        "count": 10,
+        "total_s": 72.69,
+        "mean_s": 7.269,
+        "median_s": 5.756,
+        "p90_s": 10.405,
+        "max_s": 14.202,
+        "audio_s": 223.32,
+        "tts_rtf": 0.325,
+        "chunks": 10,
+        "chunk_sentences": 75,
+        "sentences_per_chunk": 7.5,
+        "engine": "higgs_v3_torch_bfloat16",
+        "sentences": 75,
+        "overflows": 0
+      },
+      "translate": {
+        "count": 75,
+        "total_s": 84.64,
+        "mean_ms": 1128.5,
+        "median_ms": 1073.8,
+        "p90_ms": 1483.8,
+        "max_ms": 2328.5
+      },
+      "models": {
+        "ingest": "ffmpeg",
+        "separate": "htdemucs_vocals",
+        "diarize": "sortformer_nemo",
+        "emotion": "emotion2vec_plus_base",
+        "asr": "qwen3_asr_1_7b",
+        "translate": "openrouter_gemini_flash",
+        "tts": "higgs_v3_torch_bf16",
+        "mux": "ffmpeg_pad_stretch",
+        "output": "mkv_default"
+      },
+      "sections": null,
+      "notes": {
+        "build_pct_of_wall": 14.7,
+        "peak_vram_gb": 15.81,
+        "peak_vram_reserved_gb": 15.99,
+        "vram_free_gb": 7.88,
+        "peak_rss_gb": 10.84
+      },
+      "profile": "cuda",
+      "warm_cache": true,
+      "warm": false,
+      "build_total_s": 22.07
+    },
+    {
+      "clip": "samples/sample_1.mkv",
+      "mode": "batch",
+      "label": "probe",
+      "repeat_index": 1,
+      "job_id": "20260901-020309-sample_1",
+      "source_s": 301.11,
+      "total_wall_s": 117.65,
+      "agg_rtf": 0.391,
+      "stages": [
+        {
+          "name": "ingest",
+          "state": "done",
+          "wall_s": 0.42,
+          "build_s": 0.0,
+          "rtf": 0.001,
+          "pct": 0.4
+        },
+        {
+          "name": "separate",
+          "state": "done",
+          "wall_s": 8.8,
+          "build_s": 0.0,
+          "rtf": 0.029,
+          "pct": 7.5
+        },
+        {
+          "name": "diarize",
+          "state": "done",
+          "wall_s": 1.45,
+          "build_s": 0.0,
+          "rtf": 0.005,
+          "pct": 1.2
+        },
+        {
+          "name": "emotion",
+          "state": "done",
+          "wall_s": 2.52,
+          "build_s": 0.0,
+          "rtf": 0.008,
+          "pct": 2.1
+        },
+        {
+          "name": "asr",
+          "state": "done",
+          "wall_s": 16.51,
+          "build_s": 0.0,
+          "rtf": 0.055,
+          "pct": 14.0
+        },
+        {
+          "name": "translate",
+          "state": "done",
+          "wall_s": 13.8,
+          "build_s": 0.0,
+          "rtf": 0.046,
+          "pct": 11.7
+        },
+        {
+          "name": "tts",
+          "state": "done",
+          "wall_s": 63.92,
+          "build_s": 0.0,
+          "rtf": 0.212,
+          "pct": 54.3
+        },
+        {
+          "name": "mux",
+          "state": "done",
+          "wall_s": 4.41,
+          "build_s": 0.0,
+          "rtf": 0.015,
+          "pct": 3.7
+        },
+        {
+          "name": "output",
+          "state": "done",
+          "wall_s": 5.82,
+          "build_s": 0.0,
+          "rtf": 0.019,
+          "pct": 4.9
+        }
+      ],
+      "sentence_count": 79,
+      "tts": {
+        "unit": "chunk",
+        "count": 10,
+        "total_s": 63.42,
+        "mean_s": 6.342,
+        "median_s": 5.714,
+        "p90_s": 9.959,
+        "max_s": 11.24,
+        "audio_s": 216.32,
+        "tts_rtf": 0.293,
+        "chunks": 10,
+        "chunk_sentences": 79,
+        "sentences_per_chunk": 7.9,
+        "engine": "higgs_v3_torch_bfloat16",
+        "sentences": 79,
+        "overflows": 0
+      },
+      "translate": {
+        "count": 79,
+        "total_s": 80.94,
+        "mean_ms": 1024.5,
+        "median_ms": 1011.9,
+        "p90_ms": 1232.9,
+        "max_ms": 1925.4
+      },
+      "models": {
+        "ingest": "ffmpeg",
+        "separate": "htdemucs_vocals",
+        "diarize": "sortformer_nemo",
+        "emotion": "emotion2vec_plus_base",
+        "asr": "qwen3_asr_1_7b",
+        "translate": "openrouter_gemini_flash",
+        "tts": "higgs_v3_torch_bf16",
+        "mux": "ffmpeg_pad_stretch",
+        "output": "mkv_default"
+      },
+      "sections": null,
+      "notes": {
+        "build_pct_of_wall": 0.0,
+        "peak_vram_gb": 16.42,
+        "peak_vram_reserved_gb": 16.98,
+        "vram_free_gb": 7.88,
+        "peak_rss_gb": 10.84
+      },
+      "profile": "cuda",
+      "warm_cache": true,
+      "warm": true,
+      "build_total_s": 0.0
+    }
+  ]
+}

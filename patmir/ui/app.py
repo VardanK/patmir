@@ -7,7 +7,10 @@ Two surfaces live here:
   and the `patmir submit` CLI: `POST /jobs`, `GET /cache/lookup`,
   `GET /jobs/{id}`, `GET /cache/{key}/dub.wav`, `GET /cache/{key}/metadata.json`.
 
-Bound to `127.0.0.1` only; bearer-token auth gates every new endpoint. The
+Binds `127.0.0.1` by default; `patmir ui --host 0.0.0.0` opens it to the
+network, which is opt-in because the five `/run/...` progress routes have no
+auth and a job id is a guessable timestamp. Bearer-token auth gates every new
+endpoint. The
 existing `/`, `/run/{id}`, `/run/{id}/progress` routes stay open for the
 browser progress UI on the same loopback origin.
 """
@@ -58,6 +61,9 @@ def _create_app(
     storage = replace(storage, runs_root=runs_root, cache_root=cache_root)
 
     require_token = auth.TokenAuth(token)
+    # The browser-navigated progress pages: open from the machine itself, or
+    # with the token from anywhere else (see `auth.LoopbackOrToken`).
+    progress_auth = auth.LoopbackOrToken(require_token)
     # One warm-model cache for the whole process, shared by batch jobs and
     # streams. Keyed (stage, candidate_id) so the streaming overrides cannot
     # collide with the batch config. Without this every submission rebuilt every
@@ -139,7 +145,7 @@ def _create_app(
             raise HTTPException(status_code=404, detail="no such run")
         return candidate
 
-    @app.get("/", response_class=HTMLResponse)
+    @app.get("/", response_class=HTMLResponse, dependencies=[Depends(progress_auth)])
     def index(request: Request):
         rows = []
         if runs_root.exists():
@@ -158,7 +164,7 @@ def _create_app(
                 })
         return TEMPLATES.TemplateResponse(request, "index.html", {"runs": rows})
 
-    @app.get("/run/{job_id}", response_class=HTMLResponse)
+    @app.get("/run/{job_id}", response_class=HTMLResponse, dependencies=[Depends(progress_auth)])
     def run_detail(request: Request, job_id: str):
         job_dir = _safe_job_dir(job_id)
         m = Manifest.from_path(job_dir / "manifest.json")
@@ -178,7 +184,7 @@ def _create_app(
             },
         )
 
-    @app.get("/run/{job_id}/progress")
+    @app.get("/run/{job_id}/progress", dependencies=[Depends(progress_auth)])
     async def progress_sse(job_id: str):
         job_dir = _safe_job_dir(job_id)
         path = job_dir / "progress.jsonl"
@@ -204,7 +210,7 @@ def _create_app(
 
         return StreamingResponse(stream(), media_type="text/event-stream")
 
-    @app.get("/run/{job_id}/file/{rest:path}")
+    @app.get("/run/{job_id}/file/{rest:path}", dependencies=[Depends(progress_auth)])
     def serve_artifact(job_id: str, rest: str):
         job_dir = _safe_job_dir(job_id)
         target = (job_dir / rest).resolve()
@@ -214,7 +220,7 @@ def _create_app(
             raise HTTPException(status_code=404, detail="not found")
         return FileResponse(target)
 
-    @app.get("/run/{job_id}/transcript.json")
+    @app.get("/run/{job_id}/transcript.json", dependencies=[Depends(progress_auth)])
     def transcript(job_id: str):
         job_dir = _safe_job_dir(job_id)
         path = job_dir / "transcript.json"
@@ -410,6 +416,7 @@ def _is_valid_key(key: str) -> bool:
 
 def serve(
     *,
+    host: str = "127.0.0.1",
     port: int = 8765,
     storage: StoragePaths | None = None,
     cfg: PipelineConfig | None = None,
@@ -432,4 +439,8 @@ def serve(
         token=token,
         config_path=config_path,
     )
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    # `log_config=None`: uvicorn otherwise installs its own handlers and sets
+    # `propagate = False`, which puts its request lines out of reach of the
+    # rotating file log. With it None, everything propagates to the root
+    # handlers `setup_file_logging` installed — one place decides.
+    uvicorn.run(app, host=host, port=port, log_config=None)

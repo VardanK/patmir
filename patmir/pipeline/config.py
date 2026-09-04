@@ -321,7 +321,10 @@ def load_pipeline_config(
         voice_max_compress=float(opts_raw.get("voice_max_compress", 1.5)),
         prelude_window_seconds=float(opts_raw.get("prelude_window_seconds", 40.0)),
         prewarm_stages=bool(opts_raw.get("prewarm_stages", True)),
+        section_prefetch=bool(opts_raw.get("section_prefetch", True)),
         ref_min_rms_db=float(opts_raw.get("ref_min_rms_db", -33.0)),
+        tts_pin_neutral_fraction=float(
+            opts_raw.get("tts_pin_neutral_fraction", 0.5)),
         # A bad value here is a hard load error, not a silent fall back to the
         # default -- same stance as an unknown profile name. A config that says
         # "child" and quietly runs "adult" is the failure this feature exists to

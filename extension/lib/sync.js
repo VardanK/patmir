@@ -362,7 +362,47 @@
     return false;
   }
 
+  // How long the picture may stay frozen waiting for audio that never comes
+  // before the dub gives up and hands the video back.
+  //
+  // Watch-along pauses the <video> on a genuine underrun and resumes when the
+  // section lands. If the server-side stream DIES, no section ever lands: the
+  // client keeps polling, keeps finding nothing at the playhead, and re-pauses
+  // on every 250 ms tick — so pressing play stops the video a quarter second
+  // later, forever. That is what a dead stream looked like to the author, with
+  // no error anywhere, and nothing in the client noticed.
+  //
+  // 60 s because production runs ~2.6x realtime over ~36 s sections, so one
+  // lands roughly every 14 s; four missed in a row is not a slow section.
+  var STREAM_STALL_MS = 60000;
+
+  /**
+   * Should the dub give up and let the original audio play?
+   *
+   * True only while actually starved AND nothing new has arrived for
+   * `limitMs`. A paused viewer is not starved, and a complete stream has
+   * nothing left to wait for.
+   */
+  function shouldAbandonStream(state) {
+    var s = state || {};
+    if (!s.buffering) return false;              // not waiting on anything
+    if (s.complete) return false;                // everything is on disk
+    // Queued behind another job is NOT dead. Only one pipeline fits on the
+    // card, so a second stream reports `waiting` and produces nothing until
+    // the first finishes — which looked exactly like a dead stream to the
+    // 60 s rule, so it was abandoned, revived, and abandoned again. Two
+    // machines watching at once is what surfaced it: submit/stop pairs
+    // seconds apart and a video that stopped mid-translation.
+    if (s.waiting) return false;
+    var limit = typeof s.limitMs === "number" ? s.limitMs : STREAM_STALL_MS;
+    var since = s.msSinceProgress;
+    if (typeof since !== "number" || !isFinite(since)) return false;
+    return since >= limit;
+  }
+
   return {
+    STREAM_STALL_MS: STREAM_STALL_MS,
+    shouldAbandonStream: shouldAbandonStream,
     HAVE_FUTURE_DATA: HAVE_FUTURE_DATA,
     SECTION_LEAD: SECTION_LEAD,
     DEFAULT_AD_SEEK_ATTEMPTS: DEFAULT_AD_SEEK_ATTEMPTS,

@@ -73,29 +73,29 @@ SAMPLE_RATE = 16_000
 # Minimum transformers release carrying `models/qwen3_asr` (added 5.13.0).
 MIN_TRANSFORMERS = (5, 13)
 
-# Qwen3-ASR reports the language as a full English name ("English", "Russian").
-# Downstream pipeline stages expect ISO 639-1.
-_FULL_TO_ISO: dict[str, str] = {
-    "english": "en",
-    "russian": "ru",
-    "armenian": "hy",
-}
+# Language detection budget. The model emits `language <LANG><asr_text>...`, so
+# the tag arrives BEFORE any transcription — detecting the language never
+# needed a full transcription of a 28 s chunk, which is what it was doing:
+# measured 4.4-4.7 s of a 15.2 s warm stage, with the text then discarded.
+#
+# Both numbers are budgets, not guesses about the model: the probe VALIDATES
+# that it got a tag and falls back to the full transcription if it did not, so
+# too small a budget costs one wasted call and never a wrong language. That
+# matters because a silently-missing tag parses as `None` and would fall back
+# to English, mislabelling a Russian soundtrack.
+LANG_PROBE_SECONDS = 8.0
+LANG_PROBE_TOKENS = 24
+
+# Language-tag normalization is shared with the other Qwen3-ASR candidate
+# (`_language.py`) so the two runtimes cannot disagree about what a tag
+# means. `_to_iso` returns None for anything it does not recognise —
+# the callers rely on that to fall back to a full probe.
+from patmir.pipeline.stages.asr._language import FULL_TO_ISO as _FULL_TO_ISO, to_iso as _to_iso
 
 # The forced aligner covers a subset of the ASR languages (ISO codes for the
 # set documented on the model card). Japanese additionally needs `nagisa` and
 # Korean `soynlp`; a missing one surfaces as ImportError and is caught.
 _ALIGNER_LANGS = frozenset({"zh", "en", "yue", "fr", "de", "it", "ja", "ko", "pt", "ru", "es"})
-
-
-def _to_iso(language: str | None) -> str | None:
-    if not language:
-        return None
-    key = language.strip().lower()
-    if key in _FULL_TO_ISO:
-        return _FULL_TO_ISO[key]
-    if len(key) == 2 and key.isalpha():
-        return key
-    return key.split()[0]
 
 
 def _resolve_device(requested: str) -> str:
@@ -263,7 +263,8 @@ class Qwen3ASRTorch:
     # ---- ASR -------------------------------------------------------------
 
     def _transcribe_batch(
-        self, clips: list[np.ndarray], language: str | None
+        self, clips: list[np.ndarray], language: str | None,
+        max_new_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
         import torch  # type: ignore[import-not-found]
 
@@ -273,7 +274,10 @@ class Qwen3ASRTorch:
         ).to(self.model.device, self.model.dtype)
 
         with torch.inference_mode():
-            output_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens)
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens or self.max_new_tokens,
+            )
         generated = output_ids[:, inputs["input_ids"].shape[1]:]
         parsed = self.processor.decode(generated, return_format="parsed")
         return list(parsed)
@@ -305,12 +309,32 @@ class Qwen3ASRTorch:
             timestamp_token_id=self.aligner.config.timestamp_token_id,
         ))
 
+    def _detect_language(self, clip: np.ndarray) -> str | None:
+        """Read the language tag without transcribing the clip.
+
+        Two economies over the full-transcription probe it replaces: only the
+        first `LANG_PROBE_SECONDS` of audio reach the encoder, and generation
+        stops after `LANG_PROBE_TOKENS` instead of `max_new_tokens` (256).
+        The tag precedes the transcription in the model's output format, so
+        neither truncation can hide it.
+
+        Returns None when the output carried no tag — the caller then pays for
+        the full probe rather than defaulting to a language.
+        """
+        head = clip[: int(LANG_PROBE_SECONDS * SAMPLE_RATE)]
+        if head.size == 0:
+            return None
+        out = self._transcribe_batch([head], None,
+                                     max_new_tokens=LANG_PROBE_TOKENS)
+        return _to_iso(out[0].get("language") if out else None)
+
     def transcribe(self, audio: AudioTrack, ctx: JobContext) -> Transcript:
         ctx.progress("asr", 0.02, f"qwen3-asr ({self.model_id}) on {self.device}")
         samples = self._load_audio(audio)
 
         vad: list[tuple[float, float]] | None = ctx.extra.get("vad_intervals")
         chunks = build_chunks(audio.duration, vad, self.chunk_seconds)
+        ctx.probe.bump("n_chunks", len(chunks))
         if not chunks:
             return Transcript(language=ctx.source_lang or "en", words=[], sentences=[])
 
@@ -326,16 +350,28 @@ class Qwen3ASRTorch:
         # which is a documented source of foreign-script hallucination.
         language = ctx.source_lang
         if not language:
+            # The longest chunk is the most-speech one, so its opening is the
+            # best few seconds available to detect on.
             longest = max(range(len(clips)), key=lambda i: len(clips[i]))
-            probe = self._transcribe_batch([clips[longest]], None)
-            language = _to_iso(probe[0].get("language") if probe else None) or "en"
+            with ctx.probe.section("probe_s"):
+                language = self._detect_language(clips[longest])
+                if language is None:
+                    # No tag in the short output. Pay for the full-length probe
+                    # rather than guess: the fallback path is what makes the
+                    # budgets above safe to tune.
+                    ctx.probe.bump("probe_fallbacks")
+                    full = self._transcribe_batch([clips[longest]], None)
+                    language = _to_iso(full[0].get("language") if full else None)
+            language = language or "en"
             ctx.progress("asr", 0.08, f"detected {language}")
         ctx.source_lang = language
 
         results: list[dict[str, Any]] = []
         for offset in range(0, len(clips), self.batch_size):
             batch = clips[offset:offset + self.batch_size]
-            results.extend(self._transcribe_batch(batch, language))
+            with ctx.probe.section("generate_s"):
+                results.extend(self._transcribe_batch(batch, language))
+            ctx.probe.bump("n_generate_batches")
             done = min(len(clips), offset + self.batch_size)
             ctx.progress("asr", 0.08 + 0.62 * done / len(clips), f"decoded {done}/{len(clips)}")
 
@@ -351,9 +387,11 @@ class Qwen3ASRTorch:
             for offset in range(0, len(indices), self.batch_size):
                 group = indices[offset:offset + self.batch_size]
                 try:
-                    aligned = self._align_batch(
-                        [clips[i] for i in group], [texts[i] for i in group], language,
-                    )
+                    with ctx.probe.section("align_s"):
+                        aligned = self._align_batch(
+                            [clips[i] for i in group], [texts[i] for i in group], language,
+                        )
+                    ctx.probe.bump("n_align_batches")
                 except ImportError as exc:
                     # ja/ko word splitting needs an optional tokenizer package.
                     ctx.progress("asr", 0.8, f"aligner unavailable ({exc}) — chunk-level timings")

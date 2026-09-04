@@ -87,3 +87,46 @@ class TokenAuth:
                 detail="Missing or invalid bearer token.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+
+
+def _is_loopback_client(request: Request) -> bool:
+    client = request.client
+    if client is None:
+        return False
+    host = (client.host or "").strip().lower()
+    # A peer address is always numeric, never a hostname. `::ffff:127.x` is
+    # how an IPv4 loopback peer is reported on a dual-stack socket (`--host ::`).
+    return (host == "::1" or host.startswith("127.")
+            or host.startswith("::ffff:127."))
+
+
+class LoopbackOrToken:
+    """FastAPI dependency for the human-facing progress pages (`/`, `/run/*`).
+
+    Those routes predate the token and are opened in a browser by navigation,
+    which sends no Authorization header — so they cannot simply take
+    `TokenAuth`, or the local progress UI stops working. Before this they took
+    nothing at all, which was fine on `127.0.0.1` and was a leak under
+    `patmir ui --host 0.0.0.0`: `/` enumerates every job id and source path,
+    and `/run/<id>/file/<path>` then serves the source audio, the dub and the
+    transcript to anyone on the network.
+
+    A request from the machine itself (loopback client address) passes as
+    before; anything else must carry the bearer token like the `/jobs` API.
+
+    The test is on the PEER address as uvicorn reports it. Behind a same-host
+    reverse proxy that sets `X-Forwarded-For`, uvicorn's default proxy
+    middleware (trusted hosts `127.0.0.1`, chain walked right to left) rewrites
+    the client to the real remote address, so the gate still demands the
+    token; a proxy that does NOT set that header makes every request look
+    local and opens the gate — configure the proxy, or require the token
+    unconditionally, before putting one in front of this server.
+    """
+
+    def __init__(self, token_auth: TokenAuth) -> None:
+        self._token_auth = token_auth
+
+    def __call__(self, request: Request) -> None:
+        if _is_loopback_client(request):
+            return
+        self._token_auth(request)

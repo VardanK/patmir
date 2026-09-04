@@ -28,9 +28,17 @@ from patmir.pipeline.stages.separate.htdemucs import _split_vocals_with_vad
 class HTDemucsMLX:
     id = "htdemucs_mlx"
 
-    def __init__(self, model_name: str = "htdemucs_ft", shifts: int = 1, overlap: float = 0.25,
+    def __init__(self, model_name: str = "htdemucs_ft", shifts: int = 0, overlap: float = 0.25,
                  vocals_only: bool = False) -> None:
         from demucs_mlx import Separator  # lazy import (heavy)
+
+        # shifts=0, not demucs' default 1 — see the long note in the torch
+        # candidate's `__init__`. One random shift is not an average, and the
+        # offset comes from an unseeded `random`, so the default made every run
+        # produce a different vocal stem and re-rolled reference clips, emotion
+        # labels and the translator's prompt underneath it. Quality issue #28.
+        # This candidate is kept in lockstep with the torch twin so the two
+        # machines cannot disagree about reproducibility.
 
         # Vocals-only mode: run JUST the ft vocals-specialist sub-model instead of
         # the 4-model htdemucs_ft bag. The bag's vocals stem comes 100% from this
@@ -150,7 +158,7 @@ class HTDemucsMLX:
 def build(config: dict[str, Any]) -> HTDemucsMLX:
     return HTDemucsMLX(
         model_name=config.get("model", "htdemucs_ft"),
-        shifts=int(config.get("shifts", 1)),
+        shifts=int(config.get("shifts", 0)),
         overlap=float(config.get("overlap", 0.25)),
         vocals_only=bool(config.get("vocals_only", False)),
     )

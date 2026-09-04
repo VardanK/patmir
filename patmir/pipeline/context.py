@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from patmir.pipeline.probe import Probe
+
 
 class JobCancelled(Exception):
     """Raised at a checkpoint when the job's cancel token has been set.
@@ -163,6 +165,13 @@ class PipelineOptions:
     # windows fail the floor, the longest still wins (never drop a speaker's
     # only ref). Quality issue #12.
     ref_min_rms_db: float = -33.0
+    # Pinning one ref per speaker (`tts_pin_speaker_ref`) used to take the
+    # longest clip regardless of its emotion bin, and Higgs clones prosody
+    # from the reference — so a character whose longest clip was angry
+    # delivered the whole film angrily. Prefer the neutral clip when it is at
+    # least this share of the longest one's length; above 1.0 disables the
+    # preference. Quality issue #15.
+    tts_pin_neutral_fraction: float = 0.5
     # Watch-along only: seconds of the opening analyzed in the prelude to
     # establish the cast before playback starts. Smaller = faster time-to-first
     # -audio, but fewer characters are seen up front (later ones register on the
@@ -174,6 +183,13 @@ class PipelineOptions:
     # ~10 GB with the current models — so set False on a memory-constrained box
     # or when the server is started just to browse finished runs.
     prewarm_stages: bool = True
+    # Watch-along: analyse the next section while this one waits on the
+    # translate round-trip. Translate is 44.2 s of a 153.9 s watch-along wall
+    # (29%) as one cloud call per section, with the GPU idle throughout;
+    # analysis is the GPU work that fits in that gap. A single lock keeps GPU
+    # phases serialized, which the TTS CUDA-graph capture requires. False
+    # restores the fully serial section loop.
+    section_prefetch: bool = True
     # Age register the translator is steered toward: "child" | "teenager" |
     # "adult". Prompt-only softening -- gentler wording, never a dropped,
     # blanked or bleeped line.
@@ -218,6 +234,12 @@ class JobContext:
     # (vad_intervals, diarization, emotion_predictions — see pipeline.md), and a
     # control signal is not that.
     cancel: threading.Event | None = None
+    # Intra-stage timing, armed by `run_job` only when `extra["bench"]` is set
+    # and reset+dumped per stage by the runner. A separate field for the same
+    # reason `cancel` is: `extra` is the cross-stage DATA hand-off channel, and
+    # an instrument is not data. Disabled by default and free on the hot path —
+    # `section()` returns a shared no-op context manager.
+    probe: Probe = field(default_factory=Probe)
 
     def cancelled(self) -> bool:
         return self.cancel is not None and self.cancel.is_set()

@@ -104,6 +104,17 @@ timeout_seconds = 60.0
 # `effort=minimal` keeps reasoning_tokens at 0, halves latency (~2s vs ~4s
 # per sentence), and drops per-call cost ~30×. Verified 2026-05-26.
 reasoning   = { effort = "minimal" }
+# Sentences are independent round-trips (~1.1 s each, TTFT-dominated), so the
+# only thing bounding this stage is how many are in flight. At 6 it was ~16 s
+# of a ~108 s warm batch wall with the GPU idle throughout. Retries below cover
+# the 429s a higher number risks.
+#
+# `concurrency`, `max_attempts` and `retry_backoff_s` are deliberately EXCLUDED
+# from `ui.cache.config_hash` (see `_NON_OUTPUT_KEYS`): they cannot change a
+# sample, so tuning throughput must not re-dub a finished library.
+concurrency     = 12
+max_attempts    = 3
+retry_backoff_s = 0.5
 
 # Batched + structured-output variant of the same Gemini Flash backend.
 # Translates N sentences per call (default 20) with a 2-sentence sliding
@@ -132,6 +143,14 @@ timeout_seconds = 120.0
 chunk_size      = 20
 overlap         = 2
 reasoning       = { effort = "minimal" }
+# Same throughput knobs as the per-sentence candidate above, and excluded from
+# `config_hash` the same way. They reach the per-sentence FALLBACK this
+# candidate degrades to (a chunk that fails validation becomes `chunk_size`
+# single calls), which is the only place concurrency matters here — each
+# section is one chunk and makes one call. Watch-along runs this candidate.
+concurrency     = 12
+max_attempts    = 3
+retry_backoff_s = 0.5
 
 [[eval.translation.candidates]]
 id          = "openrouter_claude_opus"
@@ -478,7 +497,49 @@ temperature   = 0.8
 top_p         = 0.95
 seed          = 0
 max_retries   = 2
-max_batch     = 8
+# Swept 8/12/16 on the 3090 2026-09-02 (warm, sample_1, with the decode graph;
+# the sweep was meaningless before it, since a launch-bound step barely cares
+# how wide the batch is):
+#
+#   B    ms/step   tts wall   capture   chunks   steps   live rows   ovf   agg RTF
+#   8      17.19     29.14s     7.34s       10    1160       0.647     0     0.234
+#   12     18.11     23.84s     5.96s        7     888       0.592     0     0.218
+#   16     19.14     27.03s     5.31s        6    1032       0.468     1     0.228
+#
+# 12 wins, and 16 LOSES — which is the interesting part. Per-step cost rises
+# monotonically with B (more KV to read, more attention), so the gain has to
+# come from fewer chunks. But a chunk costs `max(steps)` over its rows, so a
+# wider batch also widens the token-cap spread inside each chunk: at 16 total
+# steps went UP (888 -> 1032) despite one fewer chunk, over half the row-steps
+# were spent on already-retired rows (live 0.468), and it produced the first
+# overflow measured in this work. VRAM was never the binding constraint
+# (16.5-17.4 GB peak, ~7.5 GB free throughout).
+max_batch     = 12
+# Grouped-query kernel for the single-token decode step (2026-09-02). Skips
+# transformers' `repeat_kv`, which expands 8 KV heads to 32 on every layer of
+# every step because `use_gqa_in_sdpa` is False whenever an attention mask is
+# present. With the CUDA graph it takes the step 27.15 -> 17.33 ms and the
+# pipeline to agg RTF 0.277. Prefill still runs transformers' own sdpa kernel.
+#
+# **Set here rather than defaulted in code because it changes the audio.** The
+# reduction order differs, so at temperature 0.8 draws flip and all 80 lines of
+# the reference clip re-roll (durations move up to 1.24 s; total speech within
+# 1.4%; reproducible run to run). `ui.cache.config_hash` hashes this entry, so
+# having it here correctly invalidates cached dubs — the alternative would let
+# one cache key hold either rendering. Enabling it re-dubs every cached video
+# once, the same price the audience guardrail paid on 2026-08-28.
+#
+# Author ear-test 2026-09-02 on `runs/20260902-230429-sample_1`: "sounds a
+# little better" than the sdpa rendering. Read as neutral-to-positive rather
+# than as an improvement — issue #19 measured this TTS's draws spreading
+# 2.4-27.9 dB on identical input, so one sample cannot establish a direction.
+# What it does establish is that the faster kernel is not worse. Revert by
+# setting "sdpa".
+decode_attention = "gqa"
+# CUDA graph capture of the decode step is on by default in code and NOT a key
+# here on purpose: it is bitwise identical (verified md5-for-md5 on 80 WAVs),
+# so it must not perturb the cache key. Disable for debugging with
+# PATMIR_TTS_CUDA_GRAPHS=0.
 
 [[eval.tts.candidates]]
 id            = "omnivoice_mlx_bf16"
@@ -774,7 +835,14 @@ tts       = "higgs_v3_torch_bf16"  # same Higgs v3 model, upstream transformers 
 # exist off Apple Silicon. `translate` is left alone — the batched OpenRouter
 # candidate that override selects is cloud and platform-independent.
 [pipeline.profiles.cuda.streaming]
-separate  = "htdemucs_fast"        # base single-model torch Demucs
+# Unified with batch 2026-09-03. Both are SINGLE models, so this is not the
+# 4-model bag: the vocals specialist costs about what the base model costs and
+# gives the better vocal stem, which is upstream of ASR, diarization and which
+# window becomes each character's reference clip. It also means one Demucs
+# resident instead of two, which matters on a 24 GB card — the same argument
+# that unified the TTS candidate on 2026-08-23. Author's call; it was Task 9 of
+# the 2026-09-02 perf plan and had been left undone.
+separate  = "htdemucs_vocals"      # ft vocals specialist (sig 04573f0d), as batch
 
 [pipeline.options]
 stretch_cap            = 0.20    # max ±20% time-stretch ratio per sentence (preserves pitch)
@@ -785,6 +853,15 @@ voice_gain_db          = -3.0    # global trim on top of the per-sentence RMS ma
 min_ref_seconds        = 1.5     # shortest clean turn that qualifies as a (speaker, emotion) ref clip (ElevenLabs IVC accepts ≥1 s; 1.5 leaves headroom)
 sentence_afade_seconds = 0.05    # per-sentence fade in/out on the AR voice (suppresses boundary bleed — quality issue #4)
 ref_min_rms_db         = -33.0   # loudness floor for ref-clip windows; quieter slices lose to louder eligible ones (quality issue #12)
+# Which clip the per-speaker pin chooses is not emotion-neutral: Higgs clones
+# PROSODY from the reference, so pinning an angry clip makes a character deliver
+# the whole film angrily. Plain "longest wins" picked a non-neutral clip in 26 of
+# 34 speaker-runs measured (angry 10, happy 13, sad 3, neutral 8). Prefer the
+# neutral clip when it is at least this share of the longest one's length — a far
+# shorter reference clones worse, so neutrality is not worth any price. Above 1.0
+# disables the preference (a neutral clip cannot exceed the longest), the same
+# convention as `duplicate_containment`. Quality issue #15.
+tts_pin_neutral_fraction = 0.5
 
 # Age register the translator is steered toward: "child" | "teenager" | "adult".
 # Prompt-only softening — gentler wording, never a dropped, blanked or bleeped
@@ -851,7 +928,11 @@ module = "patmir.pipeline.stages.ingest.ffmpeg"
 id      = "htdemucs_mlx"
 module  = "patmir.pipeline.stages.separate.htdemucs_mlx"
 model   = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
-shifts  = 1
+# 0, not demucs' default 1: shifts=1 is ONE prediction at an unseeded random
+# offset (no averaging — that needs >= 2), and it made every run produce a
+# different vocal stem, which re-rolled ref clips, emotion labels and the
+# translator's prompt underneath it. Quality issue #28.
+shifts  = 0
 overlap = 0.25
 
 # Vocals-specialist single model from the htdemucs_ft bag (sig 04573f0d). The ft
@@ -864,7 +945,7 @@ id          = "htdemucs_mlx_vocals"
 module      = "patmir.pipeline.stages.separate.htdemucs_mlx"
 model       = "04573f0d"
 vocals_only = true
-shifts      = 1
+shifts      = 0          # reproducibility — see htdemucs_mlx above, issue #28
 overlap     = 0.25
 
 # Base single-model Demucs on MLX — ~4× faster than the _ft 4-model bag.
@@ -873,7 +954,7 @@ overlap     = 0.25
 id      = "htdemucs_mlx_fast"
 module  = "patmir.pipeline.stages.separate.htdemucs_mlx"
 model   = "htdemucs"
-shifts  = 1
+shifts  = 0              # reproducibility — see htdemucs_mlx above, issue #28
 overlap = 0.25
 
 # PyTorch Demucs (MPS) — fallback for both variants. ~4× faster base model is
@@ -883,12 +964,14 @@ id     = "htdemucs"
 module = "patmir.pipeline.stages.separate.htdemucs"
 model  = "htdemucs_ft"   # bagged ensemble, state-of-art; ~300 MB weights
 device = "auto"          # auto → mps on Apple Silicon
+shifts = 0               # reproducibility — see htdemucs_mlx above, issue #28
 
 [[stages.separate.candidates]]
 id     = "htdemucs_fast"
 module = "patmir.pipeline.stages.separate.htdemucs"
 model  = "htdemucs"
 device = "auto"
+shifts = 0               # reproducibility — see htdemucs_mlx above, issue #28
 
 # PyTorch twin of htdemucs_mlx_vocals — the ft bag's vocals-specialist
 # sub-model alone (sig 04573f0d), accompaniment = mix - vocals. Same trick,
@@ -900,6 +983,7 @@ id          = "htdemucs_vocals"
 module      = "patmir.pipeline.stages.separate.htdemucs"
 model       = "04573f0d"
 vocals_only = true
+shifts      = 0          # reproducibility — see htdemucs_mlx above, issue #28
 device      = "auto"
 
 # ─── Diarize (who-spoke-when) ─────────────────────────────────────────────────

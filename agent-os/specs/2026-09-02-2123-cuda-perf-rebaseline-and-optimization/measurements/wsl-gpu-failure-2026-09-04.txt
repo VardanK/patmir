@@ -1,0 +1,30 @@
+# WSL2 GPU/storage failure captured 2026-09-04 — dmesg is wiped by wsl --shutdown
+
+## dxgkrnl (WSL2 GPU paravirtualization bridge) errors: 95
+[10369.399906] misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+[10369.400261] misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+[10463.717583] misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+[10463.717996] misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+[10463.718173] misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+[10463.750489] misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+[10463.750882] misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+[10463.751083] misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+
+## storage I/O errors
+[10387.502595] sd 0:0:0:3: [sdd] tag#3 UNKNOWN(0x2003) Result: hostbyte=0x07 driverbyte=DRIVER_OK cmd_age=0s
+[10387.502608] sd 0:0:0:3: [sdd] tag#3 CDB: opcode=0x28 28 00 01 ce 6b 70 00 10 70 00
+[10387.502760] I/O error, dev sdd, sector 30305136 op 0x0:(READ) flags 0x80700 phys_seg 526 prio class 2
+[10387.503348] hv_storvsc fd1d2cbd-ce7c-535c-966b-eb5f811c95f0: tag#4 cmd 0x28 status: scsi 0x0 srb 0x4 host 0xc000009a
+[10387.503355] sd 0:0:0:3: [sdd] tag#4 UNKNOWN(0x2003) Result: hostbyte=0x07 driverbyte=DRIVER_OK cmd_age=0s
+[10387.503356] sd 0:0:0:3: [sdd] tag#4 CDB: opcode=0x28 28 00 01 ce 7c 00 00 14 18 00
+[10387.503357] I/O error, dev sdd, sector 30309376 op 0x0:(READ) flags 0x80700 phys_seg 643 prio class 2
+[10387.508964] hv_storvsc fd1d2cbd-ce7c-535c-966b-eb5f811c95f0: tag#38 cmd 0x28 status: scsi 0x0 srb 0x4 host 0xc000009a
+[10387.508972] sd 0:0:0:3: [sdd] tag#38 UNKNOWN(0x2003) Result: hostbyte=0x07 driverbyte=DRIVER_OK cmd_age=0s
+[10387.508974] sd 0:0:0:3: [sdd] tag#38 CDB: opcode=0x28 28 00 41 8f 57 68 00 1d a0 00
+[10387.508975] I/O error, dev sdd, sector 1099913064 op 0x0:(READ) flags 0x84700 phys_seg 256 prio class 2
+[10463.717583] misc dxg: dxgk: dxgkio_escape: Ioctl failed: -22
+
+## Linux OOM kills: 0
+## memory at capture: 23 GB total, 1 used, 22 available
+## gpu at capture: 639 MiB, 38
+## uptime: up 2 hours, 55 minutes

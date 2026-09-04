@@ -189,3 +189,94 @@ class SharedTimingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SchedulerBenchTerminatesTest(unittest.TestCase):
+    """The scheduler-driven bench must END when the video is fully dubbed.
+
+    Found 2026-09-02 while taking the 350 W baseline: the greedy run produced
+    every section and then sat in a 2 s idle loop for five minutes until it was
+    killed. `bench_watch_along` passed neither `idle_fn` nor `alive_fn`, so
+    `StreamScheduler._default_idle` fell back to the playhead's `updated_at` —
+    which `BenchPlayhead` refreshes on every call, precisely so the abandon
+    timer stays fed. The abandon branch could therefore never fire and the loop
+    returned "keep waiting" forever.
+
+    Consequence worth stating plainly: `patmir bench --mode watch-along` had
+    never terminated under its own default driver, and every stored watch-along
+    baseline was taken with `--forward-loop`. The live server was never
+    affected — it passes `alive_fn` keyed on the client still polling.
+    """
+
+    def _sched(self, *, duration, covered, uncovered_after=None):
+        """A scheduler wired the way `bench_watch_along` wires one, with
+        `process_fn` stubbed out so no models are built."""
+        from patmir.pipeline.streaming.scheduler import StreamScheduler
+
+        ph = benchmod.BenchPlayhead("greedy")
+        calls = {"n": 0}
+
+        def _process(start, max_end=None):
+            calls["n"] += 1
+            return None                      # forces the scheduler's own step
+
+        sched = StreamScheduler(
+            duration=duration,
+            prelude_end=0.0,
+            process_fn=_process,
+            playhead_fn=ph,
+        )
+        for a, b in covered:
+            sched.coverage.add(a, b)
+        ph.coverage = sched.coverage
+        return sched, ph, calls
+
+    def _idle_fn(self, sched, duration):
+        """The predicate `bench_watch_along` installs."""
+        def _idle() -> bool:
+            if sched.coverage.first_uncovered(0.0, until=duration - 1.0) is None:
+                return False
+            return not sched.stopped() and not sched._stop.wait(0.01)
+        return _idle
+
+    def test_fully_covered_video_ends_the_run(self):
+        sched, _ph, _calls = self._sched(duration=300.0, covered=[(0.0, 300.0)])
+        sched._idle_fn = self._idle_fn(sched, 300.0)
+        start = time.perf_counter()
+        sched.run()                          # must return, not idle forever
+        self.assertLess(time.perf_counter() - start, 2.0)
+
+    def test_the_old_default_would_have_idled_instead(self):
+        # The negative control: with the default idle predicate and a synthetic
+        # viewer, the loop reports "keep waiting" on a fully-covered video. This
+        # is the bug, asserted rather than described.
+        sched, _ph, _calls = self._sched(duration=300.0, covered=[(0.0, 300.0)])
+        self.assertIsNone(sched._next_start())        # nothing left to dub
+        sched.abandon_seconds = 1e9                   # a viewer that never leaves
+        self.assertTrue(sched._default_idle())        # ...and so it waits
+
+    def test_a_gap_still_keeps_the_run_alive(self):
+        # Under --playhead realtime, `_next_start` also returns None when
+        # production is more than `lookahead_seconds` ahead of the viewer. That
+        # must NOT end the run: the viewer has not finished watching, and a
+        # stall can still be recorded. Hence the predicate asks coverage, not
+        # `_next_start`.
+        sched, _ph, _calls = self._sched(
+            duration=300.0, covered=[(0.0, 100.0), (200.0, 300.0)])
+        idle = self._idle_fn(sched, 300.0)
+        self.assertTrue(idle())                       # a real gap remains
+
+    def test_coverage_within_one_second_of_the_end_counts_as_done(self):
+        # `_next_start` uses `until=duration - 1.0`, so a trailing sliver under
+        # a second is not dubbable; the terminating check has to use the same
+        # bound or the run would idle on an unreachable tail.
+        sched, _ph, _calls = self._sched(duration=300.0, covered=[(0.0, 299.5)])
+        self.assertIsNone(sched._next_start())
+        self.assertFalse(self._idle_fn(sched, 300.0)())
+
+    def test_stop_still_ends_the_run(self):
+        sched, _ph, _calls = self._sched(duration=300.0, covered=[(0.0, 50.0)])
+        sched._idle_fn = self._idle_fn(sched, 300.0)
+        sched.stop()
+        sched.run()                                   # returns immediately
+        self.assertTrue(sched.stopped())

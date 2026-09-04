@@ -36,7 +36,15 @@ from patmir.pipeline.stage import STAGE_ORDER
 
 log = logging.getLogger(__name__)
 
-CACHE_VERSION = 1
+# Bumped 1 -> 2 on 2026-09-04. `config_hash` sees the TOML entries only, and
+# four output-affecting changes landed as code constants between 2026-09-02
+# and 2026-09-03 with no key movement: the mux onset-burst trim and fade-in
+# cap (#30), `EMOTION_MAX_CLIP_SECONDS` (labels of every turn over 20 s, hence
+# ref choice and the translator prompt), the 8 s ASR language probe, and
+# `shifts = 0` on the two torch fallback separate entries that had no `shifts`
+# key. A dub cached under version 1 may carry any mix of the old behaviours;
+# one regeneration folds them all in.
+CACHE_VERSION = 2
 # Fallback for callers with no loaded config. The server takes its cache root
 # from `PipelineConfig.storage.cache_root` so `[storage]` is honored.
 DEFAULT_CACHE_ROOT = paths.defaults(None).cache_root
@@ -139,11 +147,43 @@ def config_hash(cfg: PipelineConfig) -> str:
     return hashlib.sha256(serialized.encode()).hexdigest()[:8]
 
 
+# Candidate keys that govern SCHEDULING and RESILIENCE, never output. They are
+# excluded from the cache key so tuning throughput does not invalidate a
+# library of finished dubs.
+#
+# The bar for adding a key here is that it cannot change a single sample:
+#
+#   concurrency       how many independent round-trips are in flight. The
+#                     translate adapter fires per-sentence calls in a pool and
+#                     each call carries only its own text, so the result does
+#                     not depend on how many ran at once.
+#   max_attempts      whether a failed round-trip is retried. The alternative
+#                     to a retry is an EMPTY translation, so this can only add
+#                     a line that would otherwise be missing.
+#   retry_backoff_s   how long to wait between those attempts.
+#   cuda_graphs       replay a captured decode step instead of issuing it.
+#                     Verified byte-identical md5-for-md5 on 80 WAVs, and
+#                     pinned by CUDA-gated tests.
+#
+# Anything that touches sampling, prompts, model ids or dtypes does NOT belong
+# here. `decode_attention` is the near miss worth naming: it is also "just" a
+# kernel choice, but its reduction order differs and it re-rolls every line, so
+# it stays in the key.
+_NON_OUTPUT_KEYS = frozenset({
+    "concurrency", "max_attempts", "retry_backoff_s", "cuda_graphs",
+})
+
+
 def _stable_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    """JSON-safe + stable-ordered copy of a candidate entry."""
-    # Sort keys; drop nothing — every knob in the candidate entry can change
-    # output. TOML loads scalars + lists + sub-dicts, all JSON-serializable.
-    return json.loads(json.dumps(entry, sort_keys=True, ensure_ascii=False))
+    """JSON-safe + stable-ordered copy of a candidate entry, minus the keys
+    that cannot change output.
+
+    Everything else is kept: model ids, voices, languages, dtypes, sampling
+    knobs and prompt controls all change what comes out, so they belong in the
+    key. See `_NON_OUTPUT_KEYS` for the four that do not and why.
+    """
+    trimmed = {k: v for k, v in entry.items() if k not in _NON_OUTPUT_KEYS}
+    return json.loads(json.dumps(trimmed, sort_keys=True, ensure_ascii=False))
 
 
 # The default (D1) mode. Folded into the cache key only when non-default, so

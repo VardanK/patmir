@@ -301,3 +301,273 @@ class AudienceBatchPrompt(unittest.TestCase):
         for i in range(1, 4):  # the three per-sentence retries
             self.assertIn(clause, self._system_of(fake, i), f"request {i}")
 
+
+
+class RetryPolicy(unittest.TestCase):
+    """Transient failures are retried; permanent ones are not.
+
+    Before 2026-09-02 the per-sentence candidate raised any non-200 straight
+    out of the adapter's thread pool, failing the whole translate stage and
+    discarding every sentence already translated in that job — for one 429.
+    The batched candidate did not fail the stage but degraded the chunk to
+    `chunk_size` per-sentence round-trips, which is the opposite of what a rate
+    limiter wants.
+    """
+
+    def _sentence_translator(self, responses):
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter import (
+            OpenRouterTranslator,
+        )
+        t = OpenRouterTranslator(model="m", max_attempts=3, retry_backoff_s=0.0)
+        client = FakeClient(responses)
+        t._client = client
+        return t, client
+
+    def test_429_is_retried_then_succeeds(self):
+        t, client = self._sentence_translator(
+            [_FakeResp(429, "slow down"), _ok("բարև")])
+        out = t.translate("privet", source_lang="ru")
+        self.assertEqual(out, "բարև")
+        self.assertEqual(len(client.requests), 2)
+
+    def test_provider_500_is_retried(self):
+        t, client = self._sentence_translator(
+            [_FakeResp(500, "boom"), _FakeResp(503, "nope"), _ok("ok")])
+        self.assertEqual(t.translate("x", source_lang="ru"), "ok")
+        self.assertEqual(len(client.requests), 3)
+
+    def test_400_is_not_retried(self):
+        # A bad request fails identically next time; retrying only delays the
+        # real error.
+        t, client = self._sentence_translator([_FakeResp(400, "bad model")])
+        with self.assertRaises(RuntimeError):
+            t.translate("x", source_lang="ru")
+        self.assertEqual(len(client.requests), 1)
+
+    def test_attempts_are_bounded(self):
+        t, client = self._sentence_translator([_FakeResp(429, "no")] * 5)
+        with self.assertRaises(RuntimeError):
+            t.translate("x", source_lang="ru")
+        self.assertEqual(len(client.requests), 3)      # max_attempts
+
+    def test_transport_error_is_retried(self):
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter import (
+            OpenRouterTranslator,
+        )
+        import httpx
+        t = OpenRouterTranslator(model="m", max_attempts=2, retry_backoff_s=0.0)
+        calls = {"n": 0}
+
+        class _Flaky:
+            def post(self, url, *, headers, json):  # noqa: A002
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise httpx.ConnectError("dropped")
+                return _ok("recovered")
+
+        t._client = _Flaky()
+        self.assertEqual(t.translate("x", source_lang="ru"), "recovered")
+        self.assertEqual(calls["n"], 2)
+
+    def test_batch_chunk_retries_before_falling_back(self):
+        # One 429 must not turn a single batched call into chunk_size
+        # per-sentence ones.
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter_batch import (
+            OpenRouterBatchTranslator,
+        )
+        t = OpenRouterBatchTranslator(model="m", chunk_size=20, overlap=0,
+                                      max_attempts=3, retry_backoff_s=0.0)
+        client = FakeClient([_FakeResp(429, "slow"),
+                             _json_response_for([0, 1, 2])])
+        t._client = client
+        out = t.translate_batch(_items_from([0, 1, 2]), source_lang="ru")
+        self.assertEqual(out, {0: "hy_0", 1: "hy_1", 2: "hy_2"})
+        self.assertEqual(len(client.requests), 2)      # retried, not fell back
+
+    def test_batch_permanent_error_still_falls_back(self):
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter_batch import (
+            OpenRouterBatchTranslator,
+        )
+        t = OpenRouterBatchTranslator(model="m", chunk_size=20, overlap=0,
+                                      max_attempts=3, retry_backoff_s=0.0)
+        t._client = FakeClient([_FakeResp(400, "bad")])
+        calls = []
+
+        class _Fallback:
+            translate_concurrency = 1
+
+            def translate(self, text, *, source_lang, emotion=None,
+                          audience=None):
+                calls.append(text)
+                return f"fb_{text}"
+
+        t._fallback = _Fallback()
+        out = t.translate_batch(_items_from([0, 1]), source_lang="ru")
+        self.assertEqual(out, {0: "fb_ru_0", 1: "fb_ru_1"})
+        self.assertEqual(len(calls), 2)
+
+
+class ConcurrencyKnob(unittest.TestCase):
+    def test_concurrency_is_configurable_per_instance(self):
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter import (
+            OpenRouterTranslator,
+            build,
+        )
+        self.assertEqual(OpenRouterTranslator(model="m").translate_concurrency, 6)
+        self.assertEqual(
+            OpenRouterTranslator(model="m", concurrency=12).translate_concurrency, 12)
+        # ...and reachable from patmir.toml, which is the point: the number
+        # that decides ~13% of batch wall was previously code-only.
+        self.assertEqual(
+            build({"model": "m", "concurrency": 16}).translate_concurrency, 16)
+
+    def test_concurrency_floor_is_one(self):
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter import (
+            OpenRouterTranslator,
+        )
+        self.assertEqual(
+            OpenRouterTranslator(model="m", concurrency=0).translate_concurrency, 1)
+
+    def test_fallback_chunk_runs_concurrently(self):
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter_batch import (
+            OpenRouterBatchTranslator,
+        )
+        t = OpenRouterBatchTranslator(model="m", chunk_size=20, overlap=0)
+        import threading
+        peak = {"n": 0, "cur": 0}
+        lock = threading.Lock()
+        gate = threading.Barrier(3, timeout=5)
+
+        class _Fallback:
+            translate_concurrency = 4
+
+            def translate(self, text, *, source_lang, emotion=None,
+                          audience=None):
+                with lock:
+                    peak["cur"] += 1
+                    peak["n"] = max(peak["n"], peak["cur"])
+                # Blocks until three calls are in flight — the assertion IS
+                # that they overlap; a serial implementation deadlocks here.
+                gate.wait()
+                with lock:
+                    peak["cur"] -= 1
+                return f"fb_{text}"
+
+        t._fallback = _Fallback()
+        t._client = FakeClient([_FakeResp(400, "bad")])
+        out = t.translate_batch(_items_from([0, 1, 2]), source_lang="ru")
+        self.assertEqual(len(out), 3)
+        self.assertGreaterEqual(peak["n"], 3)
+
+    def test_fallback_stays_serial_when_the_inner_is_serial(self):
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter_batch import (
+            OpenRouterBatchTranslator,
+        )
+        t = OpenRouterBatchTranslator(model="m", chunk_size=20, overlap=0)
+        order = []
+
+        class _Fallback:
+            translate_concurrency = 1
+
+            def translate(self, text, *, source_lang, emotion=None,
+                          audience=None):
+                order.append(text)
+                return "x"
+
+        t._fallback = _Fallback()
+        t._client = FakeClient([_FakeResp(400, "bad")])
+        t.translate_batch(_items_from([0, 1, 2]), source_lang="ru")
+        self.assertEqual(order, ["ru_0", "ru_1", "ru_2"])
+
+
+class CacheKeyIgnoresSchedulingKnobs(unittest.TestCase):
+    """Tuning throughput must not invalidate a library of finished dubs.
+
+    `config_hash` hashes every key of a candidate entry, on the sound reasoning
+    that a model id, a voice, a dtype or a sampling knob all change output. But
+    concurrency and retry policy do not, and putting them in `patmir.toml` —
+    which is the only way to make them tunable — would otherwise re-dub
+    everything for a change that cannot alter a sample.
+    """
+
+    def _cfg(self, tts_entry=None, translate_entry=None):
+        from patmir.pipeline.stage import STAGE_ORDER
+
+        class _Cfg:
+            entries = {name: {"id": f"c_{name}"} for name in STAGE_ORDER}
+
+        c = _Cfg()
+        c.entries = dict(c.entries)
+        if tts_entry:
+            c.entries["tts"] = {**c.entries["tts"], **tts_entry}
+        if translate_entry:
+            c.entries["translate"] = {**c.entries["translate"], **translate_entry}
+        return c
+
+    def test_concurrency_and_retries_do_not_move_the_key(self):
+        from patmir.ui.cache import config_hash
+        base = config_hash(self._cfg())
+        for entry in ({"concurrency": 12}, {"max_attempts": 5},
+                      {"retry_backoff_s": 2.0},
+                      {"concurrency": 16, "max_attempts": 1}):
+            self.assertEqual(config_hash(self._cfg(translate_entry=entry)), base,
+                             f"{entry} changed the cache key")
+
+    def test_cuda_graphs_does_not_move_the_key(self):
+        # Byte-identical by measurement (md5-for-md5 on 80 WAVs).
+        from patmir.ui.cache import config_hash
+        base = config_hash(self._cfg())
+        self.assertEqual(config_hash(self._cfg(tts_entry={"cuda_graphs": True})),
+                         base)
+
+    def test_decode_attention_DOES_move_the_key(self):
+        # The near miss: also "just" a kernel choice, but its reduction order
+        # differs and it re-rolls every line, so cached dubs must regenerate.
+        from patmir.ui.cache import config_hash
+        base = config_hash(self._cfg())
+        self.assertNotEqual(
+            config_hash(self._cfg(tts_entry={"decode_attention": "gqa"})), base)
+
+    def test_output_affecting_knobs_still_move_the_key(self):
+        from patmir.ui.cache import config_hash
+        base = config_hash(self._cfg())
+        for entry in ({"model": "other"}, {"temperature": 0.9}, {"seed": 7},
+                      {"max_tokens": 1024}, {"dtype": "float16"},
+                      {"max_batch": 12}):
+            self.assertNotEqual(config_hash(self._cfg(tts_entry=entry)), base,
+                                f"{entry} must change the cache key")
+
+
+class BuiltFallbackKnobsTest(unittest.TestCase):
+    """`build()` must hand the throughput/retry knobs to the per-sentence
+    fallback — the candidate itself makes one call per chunk, so the fallback
+    is the only place `concurrency` acts, and watch-along runs THIS candidate.
+    Before this the fallback was constructed with the class defaults whatever
+    `patmir.toml` said, so the 6 -> 12 tuning never reached watch-along."""
+
+    def test_build_forwards_knobs_to_the_fallback(self):
+        from patmir.eval.candidates.translation import openrouter_batch
+        t = openrouter_batch.build({
+            "model": "m", "concurrency": 12, "max_attempts": 4, "retry_backoff_s": 0.7,
+        })
+        self.assertEqual(t._fallback.translate_concurrency, 12)
+        self.assertEqual(t._fallback.max_attempts, 4)
+        self.assertEqual(t._fallback.retry_backoff_s, 0.7)
+        self.assertEqual(t.max_attempts, 4)
+
+    def test_the_toml_entry_carries_the_knobs(self):
+        import tomllib
+        from pathlib import Path
+        cfg = tomllib.loads((Path(__file__).resolve().parents[2] / "patmir.toml").read_text())
+        entry = next(c for c in cfg["eval"]["translation"]["candidates"]
+                     if c["id"] == "openrouter_gemini_flash_batch")
+        self.assertEqual(entry["concurrency"], 12)
+        self.assertIn("max_attempts", entry)

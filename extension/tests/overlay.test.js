@@ -637,3 +637,84 @@ test("a sync-area storage change is ignored", async () => {
   await flush();
   assert.deepEqual(session.calls, []);
 });
+
+
+// --- progress fill ------------------------------------------------------
+//
+// The control doubles as its own progress bar. Reported problem: while
+// translating, the button read `Չթարգմանել` ("do not translate") with the
+// percentage buried in 12 px of subtitle, so it looked like a statement that
+// nothing was being translated. Now the word is `Չեղարկել` and the work shows
+// as green filling the grey.
+
+const RUNNING_STATE = {
+  phase: "job",
+  job: {
+    status: "running", job_id: "j",
+    stage_states: { a: "done", b: "done", c: "running", d: "queued", e: "queued" },
+  },
+};
+
+function fillOf(root) {
+  const button = root.shadow.children[0].children[0];
+  return button.children.find((c) => (c.className || "").includes("fill"));
+}
+
+test("a translating page reads Չեղարկել, not Չթարգմանել", async () => {
+  const { root } = await mounted({ state: RUNNING_STATE });
+  const button = root.shadow.children[0].children[0];
+  assert.equal(button.children[0].textContent, "Չեղարկել");
+});
+
+test("the fill is shown and sized while a job runs", async () => {
+  const { root } = await mounted({ state: RUNNING_STATE });
+  const fill = fillOf(root);
+  assert.ok(fill, "the button must carry a fill element");
+  assert.ok(!(fill.className || "").includes("hidden"), "fill must be visible");
+  // 2 of 5 stages done, the running one contributing nothing without live_pct.
+  assert.equal(fill.style.width, "40%");
+});
+
+test("the fill is hidden when there is no job to measure", async () => {
+  const { root } = await mounted();
+  const fill = fillOf(root);
+  assert.ok(fill, "the fill element exists in every state");
+  assert.ok((fill.className || "").includes("hidden"));
+  assert.equal(fill.style.width, "0%");
+});
+
+test("the fill is hidden while merely playing a cached dub", async () => {
+  // Playback is not progress: a bar that sat at 100% during playback would be
+  // claiming work that is not happening.
+  const { root } = await mounted({
+    state: { playback: { playing: true, hasVideo: true } },
+  });
+  assert.ok((fillOf(root).className || "").includes("hidden"));
+});
+
+test("the label stays children[0] so the fill cannot displace it", async () => {
+  // The fill is appended last and layered with z-index for exactly this
+  // reason: inserting it first blanked the label, because the button's shape
+  // is read positionally here and in the popup-parity checks.
+  const { root } = await mounted({ state: RUNNING_STATE });
+  const button = root.shadow.children[0].children[0];
+  assert.ok((button.children[0].className || "").includes("label"));
+  assert.ok((button.children[1].className || "").includes("sub"));
+});
+
+test("the fill is decorative, so the percentage is announced once", async () => {
+  // The subtitle is aria-live; a second announcing element would say the
+  // percentage twice on every tick.
+  const { root } = await mounted({ state: RUNNING_STATE });
+  // The stub element records setAttribute into `attributes` and has no
+  // getAttribute, so read the map it keeps.
+  assert.equal(fillOf(root).attributes["aria-hidden"], "true");
+});
+
+test("a translating button keeps the neutral chrome", async () => {
+  // Cancel shares Stop's styling: both mean "there is something to
+  // interrupt", and the difference between them is the word, not the colour.
+  const { root } = await mounted({ state: RUNNING_STATE });
+  const button = root.shadow.children[0].children[0];
+  assert.ok(button.className.includes("stop"));
+});

@@ -50,6 +50,107 @@ _LEVEL_MATCH_GAIN_CAP_DB = 12.0
 _LEVEL_MATCH_RMS_FLOOR = 1e-3
 
 
+
+
+# The TTS sometimes opens a clip with a loud, pitch-free impulse instead of
+# speech — heard by the author as "a muffled gun shot" before the first word.
+# It is a decoder attack transient, and it is only audible when the clip has no
+# lead-in, which is why it lands on the FIRST line of a job: measured over 3079
+# synthesized lines, a pitch-free impulse at >= 40% of the clip's own peak
+# occurs in **33% of first lines and 1% of all others**. On the reported clip it
+# ran 45 ms at 40-76% of peak, then the voice began — and at 20 ms resolution
+# the final mix jumped 31 dB into a frame with ZERO energy below 300 Hz, louder
+# than the source's own speech peak.
+#
+# Fading it does not fix it: a fade ramps the burst's amplitude but leaves its
+# spectrum, and the burst is longer than the 50 ms fade anyway (85 ms at p90
+# across affected clips, 150 ms max). So it is cut, not smoothed.
+#
+# Detection is deliberately narrow, because a word-initial voiceless fricative
+# (/s/, /ʃ/, /h/) is *also* pitch-free and must survive: the clip's very first
+# frame has to be at least `_BURST_PEAK_FRACTION` of the whole clip's peak,
+# which speech attacks are not — the median first-frame amplitude over
+# non-first lines is 0.005 of peak. The cut then stops at the first frame
+# carrying pitch, and never removes more than `_BURST_MAX_SECONDS`, so a
+# mis-detection costs a consonant rather than a word.
+_BURST_FRAME_SECONDS = 0.005
+_BURST_PEAK_FRACTION = 0.4
+_BURST_TONAL_RATIO = 0.05      # low(20-300Hz) / high(>=300Hz) power
+_BURST_QUIET_FRACTION = 0.05   # below this the head is silence, not a burst
+_BURST_MAX_SECONDS = 0.12      # p90 of measured heads is 0.085 s
+
+
+def _band_ratio(frame, sr: int) -> float:
+    """Power below 300 Hz over power above it — pitch presence, cheaply."""
+    import numpy as np
+
+    n = len(frame)
+    if n < 8:
+        return 1.0
+    spec = np.abs(np.fft.rfft(frame * np.hanning(n))) ** 2
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    high = spec[freqs >= 300.0].sum()
+    if high <= 0.0:
+        return 1.0
+    return float(spec[(freqs > 20.0) & (freqs < 300.0)].sum() / high)
+
+
+def _trim_onset_burst(audio, sr: int):
+    """Drop a loud pitch-free impulse at the very start of a synthesized clip.
+
+    Returns `audio` unchanged unless the first frame is both loud relative to
+    the clip's own peak and free of pitch — see the note above for why the test
+    is that narrow.
+    """
+    import numpy as np
+
+    n = max(8, int(_BURST_FRAME_SECONDS * sr))
+    peak = float(np.abs(audio).max()) if len(audio) else 0.0
+    if peak <= 0.0 or len(audio) < 4 * n:
+        return audio
+
+    first = audio[:n]
+    if float(np.abs(first).max()) < _BURST_PEAK_FRACTION * peak:
+        return audio
+    if _band_ratio(first, sr) >= _BURST_TONAL_RATIO:
+        return audio
+
+    limit = min(len(audio) - n, int(_BURST_MAX_SECONDS * sr))
+    cut = 0
+    while cut + n <= limit:
+        frame = audio[cut:cut + n]
+        # Stop at pitch (the voice) or at a drop into silence — either way the
+        # burst is over and everything after it is the utterance.
+        if _band_ratio(frame, sr) >= _BURST_TONAL_RATIO:
+            break
+        if float(np.abs(frame).max()) < _BURST_QUIET_FRACTION * peak:
+            break
+        cut += n
+    return audio[cut:] if cut else audio
+
+
+def _CLICK_GUARD_SAMPLES(sr: int) -> int:
+    """Shortest fade that still removes a step discontinuity: 4 ms."""
+    return max(1, int(0.004 * sr))
+
+
+def _leading_quiet_samples(mono, rel_db: float = -30.0) -> int:
+    """Samples before the clip's first real speech energy.
+
+    Measured against the clip's own peak, so it does not care how loud the
+    line is overall. Used to keep a fade-in inside the silence a clip
+    actually has instead of ramping over its first consonant.
+    """
+    import numpy as np
+
+    peak = float(np.abs(mono).max()) if len(mono) else 0.0
+    if peak <= 0.0:
+        return len(mono)
+    thresh = peak * (10.0 ** (rel_db / 20.0))
+    loud = np.flatnonzero(np.abs(mono) >= thresh)
+    return int(loud[0]) if len(loud) else len(mono)
+
+
 class FFmpegPadStretch:
     id = "ffmpeg_pad_stretch"
 
@@ -123,11 +224,14 @@ class FFmpegPadStretch:
         total = len(synth.sentences) or 1
 
         for i, s in enumerate(synth.sentences):
-            audio, file_sr = sf.read(str(s.wav_path), dtype="float32", always_2d=False)
+            with ctx.probe.section("read_s"):
+                audio, file_sr = sf.read(str(s.wav_path), dtype="float32",
+                                         always_2d=False)
             if file_sr != sr:
                 audio = _simple_resample(audio, file_sr, sr)
+            audio = _trim_onset_burst(audio, sr)
             window = max(0.0, s.source_end - s.source_start)
-            audio = _stretch_to_window(audio, sr, window, cap)
+            audio = _stretch_to_window(audio, sr, window, cap, probe=ctx.probe)
 
             start_sample = _placement_start(
                 int(s.source_start * sr), voice_cursor, overlap_gap, no_overlap
@@ -141,7 +245,7 @@ class FFmpegPadStretch:
                 if available > 0 and len(audio) > available:
                     ratio = min(len(audio) / available, max_compress)
                     if ratio > 1.02:
-                        audio = _stretch_audio(audio, sr, ratio)
+                        audio = _stretch_audio(audio, sr, ratio, probe=ctx.probe)
             end_sample = start_sample + len(audio)
             if start_sample >= n_samples:
                 ctx.progress("mux", (i + 1) / total, f"sentence {i+1}/{total} (past end)")
@@ -174,12 +278,31 @@ class FFmpegPadStretch:
                         mono = mono * match_gain
 
             # Apply per-sentence afade in/out on the AR voice — see issue #4.
+            #
+            # The fade-IN is shortened to whatever leading near-silence the
+            # clip actually has, with a short anti-click floor. 50 ms was
+            # chosen for lines that begin with silence, and most do — median
+            # speech onset over 2961 measured lines is 0.062 s. But the
+            # **first line of a job begins at sample 0 in 74% of jobs**
+            # (against 26% for every other line), so the full ramp landed on
+            # the first word's attack and chewed through its consonant. That
+            # is audible on every video precisely because nothing precedes it
+            # to mask it — the author's report was "the very first word starts
+            # with noise". Quality issue #30.
+            #
+            # The floor is 4 ms: enough to stop the discontinuity the fade
+            # exists to prevent, short enough to be inaudible on an attack.
+            # The fade-OUT is untouched — utterances end by decaying, so the
+            # tail has room the head does not.
             n_aud = len(mono)
             if sentence_fade > 0 and n_aud > 2 * sentence_fade:
-                fin = 0.5 * (1 - np.cos(np.linspace(0, np.pi, sentence_fade, dtype="float32")))
-                fout = fin[::-1]
+                lead = _leading_quiet_samples(mono)
+                fin_n = int(min(sentence_fade, max(_CLICK_GUARD_SAMPLES(sr), lead)))
+                fin = 0.5 * (1 - np.cos(np.linspace(0, np.pi, fin_n, dtype="float32")))
+                fout = 0.5 * (1 - np.cos(np.linspace(0, np.pi, sentence_fade,
+                                                     dtype="float32")))[::-1]
                 mono = mono.copy()
-                mono[:sentence_fade] *= fin
+                mono[:fin_n] *= fin
                 mono[-sentence_fade:] *= fout
             # Spread mono voice across all bed channels.
             voice_track[start_sample:end_sample, :] += mono[:, None] * voice_lin
@@ -240,7 +363,8 @@ class FFmpegPadStretch:
                 out_audio = out_audio * (target / peak)
 
         out_path = ctx.job_dir / "dub.wav"
-        sf.write(str(out_path), out_audio, sr, subtype="PCM_16")
+        with ctx.probe.section("write_s"):
+            sf.write(str(out_path), out_audio, sr, subtype="PCM_16")
         _write_meta(ctx.job_dir, out_path, sr, n_channels)
         # Sidecar for inspection/debugging: where each line actually landed
         # (post compress + ripple) and how far it drifted from its source time.
@@ -264,6 +388,7 @@ def _stretch_to_window(
     sr: int,
     window: float,
     cap: float,
+    probe: Any = None,
 ) -> np.ndarray:
     if window <= 0:
         return audio
@@ -274,16 +399,28 @@ def _stretch_to_window(
     clamped = max(1 - cap, min(1 + cap, desired_ratio))
     if _NO_STRETCH_BAND[0] <= clamped <= _NO_STRETCH_BAND[1]:
         return audio
-    return _stretch_audio(audio, sr, clamped)
+    return _stretch_audio(audio, sr, clamped, probe=probe)
 
 
-def _stretch_audio(audio: np.ndarray, sr: int, ratio: float) -> np.ndarray:
+def _stretch_audio(audio: np.ndarray, sr: int, ratio: float,
+                   probe: Any = None) -> np.ndarray:
     """Pitch-preserving time-stretch by `ratio` (>1 = faster/shorter). No-op on
-    a near-1 ratio or if rubberband isn't available (returns the input)."""
+    a near-1 ratio or if rubberband isn't available (returns the input).
+
+    Each real stretch writes a temp WAV, spawns the `rubberband` CLI and reads
+    the result back, and a line can be stretched twice (to its window, then to
+    fit before the next). `n_stretch_calls` beside `stretch_s` is what separates
+    process-spawn cost from the stretch itself. Note the bare `except` also
+    means a MISSING `rubberband` binary silently disables stretching, so a
+    probe reporting 0 calls on dense dialogue is a finding, not noise."""
     if _NO_STRETCH_BAND[0] <= ratio <= _NO_STRETCH_BAND[1]:
         return audio
     try:
         import pyrubberband as pyrb  # lazy import
+        if probe is not None:
+            probe.bump("n_stretch_calls")
+            with probe.section("stretch_s"):
+                return pyrb.time_stretch(audio, sr, ratio)
         return pyrb.time_stretch(audio, sr, ratio)
     except Exception:
         return audio

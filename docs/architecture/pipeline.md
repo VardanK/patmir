@@ -190,7 +190,10 @@ The same 9 stages run under two execution models, selected per submission by a
 - **Watch-along mode (D3, additive)** — the dub is produced in VAD-snapped
   sections and streamed behind a short buffer while the viewer watches; each
   section is written into the cache as it lands (free rewatch). See ADR
-  `decisions/2026-06-13-near-realtime-d3-spike.md`. Active TTS is the
+  `decisions/2026-06-13-near-realtime-d3-spike.md`. On CUDA all four model
+  stages are the **same candidates as batch** since 2026-09-03 (separate was
+  the last holdout, `htdemucs_fast` -> `htdemucs_vocals`); only `translate`
+  differs, using the batched candidate. Active TTS is the
   ElevenLabs `eleven_v3` preset-voice pool (`elevenlabs_pool`, no IVC cloning),
   which clears realtime; OmniVoice with a low `num_steps` is the offline fallback.
 
@@ -262,10 +265,46 @@ alongside the **streaming** stage set, whose `separate` and `translate`
 candidates differ from batch and so were previously cache misses on the first
 stream of every server lifetime.
 
-NOTE (perf follow-up): `process_section` calls `run_job` twice per section
-(analysis, then translate→tts→mux), rebuilding stage models each call. A
-warm-model loop (build stages once, process sections in place) is an open
-optimization, not a correctness issue.
+### Sections are pipelined (2026-09-02)
+
+`process_section` runs its phases back to back and is still the simple path
+(`stream_sections`, the bench forward-loop, the tests). The **live server and
+the scheduler-driven bench** instead go through `SectionPipeline`
+(`streaming/pipeline.py`), which overlaps the one thing in a section that does
+not use the GPU with the one thing that does:
+
+```
+section k    [analyse][translate .......][speak]
+section k+1           [analyse]                 [translate ....][speak]
+                      ^^^^^^^^ the GPU, busy during k's network wait
+```
+
+Translate was **44.2 s of a 153.9 s watch-along wall (29 %)** — one structured
+cloud round-trip per section, measured between 1.75 s and 13.34 s, with the GPU
+idle throughout. Analysis is the GPU work that fits in that gap. Measured:
+**agg RTF 0.511 -> 0.396, wall 153.9 -> 119.3 s**, 7 prefetch hits of 8
+possible, 0 discarded.
+
+**The GPU is never used by two phases at once**, and that is a hard requirement
+rather than tidiness: the TTS decode captures a CUDA graph, and capture fails
+or corrupts if another thread allocates on the device. One lock inside the
+driver serializes every GPU phase (`analyze_section`, `speak_section`) plus the
+registry mutation that identity resolution performs; `translate_section` is the
+only phase that runs outside it. This is why `process_section` was split into
+three phases in the first place — the runner's `resume_from`/`stop_after` range
+already allowed it.
+
+Prefetch is one section deep, so a seek throws away at most one section's work,
+and it refuses to trust stale analysis in four ways: a different start
+discards it, a `max_end` clamp discards it (the clamp changes where the section
+ends), a prefetch is never *started* with a clamp (the next window's clamp comes
+from coverage the scheduler has not updated yet), and `close()` waits for an
+in-flight analysis because a torch forward cannot be interrupted and abandoning
+the thread would hand the GPU to the next job while we still held it. Section
+numbering stays with the caller, since a resumed stream must number past the
+highest cached index (quality issue #22).
+
+`[pipeline.options] section_prefetch = false` restores the fully serial loop.
 
 ## Audio artifacts written per job
 

@@ -58,6 +58,8 @@
   let shadow = null;
   let buttonEl = null;
   let subtitleEl = null;
+  let fillEl = null;
+  let labelEl = null;
   let session = null;
   let tickHandle = null;
   let tickCount = 0;
@@ -236,6 +238,22 @@
       color: var(--yt-spec-text-primary, #0f0f0f);
       box-shadow: inset 0 0 0 1px var(--yt-spec-10-percent-layer, rgba(0,0,0,0.1));
     }
+    /* The control doubles as its own progress bar: green filling the grey
+       left-to-right. The author's report was that the old button read as a
+       status ("not translating") with the percentage buried in 12 px of
+       subtitle, so the work now shows in the shape of the control itself.
+       Text sits above the fill and stays dark, so contrast does not depend on
+       how far along the job is. */
+    button { position: relative; overflow: hidden; }
+    .fill {
+      position: absolute; left: 0; top: 0; bottom: 0; width: 0;
+      background: rgba(30, 142, 62, 0.30);
+      border-right: 1px solid rgba(30, 142, 62, 0.55);
+      transition: width 300ms ease;
+      pointer-events: none; z-index: 0;
+    }
+    .fill.hidden { display: none; }
+    .label, .sub { position: relative; z-index: 1; }
     button.error { background: #c5221f; color: #fff; }
     button.warn  { background: #b06000; color: #fff; }
     .sub { font-size: 12px; font-weight: 400; opacity: 0.85; }
@@ -270,16 +288,26 @@
     buttonEl = document.createElement("button");
     buttonEl.type = "button";
 
-    const label = document.createElement("span");
-    label.className = "label";
+    fillEl = document.createElement("div");
+    fillEl.className = "fill hidden";
+    // Decorative: the percentage is already spoken by the aria-live subtitle,
+    // and a second announcing element would say everything twice.
+    fillEl.setAttribute("aria-hidden", "true");
+
+    labelEl = document.createElement("span");
+    labelEl.className = "label";
 
     subtitleEl = document.createElement("span");
     subtitleEl.className = "sub";
     // The state changes under the viewer without them acting, so announce it.
     subtitleEl.setAttribute("aria-live", "polite");
 
-    buttonEl.appendChild(label);
+    buttonEl.appendChild(labelEl);
     buttonEl.appendChild(subtitleEl);
+    // Appended LAST but painted underneath via z-index, rather than inserted
+    // first: the label stays `children[0]`, which the popup-parity tests and
+    // anything else reading the button's shape already rely on.
+    buttonEl.appendChild(fillEl);
     buttonEl.addEventListener("click", onPress);
     // A focused button plus YouTube's document-level shortcuts means space and
     // k would both activate the button AND toggle the player. Stop the bubble,
@@ -301,29 +329,95 @@
     const v = session.view();
     const label = Session.formatLabel(v, Session.STRINGS_HY);
     const sub = Session.formatSubtitle(v, Session.STRINGS_HY);
-    const signature = [v.kind, label, sub, v.disabled, v.tone].join("|");
+    // Progress joins the signature so the bar advances between ticks whose
+    // text has not changed — `queued` and `streaming` carry no percentage in
+    // their subtitle, and without this the fill would sit still.
+    const pct = typeof v.progress === "number" ? Math.round(v.progress * 100) : null;
+    const signature = [v.kind, label, sub, v.disabled, v.tone, pct].join("|");
     // Diffed on purpose: unconditional DOM writes at 2 Hz inside YouTube's
     // layout, on a page decoding video, is what shows up as dropped frames and
     // gets blamed on the dub.
     if (!force && signature === lastRendered) return;
     lastRendered = signature;
 
-    buttonEl.querySelector(".label").textContent = label;
+    labelEl.textContent = label;
     subtitleEl.textContent = sub;
     buttonEl.disabled = !!v.disabled;
     buttonEl.setAttribute("aria-busy", v.busy ? "true" : "false");
+    // CANCEL shares STOP's neutral chrome: both are the "there is something to
+    // interrupt" state, and the difference between them is the word, not the
+    // colour.
+    const neutral = v.label === Session.LABELS.STOP
+                 || v.label === Session.LABELS.CANCEL;
     buttonEl.className =
-      (v.label === Session.LABELS.STOP ? "stop" : "") +
+      (neutral ? "stop" : "") +
       (v.tone === "error" ? " error" : v.tone === "warn" ? " warn" : "");
+
+    if (pct === null) {
+      fillEl.className = "fill hidden";
+      fillEl.style.width = "0%";
+    } else {
+      fillEl.className = "fill";
+      fillEl.style.width = pct + "%";
+    }
     if (root) {
       // Pill styling is keyed off the host so the shadow CSS can select it.
       if (floating) root.classList.add("pill"); else root.classList.remove("pill");
     }
   }
 
+  // --- auto-start ------------------------------------------------------
+  //
+  // `patmirTranslateEnabled` is one remembered choice for every video. When it
+  // is on, the surface presses its own button: the same `session.primary()`
+  // the viewer would, so a video that has never been dubbed is SUBMITTED
+  // rather than skipped. content.js's old auto-play only ever started an
+  // already-cached dub, which is why a new video always played in the
+  // original language.
+  //
+  // Latched per URL, so it fires once per video and re-arms on navigation
+  // without any listener of its own — the tick already runs.
+  let autoStartedFor = null;
+
+  async function maybeAutoStart() {
+    if (!session) return;
+    const url = window.location.href;
+    if (autoStartedFor === url) return;
+    let enabled = false;
+    try {
+      const stored = await chrome.storage.local.get(Session.TRANSLATE_KEYS);
+      // Resolved, not read: the new key replaced two older ones, and reading
+      // only it reset every viewer who already had automatic dubbing.
+      enabled = Session.resolveTranslateEnabled(stored);
+    } catch (_) { return; }
+    if (window.location.href !== url) return;     // navigated while awaiting
+    if (!Session.shouldAutoStart(session.view(), { enabled })) return;
+    // Latch BEFORE awaiting the press: `primary()` takes a round trip to the
+    // server, and a second tick inside that window would submit twice.
+    autoStartedFor = url;
+    try { await session.primary(); } catch (_) { /* the view shows it */ }
+    render();
+  }
+
   function onPress() {
     if (!session) return;
+    // Record the remembered choice HERE, on the press, not when playback
+    // eventually starts. `content.js` writes it in `playQuality` /
+    // `playWatchAlongFor`, which only run once audio actually plays — so
+    // pressing translate on a video that was not cached yet left the flag
+    // unwritten while the job ran, and switching videos mid-job started the
+    // next one in the original language. The press is the intent; whether the
+    // job succeeds is a separate question.
+    const action = session.view().action;
+    if (action === "start") rememberTranslateEnabled(true);
+    else if (action === "stop") rememberTranslateEnabled(false);
     session.primary().then(() => render()).catch(() => render());
+  }
+
+  function rememberTranslateEnabled(on) {
+    try {
+      chrome.storage.local.set({ patmirTranslateEnabled: !!on });
+    } catch (_) { /* the primitives write it too; this is the early one */ }
   }
 
   // --- ads -------------------------------------------------------------
@@ -403,6 +497,7 @@
     guarded("mount", ensureMounted);
     guarded("ads", handleAds);
     guarded("render", () => render());
+    guarded("auto-start", () => { maybeAutoStart(); });
     tickCount += 1;
     if (session && (tickCount % SESSION_EVERY === 0)) {
       session.tick().then(() => render()).catch((e) => {
@@ -418,7 +513,7 @@
     skipAdsEnabled = stored.patmirSkipAds !== false;
     skipAdSeekEnabled = stored.patmirSkipAdSeek === true;
     session = makeSession(
-      stored.patmirMode === Session.WATCH_ALONG ? Session.WATCH_ALONG : Session.QUALITY);
+      Session.resolveMode(stored));
     session.onChange(() => render());
     ensureMounted();
     session.refresh().then(() => render(true)).catch(() => render(true));

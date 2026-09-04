@@ -137,7 +137,31 @@ Pure decision logic lives in `lib/` so it can be tested without a browser:
   tests drive it by hand with a fake clock.
 
 ```
-node --test extension/tests/
+node --test "extension/tests/*.test.js"
+
+## Reaching a server on another machine
+
+The manifest grants `http://127.0.0.1:8765/*` and nothing else, so pointing the
+extension at a server elsewhere on the network used to fail *inside the
+browser* — the fetch never left, and the symptom was indistinguishable from a
+server that was down.
+
+The permission now follows the address you configure:
+
+1. Start the server bound to the network: `patmir ui --profile cuda --host 0.0.0.0`
+   (it binds loopback by default; see `docs/setup/windows-wsl2-cuda.md` for the
+   WSL2 side, which needs `networkingMode=mirrored` and a firewall rule).
+2. In the options page set the server to `http://<that machine>:<port>` and
+   paste the token, then press Save. Chrome asks once for access to that host;
+   granting it is what makes the extension able to talk to it.
+
+If you decline, **nothing is saved** — deliberately, because an address stored
+without permission is a configuration that looks right and cannot work.
+
+The requested pattern is host-only (`http://192.168.1.50/*`, no port): Chrome's
+match-pattern grammar has no port component, so a host-only pattern is
+unambiguous and covers whichever port the server runs on. `127.0.0.1` and
+`localhost` need no prompt — they are already in the manifest.
 ```
 
 (On Node 26 the bare-directory form was dropped; use

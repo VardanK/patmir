@@ -41,10 +41,12 @@ class MKVOutput:
     ) -> OutputArtifacts:
         out_video = ctx.job_dir / "out.mkv"
         srt_path = ctx.job_dir / "out.hy.srt"
-        _write_srt(srt_path, translated.sentences)
+        with ctx.probe.section("srt_s"):
+            _write_srt(srt_path, translated.sentences)
         ctx.progress("output", 0.2, "wrote SRT")
 
-        has_video = _has_video_stream(source_video)
+        with ctx.probe.section("ffprobe_s"):
+            has_video = _has_video_stream(source_video)
         src_lang_tag = translated.source_lang or "und"
         cmd: list[str] = [
             "ffmpeg", "-y",
@@ -76,7 +78,11 @@ class MKVOutput:
             "-disposition:s:0", "default",
             str(out_video),
         ]
-        subprocess.run(cmd, check=True, capture_output=True)
+        # One ffmpeg: video copied, ORIGINAL audio copied, but the Armenian
+        # dub re-encoded to AAC 192k. That encode is the whole cost of this
+        # stage (~5% of batch wall) and is what `ffmpeg_s` measures.
+        with ctx.probe.section("ffmpeg_s"):
+            subprocess.run(cmd, check=True, capture_output=True)
         ctx.progress("output", 1.0, str(out_video))
         return OutputArtifacts(video=out_video, subtitles=srt_path)
 

@@ -93,12 +93,31 @@ class SentenceTranslator:
                 steered = True
             elif audience != NEUTRAL_AUDIENCE:
                 _warn_unsteerable(ctx, self.inner, audience)
+            import time as _time
+            _b0 = _time.perf_counter()
             results = translate_batch(
                 transcript.sentences,
                 source_lang=source_lang,
                 progress=_on_progress,
                 **batch_kwargs,
             )
+            _batch_wall = _time.perf_counter() - _b0
+            # The batch path wrote NO timings at all, so watch-along translate —
+            # which forces `openrouter_gemini_flash_batch` — was completely
+            # un-instrumented and `BenchResult.translate` was hard-coded None
+            # for that whole mode. One `kind: "chunk"` row, mirroring what the
+            # TTS adapter does for batched decode: a per-sentence latency does
+            # not exist once a round-trip is shared.
+            if ctx.extra.get("bench") and transcript.sentences:
+                tdir = ctx.job_dir / "translate"
+                tdir.mkdir(exist_ok=True)
+                with (tdir / "timings.jsonl").open("w") as f:
+                    f.write(json.dumps({
+                        "kind": "chunk",
+                        "sentences": len(transcript.sentences),
+                        "elapsed_s": round(_batch_wall, 4),
+                        "latency_ms": round(_batch_wall * 1000, 1),
+                    }, ensure_ascii=False) + "\n")
             sentences = [
                 TranslatedSentence(
                     idx=s.idx,

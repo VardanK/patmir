@@ -132,7 +132,18 @@
     if (!rec) return null;
     var stages = rec.stage_states || {};
     var names = Object.keys(stages);
-    if (!names.length) return null;
+    if (!names.length) {
+      // A watch-along record has no `stage_states` at all: it does not walk
+      // the pipeline once, it dubs the video in sections. So the fraction is
+      // how much of the video is dubbed. Without this the in-page progress bar
+      // showed nothing in watch-along, which was invisible until that mode
+      // became the default.
+      if (typeof rec.dubbed_s === "number" && typeof rec.duration === "number"
+          && rec.duration > 0) {
+        return clamp01(rec.dubbed_s / rec.duration);
+      }
+      return null;
+    }
     var done = 0, running = null;
     for (var i = 0; i < names.length; i++) {
       if (stages[names[i]] === "done") done++;
@@ -160,6 +171,13 @@
   // whose text changes every two seconds cannot be aimed at.
   var TRANSLATE = "translate";
   var STOP = "stop";
+  // `cancel`, distinct from `stop`, because the two are different acts and the
+  // words for them read differently. `Չթարգմանել` ("do not translate") is
+  // right while a dub is PLAYING: it turns the Armenian track off. While a job
+  // is being PREPARED it reads as a status — the author's report was that the
+  // button "says that it's not translating, while in reality it does" — so
+  // those states get `Չեղարկել` ("cancel"), which names the action instead.
+  var CANCEL = "cancel";
   var RETRY = "retry";
   var SETTINGS = "settings";
 
@@ -211,7 +229,13 @@
       else if (job.status === "prelude") kind = "prelude";
       else if (job.status === "streaming") kind = "streaming";
       else if (runningStage(job) === "download") kind = "downloading";
-      return view(kind, STOP, {
+      // `Չեղարկել` for EVERY in-flight job, streaming included (author's
+      // call). Watch-along does play while producing, which is why STOP was
+      // used here at first — but the button's job is to name what pressing it
+      // does, and while work is still queued behind the playhead that is
+      // cancelling the work, not just muting a finished track. `Չթարգմանել`
+      // is left to states where nothing is being produced any more.
+      return view(kind, CANCEL, {
         action: "stop", tone: "active", busy: true,
         progress: jobProgress(job),
         // `job` is null while phase is "submitting" — the request is in flight
@@ -265,6 +289,65 @@
     return view("not-cached", TRANSLATE, { action: "start", tone: "idle", mode: s.mode });
   }
 
+  /**
+   * Which mode a surface should use when the viewer has not chosen one.
+   *
+   * Watch-along by default (author's call): it starts playing within about
+   * half a minute instead of after a full pass over the video, which is the
+   * difference between pressing translate and watching, and pressing
+   * translate and waiting. Quality mode stays one click away and an explicit
+   * stored choice always wins.
+   *
+   * Mode is folded into the cache key, so this changes which dubs a lookup
+   * finds: a video previously dubbed in quality mode is not the same cache
+   * entry as the same video in watch-along.
+   */
+  function resolveMode(stored) {
+    var st = stored || {};
+    return st.patmirMode === QUALITY ? QUALITY : WATCH_ALONG;
+  }
+
+  /**
+   * Resolve the remembered translate-everything choice from stored values.
+   *
+   * `patmirTranslateEnabled` replaced two older keys, and reading only the new
+   * one silently reset everybody who already had translation working: the
+   * author reloaded, opened a video and got the original language with a blue
+   * `Թարգմանել` button, because the new flag had never been written.
+   *
+   * `patmirAutoPlayEnabled` is the legacy signal and it DEFAULTED ON, so a
+   * stored `true` means "this viewer had automatic dubbing and expects it".
+   * That is honoured once; anything explicit on the new key always wins.
+   */
+  function resolveTranslateEnabled(stored) {
+    var st = stored || {};
+    if (typeof st.patmirTranslateEnabled === "boolean") {
+      return st.patmirTranslateEnabled;
+    }
+    return st.patmirAutoPlayEnabled === true;
+  }
+
+  /**
+   * Should the surface press its own start button?
+   *
+   * `patmirTranslateEnabled` is a GLOBAL, remembered choice, not a per-video
+   * one: "if enabled it should work for all videos, if disabled should not
+   * translate". So this fires on any video whose view offers `start`, which
+   * includes one that has never been dubbed — that is the point, and it means
+   * enabling translation submits work.
+   *
+   * `retry` is deliberately NOT auto-pressed. A failed job that re-submits
+   * itself is a loop, and the failure is usually the reason the viewer needs
+   * to see the button.
+   */
+  function shouldAutoStart(v, opts) {
+    var o = opts || {};
+    if (!o.enabled) return false;
+    if (o.tried) return false;
+    if (!v || v.disabled) return false;
+    return v.action === "start";
+  }
+
   function view(kind, label, extra) {
     var v = {
       kind: kind,
@@ -309,6 +392,7 @@
     labels: {
       translate: "Թարգմանել",
       stop: "Չթարգմանել",
+      cancel: "Չեղարկել",
       retry: "Կրկին փորձել",
       settings: "Կարգավորել",
     },
@@ -342,6 +426,7 @@
     labels: {
       translate: "Translate this",
       stop: "Stop dub",
+      cancel: "Cancel",
       retry: "Retry",
       settings: "Open options",
     },
@@ -683,13 +768,20 @@
         .then(function () {
           // Cancel the server-side work too. Quality jobs had no path to this
           // at all from the extension, so switching translation off left the
-          // GPU grinding on a dub nobody was waiting for — the waste
-          // `stream:stop` already prevents for watch-along.
-          if (job && job.job_id && !TERMINAL[job.status] && st.mode !== WATCH_ALONG) {
-            return tx.sw({ type: "jobs:cancel", job_id: job.job_id })
+          // GPU grinding on a dub nobody was waiting for.
+          if (!job || !job.job_id || TERMINAL[job.status]) return null;
+          if (st.mode === WATCH_ALONG) {
+            // The content script's `stopWatchAlong` sends `stream:stop` too,
+            // but only once playback has ATTACHED (`waActive`). While the job
+            // is still in prelude the button already reads Չեղարկել, and
+            // pressing it stopped nothing on the server. `/stream/<key>/stop`
+            // is idempotent, so the two never fight.
+            if (!job.cache_key) return null;
+            return tx.sw({ type: "stream:stop", cache_key: job.cache_key })
               .catch(function () { return null; });
           }
-          return null;
+          return tx.sw({ type: "jobs:cancel", job_id: job.job_id })
+            .catch(function () { return null; });
         })
         .then(function () {
           if (job && job.cache_key) forgetJob(job.cache_key);
@@ -811,7 +903,12 @@
     ACTIVE_JOBS_KEY: ACTIVE_JOBS_KEY,
     ACTIVE_JOBS_MAX: ACTIVE_JOBS_MAX,
     MOUNTS: MOUNTS,
-    LABELS: { TRANSLATE: TRANSLATE, STOP: STOP, RETRY: RETRY, SETTINGS: SETTINGS },
+    LABELS: { TRANSLATE: TRANSLATE, STOP: STOP, CANCEL: CANCEL, RETRY: RETRY,
+              SETTINGS: SETTINGS },
+    shouldAutoStart: shouldAutoStart,
+    resolveTranslateEnabled: resolveTranslateEnabled,
+    resolveMode: resolveMode,
+    TRANSLATE_KEYS: ["patmirTranslateEnabled", "patmirAutoPlayEnabled"],
     STRINGS_HY: STRINGS_HY,
     STRINGS_EN: STRINGS_EN,
     NULL_PLAYER: NULL_PLAYER,

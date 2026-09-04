@@ -185,6 +185,16 @@ class OpenRouterTranslator:
         # DeepSeek-native control passed straight through OpenRouter. Set
         # `{"type": "disabled"}` to skip chain-of-thought.
         thinking: dict | None = None,
+        # How many sentence round-trips are in flight at once. Overrides the
+        # class default so the knob that decides ~13% of batch wall is tunable
+        # from `patmir.toml` instead of only from code.
+        concurrency: int | None = None,
+        # Bounded retry for transient failures. Before this, ANY non-200 —
+        # a 429, a provider 5xx, a dropped connection — raised straight out of
+        # the thread pool and failed the whole translate stage, discarding
+        # every sentence already translated in that job.
+        max_attempts: int = 3,
+        retry_backoff_s: float = 0.5,
         # Optional OpenRouter attribution headers (recommended by their docs).
         referer: str = "https://github.com/patmir-dub",
         title: str = "Patmir Armenian Dubbing",
@@ -203,6 +213,10 @@ class OpenRouterTranslator:
         self.top_p = top_p
         self.reasoning = reasoning
         self.thinking = thinking
+        if concurrency is not None:
+            self.translate_concurrency = max(1, int(concurrency))
+        self.max_attempts = max(1, int(max_attempts))
+        self.retry_backoff_s = float(retry_backoff_s)
         self.base_url = base_url.rstrip("/")
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -211,6 +225,49 @@ class OpenRouterTranslator:
             "X-Title": title,
         }
         self._client = httpx.Client(timeout=timeout_seconds)
+
+    # Statuses worth trying again: rate limiting, and the provider's own
+    # transient failures. A 400 or a 401 will fail identically next time, so
+    # retrying them only delays a real error.
+    _RETRYABLE = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+
+    def _post_with_retry(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """One chat completion, retried on transient failures.
+
+        Before this, any non-200 raised straight out of the adapter's thread
+        pool and failed the whole translate stage — throwing away every
+        sentence already translated in that job for one 429. Cloud output is
+        already non-deterministic at temperature 0.2, so a retry cannot change
+        the guarantees; it only decides whether one bad round-trip costs a
+        sentence or the run.
+        """
+        import time as _time
+
+        last: Exception | None = None
+        for attempt in range(self.max_attempts):
+            try:
+                resp = self._client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    json=payload,
+                )
+            except Exception as exc:  # noqa: BLE001 — httpx transport errors
+                last = exc
+            else:
+                if resp.status_code == 200:
+                    return resp.json()
+                last = RuntimeError(
+                    f"openrouter translator: HTTP {resp.status_code} from "
+                    f"{self.model}: {resp.text[:500]}"
+                )
+                if resp.status_code not in self._RETRYABLE:
+                    raise last
+            if attempt + 1 < self.max_attempts:
+                # 0.5, 1.0, 2.0 ... — short enough not to stall a watch-along
+                # section, long enough for a rate limiter to drain.
+                _time.sleep(self.retry_backoff_s * (2 ** attempt))
+        assert last is not None
+        raise last
 
     def translate(
         self,
@@ -248,17 +305,7 @@ class OpenRouterTranslator:
             payload["reasoning"] = self.reasoning
         if self.thinking is not None:
             payload["thinking"] = self.thinking
-        resp = self._client.post(
-            f"{self.base_url}/chat/completions",
-            headers=self.headers,
-            json=payload,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"openrouter translator: HTTP {resp.status_code} from {self.model}: "
-                f"{resp.text[:500]}"
-            )
-        data = resp.json()
+        data = self._post_with_retry(payload)
         try:
             message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -299,6 +346,9 @@ def build(config: dict[str, Any]) -> OpenRouterTranslator:
         base_url=config.get("base_url", _BASE_URL),
         reasoning=config.get("reasoning"),
         thinking=config.get("thinking"),
+        concurrency=config.get("concurrency"),
+        max_attempts=int(config.get("max_attempts", 3)),
+        retry_backoff_s=float(config.get("retry_backoff_s", 0.5)),
         referer=config.get("referer", "https://github.com/patmir-dub"),
         title=config.get("title", "Patmir Armenian Dubbing"),
     )
