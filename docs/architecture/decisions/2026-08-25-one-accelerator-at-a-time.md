@@ -80,7 +80,12 @@ which is what the existing tests construct.
   `StreamManager._run_blocking`, so a URL submission blocks batch work while
   doing pure network I/O. Wasteful, not incorrect — the download is upstream of
   the accelerator work in the same function, and splitting it out is a bigger
-  change than this fix warranted. Worth doing if it bites.
+  change than this fix warranted. Worth doing if it bites. **It bit on
+  2026-09-04, differently than priced:** a YouTube Mix URL made the download
+  itself endless, so the hold was not "wasteful" but a hang with the GPU idle.
+  Fixed at the download (`noplaylist` + a cancel token that reaches into
+  yt-dlp), not by moving it out of the lock — see
+  `2026-09-04-download-inside-the-lock-and-waiting-cancel`.
 - Nothing frees VRAM without a process restart: `_free_accelerator_cache()` runs
   only at prewarm (`runner.py:88`) and on an actual stage build
   (`runner.py:226`). That gate is deliberate — reverting it cost a 1.710 → 3.018

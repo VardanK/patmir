@@ -474,7 +474,11 @@ class JobManager:
             try:
                 local_path = self._download_url(
                     rec.source_url, rec.download_key or rec.cache_key, rec,
+                    cancel=cancel,
                 )
+            except JobCancelled:
+                rec.stage_states["download"] = "cancelled"
+                raise
             except Exception:
                 rec.stage_states["download"] = "failed"
                 raise
@@ -520,13 +524,24 @@ class JobManager:
             pipeline_summary=cache_mod.pipeline_summary(cfg),
         )
 
-    def _download_url(self, url: str, cache_key: str, rec: "JobRecord | None" = None) -> Path:
+    def _download_url(self, url: str, cache_key: str, rec: "JobRecord | None" = None,
+                      cancel: threading.Event | None = None) -> Path:
         """yt-dlp pre-download to a known dir keyed by cache_key.
 
         Re-uses already-downloaded files between retries so a re-submit after
         pipeline failure doesn't re-fetch from YouTube. When `rec` is given,
         updates `rec.download_pct` + `rec.live_*` on each yt-dlp progress
         tick so the popup can show progress while waiting.
+
+        `cancel` is the job's cooperative token. The download runs INSIDE the
+        accelerator lock, so a download that cannot be stopped holds the GPU
+        hostage for every later job: on 2026-09-04 a watch-along stream sat in
+        `extract_info` for 6+ minutes with the card idle while two re-submits
+        of the same video queued behind it as `waiting` (quality issue #33).
+        yt-dlp's own abort mechanism is a `DownloadCancelled` raised from a
+        hook, which `extract_info` re-raises verbatim; we raise it from both
+        the per-entry `match_filter` and the per-chunk progress hook and turn
+        it into `JobCancelled` at the boundary.
         """
         dest = self._downloads_dir / cache_key
         dest.mkdir(parents=True, exist_ok=True)
@@ -540,12 +555,30 @@ class JobManager:
 
         try:
             import yt_dlp  # type: ignore[import-untyped]
+            from yt_dlp.utils import DownloadCancelled  # type: ignore[import-untyped]
         except ImportError as exc:
             raise RuntimeError(
                 "yt-dlp not installed. Install patmir[local] to enable URL ingest."
             ) from exc
 
+        if cancel is not None and cancel.is_set():
+            raise JobCancelled("download")
+
+        def _check_cancel() -> None:
+            if cancel is not None and cancel.is_set():
+                # A message (not NO_DEFAULT) makes yt-dlp re-raise instead of
+                # prompting interactively — see `YoutubeDL._match_entry`.
+                raise DownloadCancelled("cancelled by the user")
+
+        def _match_filter(info: dict, *, incomplete: bool = False):
+            # Called once per entry before its download starts.
+            _check_cancel()
+            return None
+
         def _hook(info: dict) -> None:
+            # Called on every downloaded chunk; the cheapest place to notice
+            # a Stop that landed mid-transfer.
+            _check_cancel()
             if rec is None:
                 return
             st = info.get("status")
@@ -576,10 +609,31 @@ class JobManager:
             "noprogress": True,
             "retries": 3,
             "progress_hooks": [_hook],
+            "match_filter": _match_filter,
+            # A `watch?v=<id>&list=<playlist>` URL is ONE video to us — the
+            # cache key is `yt:<id>` — but to yt-dlp it is the whole playlist,
+            # and a YouTube Mix (`list=RD...`) is effectively endless. Without
+            # this, one submission downloaded entry after entry into the same
+            # `source.%(ext)s` (two different videos' audio were found in one
+            # download dir), the hook reported "download complete" after the
+            # FIRST entry, and `extract_info` never returned. Quality issue #33.
+            "noplaylist": True,
         }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+        except DownloadCancelled as exc:
+            raise JobCancelled("download") from exc
+        if isinstance(info, dict) and info.get("_type") in ("playlist", "multi_video"):
+            # `noplaylist` only disambiguates a URL that names both a video and
+            # a playlist. A bare playlist URL, a channel, or the YouTube home
+            # page still comes back as a playlist — and `prepare_filename` on
+            # that gives `source.NA` while yt-dlp has fetched N entries. Fail
+            # fast with a reason the popup can show.
+            raise RuntimeError(
+                f"URL resolves to a playlist/channel, not a single video: {url}"
+            )
         path = Path(filename)
         if not path.is_file():
             # yt-dlp may rewrite the extension post-merge; fall back to scanning.

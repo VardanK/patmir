@@ -408,6 +408,35 @@ test("a playing page reads Չթարգմանել", async () => {
   assert.ok(button.className.includes("stop"));
 });
 
+test("a busy job with nothing measurable shows the sweeping band, not a grey button", async () => {
+  // Watch-along start-up (waiting for the GPU, prelude) has no percentage;
+  // the fill used to be hidden for all of it, so the button looked dead.
+  for (const job of [
+    { status: "waiting", job_id: "j" },
+    { status: "prelude", job_id: "j" },
+    { status: "streaming", job_id: "j", dubbed_s: 0, duration: 600 },   // 0% == nothing
+  ]) {
+    const { root } = await mounted({ state: { phase: "job", job } });
+    const button = root.shadow.children[0].children[0];
+    const fill = button.children.find((c) => c.className.startsWith("fill"));
+    assert.equal(fill.className, "fill indeterminate", job.status);
+    assert.equal(button.attributes["aria-busy"], "true", job.status);
+  }
+});
+
+test("a measurable job shows the proportional fill; an idle page shows none", async () => {
+  const busy = await mounted({
+    state: { phase: "job", job: { status: "streaming", job_id: "j", dubbed_s: 180, duration: 600 } },
+  });
+  const fill = busy.root.shadow.children[0].children[0].children.find((c) => c.className.startsWith("fill"));
+  assert.equal(fill.className, "fill");
+  assert.equal(fill.style.width, "30%");
+
+  const idle = await mounted();
+  const idleFill = idle.root.shadow.children[0].children[0].children.find((c) => c.className.startsWith("fill"));
+  assert.equal(idleFill.className, "fill hidden");
+});
+
 test("render is diffed: an unchanged state does not rewrite the DOM", async () => {
   // Unconditional writes at 2 Hz inside YouTube's layout, on a page decoding
   // video, is what shows up as dropped frames and gets blamed on the dub.

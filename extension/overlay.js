@@ -253,6 +253,24 @@
       pointer-events: none; z-index: 0;
     }
     .fill.hidden { display: none; }
+    /* Busy with nothing to measure yet — submitting, queued, waiting for the
+       GPU, a watch-along prelude — used to be the hidden fill, i.e. a flat
+       grey button for the whole start-up (author: "the green progress does
+       not appear"). A sweeping band says "working" without inventing a
+       percentage; a percentage here would have to fall back to ~1% when the
+       first section lands, which is how a progress bar goes backwards. */
+    .fill.indeterminate {
+      width: 30%; left: -30%;
+      border-right: none;
+      animation: patmir-sweep 1.6s linear infinite;
+    }
+    @keyframes patmir-sweep {
+      from { left: -30%; }
+      to   { left: 100%; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .fill.indeterminate { animation: none; left: 0; width: 100%; opacity: 0.5; }
+    }
     .label, .sub { position: relative; z-index: 1; }
     button.error { background: #c5221f; color: #fff; }
     button.warn  { background: #b06000; color: #fff; }
@@ -353,9 +371,15 @@
       (neutral ? "stop" : "") +
       (v.tone === "error" ? " error" : v.tone === "warn" ? " warn" : "");
 
-    if (pct === null) {
-      fillEl.className = "fill hidden";
-      fillEl.style.width = "0%";
+    if (pct === null || pct === 0) {
+      // 0% is as invisible as hidden; both mean "nothing measurable yet".
+      if (v.busy) {
+        fillEl.className = "fill indeterminate";
+        fillEl.style.width = "";        // the sweep's width comes from the CSS
+      } else {
+        fillEl.className = "fill hidden";
+        fillEl.style.width = "0%";
+      }
     } else {
       fillEl.className = "fill";
       fillEl.style.width = pct + "%";

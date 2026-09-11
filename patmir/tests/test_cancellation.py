@@ -258,5 +258,204 @@ class StopStreamTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(streamer.stop_stream("no-such-key"))
 
 
+class WaitingStreamCancelTest(unittest.IsolatedAsyncioTestCase):
+    """Quality issue #33 (2026-09-04). A stream parked on the accelerator lock
+    is `waiting`, and `StreamManager.cancel` only knew `queued` as the
+    not-started status — so the Stop fell into the running branch, found no
+    token (none exists before `_run_locked`), and left the record
+    `cancelling`. `_run` skips only `cancelled`, so the "cancelled" stream ran
+    in full when the lock freed. The batch side had `waiting` from day one."""
+
+    async def test_cancelling_a_waiting_stream_is_instant_and_the_body_never_runs(self):
+        ran: list[str] = []
+        with TemporaryDirectory() as td:
+            lock = asyncio.Lock()
+            _, streamer = _managers(td, lock=lock)
+
+            async def fake_locked(rec, force):
+                ran.append(rec.job_id)
+            streamer._run_locked = fake_locked  # type: ignore[method-assign]
+
+            rec = _stream_record()
+            streamer._records[rec.job_id] = rec
+            streamer._by_cache_key[rec.cache_key] = rec.job_id
+
+            await lock.acquire()                     # a stream is on the GPU
+            task = asyncio.create_task(streamer._run(rec, False))
+            deadline = time.monotonic() + 5.0
+            while rec.status != "waiting":
+                if time.monotonic() > deadline:
+                    self.fail(f"never reported waiting (status={rec.status})")
+                await asyncio.sleep(0.01)
+
+            self.assertTrue(streamer.cancel(rec.job_id))
+            self.assertEqual(rec.status, "cancelled")
+            self.assertIsNotNone(rec.finished_at)
+
+            lock.release()
+            await asyncio.wait_for(task, 5.0)
+        self.assertEqual(ran, [], "a cancelled waiting stream must never start")
+
+    async def test_stop_stream_reaches_every_live_record_for_the_key(self):
+        """`_by_cache_key` points at the newest submission only. After a Stop
+        + re-submit the record actually holding the accelerator was no longer
+        reachable from `/stream/<key>/stop`; on 2026-09-04 three records for
+        one video stacked up (running-but-stuck, cancelling-never-started,
+        waiting) and only the last could be stopped."""
+        with TemporaryDirectory() as td:
+            _, streamer = _managers(td)
+            older = _stream_record()
+            older.job_id = "stream-older"
+            older.status = "prelude"
+            ev = threading.Event()
+            streamer._cancels[older.job_id] = ev
+            newer = _stream_record()
+            newer.job_id = "stream-newer"
+            newer.status = "waiting"
+            finished = _stream_record()
+            finished.job_id = "stream-finished"
+            finished.status = "done"
+            for r in (older, newer, finished):
+                streamer._records[r.job_id] = r
+            streamer._by_cache_key[newer.cache_key] = newer.job_id
+
+            self.assertTrue(streamer.stop_stream(newer.cache_key))
+            self.assertTrue(ev.is_set(), "the record holding the accelerator was not told to stop")
+            self.assertEqual(older.status, "cancelling")
+            self.assertEqual(newer.status, "cancelled")
+            self.assertEqual(finished.status, "done")
+
+
+class _FakeYtDlp:
+    """Stand-in for the `yt_dlp` module: records the options `_download_url`
+    passes and lets a test script what `extract_info` does."""
+
+    class utils:  # noqa: N801 — mirrors the real module layout
+        class DownloadCancelled(Exception):
+            def __init__(self, msg=None):
+                super().__init__(msg)
+                self.msg = msg
+
+    def __init__(self, behaviour):
+        self.behaviour = behaviour
+        self.constructed: list[dict] = []
+        outer = self
+
+        class YoutubeDL:
+            def __init__(self, opts):
+                outer.constructed.append(opts)
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=True):
+                return outer.behaviour(self.opts, url)
+
+            def prepare_filename(self, info):
+                return info["_filename"]
+
+        self.YoutubeDL = YoutubeDL
+
+
+class DownloadCancelTest(unittest.TestCase):
+    """The yt-dlp download runs INSIDE the accelerator lock and used to be the
+    one place the token was never consulted. On 2026-09-04 a stream sat in
+    `extract_info` for 6+ minutes on a `watch?v=..&list=RD..` (YouTube Mix)
+    URL — yt-dlp walking the whole mix, one entry after another — with the GPU
+    idle and every later submission `waiting` behind it."""
+
+    def _manager(self, td: str) -> JobManager:
+        jobs, _ = _managers(td)
+        return jobs
+
+    def _install(self, fake):
+        import sys
+        saved = {k: sys.modules.get(k) for k in ("yt_dlp", "yt_dlp.utils")}
+        sys.modules["yt_dlp"] = fake
+        sys.modules["yt_dlp.utils"] = fake.utils
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        self.addCleanup(restore)
+
+    def test_single_video_options_and_cancel_hooks_are_wired(self):
+        with TemporaryDirectory() as td:
+            jobs = self._manager(td)
+            def ok(opts, url):
+                out = Path(opts["outtmpl"] % {"ext": "m4a"})
+                out.write_bytes(b"x")
+                return {"_type": "video", "_filename": str(out)}
+            fake = _FakeYtDlp(ok)
+            self._install(fake)
+            path = jobs._download_url("https://www.youtube.com/watch?v=abc&list=RDabc",
+                                      "k", None, cancel=threading.Event())
+            self.assertTrue(path.is_file())
+            opts = fake.constructed[0]
+            self.assertIs(opts.get("noplaylist"), True,
+                          "a watch URL with list= must download ONE video")
+            self.assertTrue(callable(opts.get("match_filter")))
+            self.assertTrue(opts.get("progress_hooks"))
+
+    def test_token_set_before_the_download_aborts_without_touching_yt_dlp(self):
+        with TemporaryDirectory() as td:
+            jobs = self._manager(td)
+            fake = _FakeYtDlp(lambda opts, url: self.fail("must not extract"))
+            self._install(fake)
+            ev = threading.Event(); ev.set()
+            with self.assertRaises(JobCancelled):
+                jobs._download_url("https://youtu.be/abc", "k", None, cancel=ev)
+            self.assertEqual(fake.constructed, [])
+
+    def test_token_set_mid_download_surfaces_as_job_cancelled(self):
+        """yt-dlp's abort path: a hook raises `DownloadCancelled`, which
+        `extract_info` re-raises verbatim. The boundary must translate it so
+        the server records `cancelled`, not `failed`."""
+        with TemporaryDirectory() as td:
+            jobs = self._manager(td)
+            ev = threading.Event()
+            def mid_download(opts, url):
+                # The per-entry filter passes while the token is clear...
+                self.assertIsNone(opts["match_filter"]({"id": "abc"}, incomplete=False))
+                ev.set()                      # ...then Stop lands mid-transfer
+                for hook in opts["progress_hooks"]:
+                    hook({"status": "downloading", "downloaded_bytes": 1, "total_bytes": 2})
+                self.fail("hook did not abort the download")
+            fake = _FakeYtDlp(mid_download)
+            self._install(fake)
+            with self.assertRaises(JobCancelled):
+                jobs._download_url("https://youtu.be/abc", "k", None, cancel=ev)
+
+    def test_playlist_result_fails_fast_instead_of_source_na(self):
+        """`noplaylist` cannot help a bare playlist / channel / home-page URL —
+        yt-dlp still returns a playlist, `prepare_filename` on it gives
+        `source.NA`, and before this the error came only after N entries were
+        fetched (observed: `https://www.youtube.com/` submitted by the
+        extension)."""
+        with TemporaryDirectory() as td:
+            jobs = self._manager(td)
+            fake = _FakeYtDlp(lambda opts, url: {"_type": "playlist", "entries": [],
+                                                 "_filename": "source.NA"})
+            self._install(fake)
+            with self.assertRaisesRegex(RuntimeError, "playlist"):
+                jobs._download_url("https://www.youtube.com/", "k", None)
+
+    def test_no_token_downloads_as_before(self):
+        with TemporaryDirectory() as td:
+            jobs = self._manager(td)
+            def ok(opts, url):
+                out = Path(opts["outtmpl"] % {"ext": "webm"})
+                out.write_bytes(b"x")
+                return {"_type": "video", "_filename": str(out)}
+            self._install(_FakeYtDlp(ok))
+            self.assertTrue(jobs._download_url("https://youtu.be/abc", "k").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
