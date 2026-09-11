@@ -40,3 +40,11 @@ samples/
 *.webm
 # Allow committed sample audio under eval_data/ if needed:
 !eval_data/**/*.wav
+
+# Agent tool state — local to one machine, not shared.
+# `.claude/commands/` IS tracked and shared (the agent-os slash commands), so
+# .claude is ignored by contents rather than wholesale: ignoring the directory
+# would silently swallow a command file added later.
+.claude/*
+!.claude/commands/
+.impeccable/
