@@ -1,0 +1,6 @@
+=== arm noexp : PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False ===
+server up pid=100933  va_marker_at_start=1788802014
+run  1 done   tts=  27.92s ms/step=   26.9 slow=0 cap=9 reuse=0 vram=18025MiB new_va_errors=no
+run  2 done   tts=  23.31s ms/step=   26.9 slow=0 cap=17 reuse=1 vram=18163MiB new_va_errors=no
+run  3 done   tts=  22.85s ms/step=   26.9 slow=0 cap=24 reuse=2 vram=18981MiB new_va_errors=no
+run  4 running ERROR unsupported operand type(s) for -: 'NoneType' and 'float' vram=19090MiB new_va=1

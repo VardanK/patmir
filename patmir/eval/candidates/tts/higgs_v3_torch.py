@@ -440,6 +440,57 @@ class _DecodeGraph:
 # are still exact.
 _SYNC_EVERY = 4
 
+# Cost per decode step, in ms, that the three real renderers hit on the
+# reference 3090 (graph + gqa / graph / eager). `_note_chunk_cost` warns above
+# `_SLOW_STEP_MS`, which clears the slowest of them by 4x so that an ordinary
+# graph fallback is never reported as a degraded accelerator.
+_HEALTHY_STEP_MS = 45
+_SLOW_STEP_MS = 200.0
+
+# --- fixed decode geometry ------------------------------------------------
+#
+# Chunks are formed by sorting a job's sentences by cap, so consecutive chunks
+# differ in batch width, prompt length AND cap — every chunk is a new geometry,
+# so every chunk captured its own CUDA graph. Measured 2026-09-07: ~9 captures
+# per job, VRAM climbing 15.4 -> 19.1 GB over four jobs and never coming back,
+# ending in `dxgkio_reserve_gpu_va` EOVERFLOW and an 86x decode slowdown. A
+# graph's memory pool is never returned to the general allocator, so this grows
+# whether the pool is shared or private — the fix is to stop minting geometries.
+#
+# Rounding each dimension onto a coarse grid collapses a job's chunks onto a
+# handful of shapes, and — the part that actually matters — those shapes RECUR
+# across jobs, so the captured set stops growing after the first job or two
+# instead of growing forever.
+#
+# Grids are a deliberate trade, not tuning knobs discovered by sweep:
+#   B    padding a row costs its attention width for the whole chunk, and
+#        watch-along sections can carry as few as 3 sentences, so a coarse
+#        grid here would tax the latency-critical path. 4 keeps the worst case
+#        at +3 rows.
+#   seq  prompt lengths cluster tightly (one pinned ref per speaker), so 128
+#        usually collapses a whole job to one or two buckets.
+#   cap  `token_cap` is already clamped to [200, 1024], so 256 gives at most 4.
+_GEOM_B_GRID = 4
+_GEOM_SEQ_GRID = 128
+_GEOM_CAP_GRID = 256
+#: Cap given to a padding row: it must decode something well-defined (a fully
+#: masked row makes softmax produce NaN and would poison the batch), but it
+#: should retire immediately. Its output is discarded.
+_PAD_ROW_CAP = 8
+
+
+def _bucket_up(n: int, grid: int, hard_max: int | None = None) -> int:
+    """Round `n` up onto `grid`, never below `n`, clamped to `hard_max`.
+
+    Never below `n` is the load-bearing half: the value feeds the attention
+    width and the cache length, so rounding DOWN would truncate a real row's
+    prompt or cap.
+    """
+    out = ((n + grid - 1) // grid) * grid
+    if hard_max is not None:
+        out = min(max(out, n), hard_max)
+    return max(out, n)
+
 
 def _balanced_chunks(items: list[int], size: int) -> list[list[int]]:
     """Split into the FEWEST chunks of at most `size`, balanced in length.
@@ -562,6 +613,7 @@ class HiggsV3Torch:
         max_retries: int = 2,
         max_batch: int = 8,
         cuda_graphs: bool = True,
+        fixed_geometry: bool = False,
         decode_attention: str = "sdpa",
         _model: Any = None,
         _tokenizer: Any = None,
@@ -590,6 +642,20 @@ class HiggsV3Torch:
         # byte-identical to DynamicCache even with ragged left-padded prompts.
         # So this is not a quality trade — see `_capture_decode_graph`.
         self.cuda_graphs = bool(cuda_graphs)
+        # Round the decode geometry onto a coarse grid so a job's chunks share
+        # shapes. **Defaults OFF: measured 2026-09-07 as a net harm.** Bucketing
+        # collapsed a real job from 8 geometries to 5 rather than to 1, while
+        # padding raised the VRAM floor ~1 GB — so the address-space ceiling
+        # arrived at run 2 instead of run 4. Kept because it is tested and is
+        # the groundwork for a single process-wide geometry, which is what the
+        # NVIDIA guidance ("reduce the number of graphs") actually asks for.
+        # Applied whether or not graphs are on, and that is deliberate:
+        # `cuda_graphs` lives in `ui.cache._NON_OUTPUT_KEYS` and carries a bench
+        # env override, so anything gated on it can change a rendering under an
+        # unchanged cache key — the exact trap the `max_batch` comment in
+        # `build()` records. Padding costs the eager path a little width it does
+        # not need; keeping one rendering per cache key is worth more.
+        self.fixed_geometry = bool(fixed_geometry)
         # "gqa" swaps the single-token decode attention for a grouped matmul
         # that skips transformers' `repeat_kv` expansion; "sdpa" keeps
         # transformers' kernel everywhere.
@@ -686,6 +752,18 @@ class HiggsV3Torch:
         # on every call; with one pinned ref per speaker that is the same clip
         # re-encoded once per sentence.
         self._ref_cache: dict[str, Any] = {}
+        # ONE memory pool shared by every capture, and ONE live capture reused
+        # across same-shape chunks. Both exist because a fresh `CUDAGraph()`
+        # per chunk reserves its own GPU virtual address range, and under WSL2
+        # that address space is the binding resource long before VRAM is:
+        # `dxgkio_reserve_gpu_va` starts failing with EOVERFLOW, cudaMalloc
+        # then fails with gigabytes still free, and the decode falls back to
+        # host-side paths that cost ~1.5 s/step against ~17 ms. See
+        # `decisions/2026-09-07-tts-graph-pool-and-gpu-va-exhaustion.md`.
+        self._graph_pool: Any = None
+        self._graph_holder: Any = None
+        self._graph_key: tuple | None = None
+        self._chunk_steps = 0
         self._summary: dict[str, Any] = {
             "engine": f"higgs_v3_torch_{dtype}",
             "device": self.device,
@@ -705,6 +783,19 @@ class HiggsV3Torch:
             "onset_bursts": 0,
             "onset_bursts_kept": 0,
             "graph_fallbacks": 0,
+            # Captures actually taken vs. chunks served from the live capture.
+            # A healthy long job holds `graph_captures` near the number of
+            # DISTINCT (B, seq, max_cap) shapes, not near `batches`; a ratio
+            # that tracks `batches` means reuse is missing and the GPU address
+            # space is being churned again.
+            "graph_captures": 0,
+            "graph_reuses": 0,
+            # Chunks whose measured cost per decode step exceeded
+            # `_SLOW_STEP_MS`. Non-zero means the accelerator has degraded
+            # under this process and the run is no longer comparable to a
+            # baseline — the state that used to be visible only in dmesg.
+            "slow_chunks": 0,
+            "slowest_ms_per_step": 0.0,
         }
 
         self._check_audio_head_tied()
@@ -791,6 +882,89 @@ class HiggsV3Torch:
         )
 
     # ---- batched autoregressive decode ---- #
+    def _acquire_decode_graph(self, *, embeds, mask_full, position_ids, seq,
+                              B, N, device, probe):
+        """Return `(holder, hidden0, next_pos)` for this chunk, reusing the
+        live capture when the chunk has the same shape, else capturing one.
+
+        Returns None on any failure, exactly as capture alone used to, so the
+        caller's eager fallback is unchanged.
+
+        **The reuse key is the full captured geometry** — `(B, seq,
+        max_cache_len)`. Not a prefix of it, and not "close enough": the graph
+        replays fixed addresses, and `_decode_chunk`'s own docstring records
+        that the graph attends over `seq + max_cap` columns while the eager
+        path attends over `seq + step + 1`, so a graph replayed at a geometry
+        it was not captured at would not merely be wrong, it would be
+        *silently* wrong — a rendered line with no error anywhere. A mismatch
+        therefore drops the capture and takes a new one.
+
+        On reuse the prefill still runs, into the SAME `StaticCache`: the
+        capture froze the cache's addresses, so the new chunk's keys and values
+        have to land in those buffers. `reset()` zeroes them first, which is
+        what makes a reused capture bitwise identical to a fresh one rather
+        than merely equivalent — `GraphReuseEquivalenceTest` pins that.
+        """
+        import torch
+
+        if not self.cuda_graphs or device.type != "cuda":
+            return None
+        key = (B, seq, int(mask_full.shape[1]), N)
+        holder = self._graph_holder
+        if holder is not None and self._graph_key == key:
+            try:
+                with probe.section("prefill_s"):
+                    cache = holder.cache
+                    cache.reset()
+                    for layer in cache.layers:
+                        cl = getattr(layer, "cumulative_length", None)
+                        if hasattr(cl, "zero_"):
+                            cl.zero_()
+                    # Adopt the CAPTURED mask buffer: it is the address the
+                    # graph reads. Writing the caller's fresh tensor instead
+                    # would leave the replay attending over the previous
+                    # chunk's mask.
+                    holder._mask.copy_(mask_full)
+                    out = self.model.model(
+                        inputs_embeds=embeds,
+                        attention_mask=holder._mask[:, :seq],
+                        position_ids=position_ids,
+                        use_cache=True,
+                        past_key_values=cache,
+                    )
+                    hidden0 = out.last_hidden_state[:, -1, :]
+                    next_pos = position_ids[:, -1] + 1
+                    holder._cum0 = [l.cumulative_length.clone()
+                                    for l in cache.layers]
+                    holder._pos0 = next_pos.unsqueeze(1).clone()
+                    holder.rewind()
+                self._summary["graph_reuses"] += 1
+                return holder, hidden0, next_pos
+            except Exception as exc:  # noqa: BLE001
+                # A reuse that failed leaves the cache in an unknown state, so
+                # the capture is dropped rather than retried against it.
+                print(f"tts: decode-graph reuse failed "
+                      f"({type(exc).__name__}: {exc}) — recapturing")
+                self._release_decode_graph()
+
+        # Shape changed (or nothing captured yet). Free the old capture BEFORE
+        # taking a new one, so the shared pool holds one geometry's tensors
+        # rather than accumulating every geometry the job has seen.
+        self._release_decode_graph()
+        captured = self._capture_decode_graph(
+            embeds=embeds, mask_full=mask_full, position_ids=position_ids,
+            seq=seq, B=B, N=N, device=device, probe=probe)
+        if captured is not None:
+            self._graph_holder = captured[0]
+            self._graph_key = key
+        return captured
+
+    def _release_decode_graph(self) -> None:
+        """Drop the live capture. The pool itself is kept — it is the arena we
+        are deliberately reusing; only the graph and its tensors go."""
+        self._graph_holder = None
+        self._graph_key = None
+
     def _capture_decode_graph(self, *, embeds, mask_full, position_ids, seq,
                               B, N, device, probe):
         """Prefill into a `StaticCache` and capture one decode step.
@@ -879,11 +1053,20 @@ class HiggsV3Torch:
                 holder.rewind()
 
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+                # `pool=` is the whole point. Without it each capture takes a
+                # PRIVATE memory pool, which is a fresh GPU virtual address
+                # reservation that outlives the graph's usefulness; thousands
+                # of those exhaust the WSL2 address space. One handle, created
+                # once and reused, keeps every capture in the same arena. The
+                # captured computation is unchanged, so output is unchanged.
+                if self._graph_pool is None:
+                    self._graph_pool = torch.cuda.graph_pool_handle()
+                with torch.cuda.graph(graph, pool=self._graph_pool):
                     logits_static = _step()
                 holder.graph = graph
                 holder.logits = logits_static
                 holder.rewind()
+            self._summary["graph_captures"] += 1
             return holder, hidden0, next_pos
         except Exception as exc:  # noqa: BLE001
             print(f"tts: CUDA graph capture unavailable "
@@ -923,9 +1106,22 @@ class HiggsV3Torch:
             )
             per_row.append(model._prefill_embeds(prompt_ids, delayed))  # [1, S_b, D]
 
-        seq = max(e.shape[1] for e in per_row)
         hidden_dim = per_row[0].shape[2]
-        max_cap = max(r.cap for r in requests)
+        # Fixed geometry: round the three dimensions that define a capture onto
+        # a coarse grid so chunks share shapes instead of minting one each.
+        # Only when graphs are on — with eager stepping the padding would be
+        # compute spent for nothing.
+        B_real = len(requests)
+        if self.fixed_geometry:
+            B = _bucket_up(B_real, _GEOM_B_GRID, hard_max=max(self.tts_max_batch,
+                                                              B_real))
+            seq = _bucket_up(max(e.shape[1] for e in per_row), _GEOM_SEQ_GRID)
+            max_cap = _bucket_up(max(r.cap for r in requests), _GEOM_CAP_GRID,
+                                 hard_max=1024)
+        else:
+            B = B_real
+            seq = max(e.shape[1] for e in per_row)
+            max_cap = max(r.cap for r in requests)
         embeds = torch.zeros(B, seq, hidden_dim, dtype=per_row[0].dtype, device=device)
         # Allocated once at its final width and filled one column at a time. The
         # loop used to `torch.cat` a column onto the mask every step, which
@@ -938,6 +1134,14 @@ class HiggsV3Torch:
             # row, so one `last_hidden_state[:, -1]` is correct for the batch.
             embeds[b, seq - s_b:] = e[0]
             mask_full[b, seq - s_b:seq] = 1
+        for b in range(B_real, B):
+            # A padding row is a COPY of a real one, not zeros: a row with an
+            # all-zero mask makes the softmax reduce an all -inf window and
+            # produce NaN, which propagates through the batched matmul and
+            # would corrupt the real rows' logits. Its output is discarded and
+            # `_PAD_ROW_CAP` retires it within a few steps.
+            embeds[b] = embeds[0]
+            mask_full[b, :seq] = mask_full[0, :seq]
         mask = mask_full[:, :seq]
 
         # Derived from the mask, not from cache_position: with left padding the
@@ -948,13 +1152,19 @@ class HiggsV3Torch:
             # The graph path prefills into its own StaticCache, so only one
             # prefill runs either way.
             graph = None
-            captured = self._capture_decode_graph(
+            captured = self._acquire_decode_graph(
                 embeds=embeds, mask_full=mask_full,
                 position_ids=position_ids, seq=seq, B=B, N=N,
                 device=device, probe=probe)
             if captured is not None:
                 graph, hidden, next_pos = captured
                 past = None
+                # A REUSED capture reads its own mask buffer, not the one this
+                # call just built. Rebinding here means the step loop's
+                # `mask_full[:, seq + step] = 1` opens the column the graph
+                # actually attends over; without it a reused graph would run
+                # against a mask frozen at the previous chunk's.
+                mask_full = graph._mask
             else:
                 # A capture that failed AFTER its prefill records `prefill_s`
                 # twice, which is right: two prefills ran.
@@ -984,9 +1194,19 @@ class HiggsV3Torch:
                 g = torch.Generator(device=device)
                 g.manual_seed((self.base_seed + attempt + req.seed) & ((1 << 62) - 1))
                 gens.append(g)
+            for b in range(B_real, B):
+                # A padding row is drawn for like any other (the sampler stacks
+                # over the full batch), but from its OWN stream, so it cannot
+                # consume draws that belong to a real sentence and change what
+                # that sentence renders.
+                g = torch.Generator(device=device)
+                g.manual_seed((self.base_seed + attempt + 0x9E37_79B9 + b)
+                              & ((1 << 62) - 1))
+                gens.append(g)
 
-            caps = torch.tensor([r.cap for r in requests], dtype=torch.long,
-                                device=device)
+            caps = torch.tensor([r.cap for r in requests]
+                                + [_PAD_ROW_CAP] * (B - B_real),
+                                dtype=torch.long, device=device)
             state = _DelayState(batch=B, num_codebooks=N, caps=caps,
                                 boc_id=up.BOC_ID, eoc_id=up.EOC_ID, device=device)
             # `emitted[b, s]` is row b's s-th emitted frame. A row emits on every
@@ -1078,7 +1298,10 @@ class HiggsV3Torch:
 
             results: list[tuple[Any, bool]] = []
             with probe.section("codec_s"):
-                for b in range(B):
+                # `B_real`, not `B`: padding rows exist only to hold the
+                # captured geometry and must never reach the caller, which maps
+                # results positionally onto its request slots.
+                for b in range(B_real):
                     if lengths[b] < N:
                         results.append((None, bool(overflow_flags[b])))
                         continue
@@ -1092,14 +1315,18 @@ class HiggsV3Torch:
             # retired rows out of the batch mid-flight would be worth it: such a
             # row still occupies its slot and still pays its KV read until the
             # whole chunk drains.
+            # Tracked on the instance as well as the probe: the probe is off in
+            # production, and the degradation this feeds is exactly the thing
+            # that only ever shows up in production.
+            self._chunk_steps += steps_run
             probe.bump("steps", steps_run)
             probe.bump("chunks", 1)
-            probe.bump("live_row_steps", sum(lengths))
+            probe.bump("live_row_steps", sum(lengths[:B_real]))
             probe.bump("total_row_steps", B * steps_run)
             probe.detail({
-                "B": B, "seq": seq, "steps": steps_run,
+                "B": B, "B_real": B_real, "seq": seq, "steps": steps_run,
                 "caps": [r.cap for r in requests],
-                "lengths": lengths,
+                "lengths": lengths[:B_real],
                 "attempt": attempt,
             })
             return results
@@ -1162,6 +1389,46 @@ class HiggsV3Torch:
         pr.set("dtype", self.dtype_name)
         pr.set("device", self.device)
 
+    def _note_chunk_cost(self, wall_s: float) -> None:
+        """Flag a chunk that cost far more per decode step than any healthy
+        path on this hardware.
+
+        The three real renderers measure 17.33 ms/step (graph + gqa), 27.15
+        (graph) and 45.55 (eager), so `_SLOW_STEP_MS` sits above the slowest of
+        them by 4x and cannot fire on an ordinary fallback. What it does catch
+        is the accelerator degrading underneath a long-lived process — measured
+        at ~1500 ms/step, i.e. 33x the eager path — which previously appeared
+        nowhere: not in the manifest, not in the job record, not in the stage
+        log. Only `dmesg` knew, and only if you thought to look.
+
+        Reported, never acted on. Aborting the job would turn a slow dub into
+        no dub, and the operator is the one who decides whether to restart.
+        """
+        steps = getattr(self, "_chunk_steps", 0)
+        if steps <= 0 or wall_s <= 0:
+            return
+        ms = 1000.0 * wall_s / steps
+        # `.get`/`setdefault` rather than direct indexing: a candidate built
+        # for orchestration tests carries a minimal summary, and a watchdog
+        # that raised there would fail the run it exists to report on.
+        if ms > self._summary.get("slowest_ms_per_step", 0.0):
+            self._summary["slowest_ms_per_step"] = round(ms, 1)
+        if ms < _SLOW_STEP_MS:
+            return
+        self._summary["slow_chunks"] = self._summary.get("slow_chunks", 0) + 1
+        if self._summary["slow_chunks"] == 1:
+            # Once per job, with the diagnosis attached: a second reader should
+            # not have to rediscover what this means.
+            print(
+                f"tts: decode is {ms:.0f} ms/step against ~{_HEALTHY_STEP_MS} ms "
+                f"expected ({steps} steps in {wall_s:.1f} s). The accelerator "
+                f"has degraded under this process — on WSL2 check "
+                f"`dmesg | grep reserve_gpu_va` for EOVERFLOW, which means the "
+                f"GPU address space is exhausted and only restarting the "
+                f"server clears it.",
+                file=sys.stderr,
+            )
+
     # ---- public API (driven by SentenceTTS adapter) ---- #
     def _synthesize_chunk(self, chunk_i: int, chunk: list[int],
                           prepared: list[Any], audio: list[Any]) -> None:
@@ -1175,6 +1442,7 @@ class HiggsV3Torch:
         separate budget is a policy call, not a bug fix.
         """
         pending = list(chunk)
+        self._chunk_steps = 0
         # Slots already counted as bursting in this chunk, so the count is per
         # LINE. Counting attempts inflated the "2 of 77" rate the ADR quotes
         # whenever one row burst twice. `overflows` keeps counting attempts —
@@ -1249,6 +1517,7 @@ class HiggsV3Torch:
         for chunk_i, chunk in enumerate(_balanced_chunks(order, self.tts_max_batch)):
             started = time.perf_counter()
             self._synthesize_chunk(chunk_i, chunk, prepared, audio)
+            self._note_chunk_cost(time.perf_counter() - started)
             if on_chunk is not None:
                 # Retries are folded into the chunk's wall deliberately: a
                 # reseed is real time spent on these sentences.
@@ -1295,6 +1564,12 @@ class HiggsV3Torch:
         self._summary.update({
             "sentences": 0, "overflows": 0, "batches": 0,
             "onset_bursts": 0, "onset_bursts_kept": 0, "graph_fallbacks": 0,
+            # The graph and watchdog counters, added 2026-09-07 — and missed
+            # here on the first pass, which is the very mistake the paragraph
+            # above records. `GraphCounterResetTest` now pins the whole set, so
+            # the next counter cannot repeat it silently.
+            "graph_captures": 0, "graph_reuses": 0,
+            "slow_chunks": 0, "slowest_ms_per_step": 0.0,
         })
 
 
@@ -1397,10 +1672,19 @@ def build(config: dict[str, Any]) -> HiggsV3Torch:
         # once had let a bench run write a differently rendered dub under an
         # unchanged cache key. Sweep them by editing `patmir.toml`.
         max_batch=int(config.get("max_batch", 8)),
-        # Bench-only override so a perf A/B needs no patmir.toml edit. Safe
-        # because `cuda_graphs` is in `_NON_OUTPUT_KEYS`: it is byte-identical
-        # to eager stepping when capture succeeds.
-        cuda_graphs=_env_flag("PATMIR_TTS_CUDA_GRAPHS",
-                              bool(config.get("cuda_graphs", True))),
+        # From the entry and nowhere else, same rule as `max_batch` above.
+        # This had a bench-only env override (`PATMIR_TTS_CUDA_GRAPHS`), taken
+        # to be safe because `cuda_graphs` sat in `_NON_OUTPUT_KEYS`. Measured
+        # 2026-09-07: flipping it re-renders **24 of 24** lines, with same-flag
+        # repeats byte-identical as controls. So the override let a bench run
+        # write a differently rendered dub under an unchanged cache key —
+        # precisely the failure the `max_batch` note above records. The key now
+        # contains `cuda_graphs`, and the env override is gone so nothing can
+        # route around it.
+        cuda_graphs=bool(config.get("cuda_graphs", True)),
+        # Output-affecting (padding changes the batch shape, and batching is
+        # not bitwise-invariant across shapes), so it comes from the entry with
+        # NO env override — same rule as `max_batch` above.
+        fixed_geometry=bool(config.get("fixed_geometry", False)),
         decode_attention=str(config.get("decode_attention", "sdpa")),
     )

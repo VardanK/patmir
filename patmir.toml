@@ -536,6 +536,13 @@ max_batch     = 12
 # What it does establish is that the faster kernel is not worse. Revert by
 # setting "sdpa".
 decode_attention = "gqa"
+# OFF 2026-09-07. Each capture takes a private memory pool that
+# `empty_cache()` cannot reclaim until the graph is destroyed (NVIDIA's
+# CUDA-graph guide), and one capture per chunk exhausted the WSL2 GPU
+# address space after 3-4 jobs: `dxgkio_reserve_gpu_va` EOVERFLOW, then an
+# 86x decode slowdown that only a server restart cleared. Costs the decode
+# step 17.33 -> 45.55 ms. Quality issue #34.
+cuda_graphs = false
 # CUDA graph capture of the decode step is on by default in code and NOT a key
 # here on purpose: it is bitwise identical (verified md5-for-md5 on 80 WAVs),
 # so it must not perturb the cache key. Disable for debugging with

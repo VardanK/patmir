@@ -1,5 +1,31 @@
 # 2026-09-02 — Re-baselining the 3090 at full power, and what was actually slow
 
+
+
+> **Correction, 2026-09-07.** The claim above that graph replay is
+> **byte-identical** to eager stepping is **false for the decode loop as it
+> actually runs**, and it was load-bearing: it is why `cuda_graphs` was placed
+> in `ui.cache._NON_OUTPUT_KEYS` and given a bench env override. Measured
+> directly — 24 real sentences, one pinned reference, separate processes:
+>
+> ```
+> graphs ON  vs ON  (repeat): identical 24/24   <- control
+> graphs OFF vs OFF (repeat): identical 24/24   <- control
+> graphs ON  vs OFF:          identical  0/24
+> ```
+>
+> The controls establish that the candidate is deterministic across processes,
+> so the flag alone accounts for the difference, and `graph_captures` read 2
+> against 0, so the two runs really did take the two paths. What the original
+> verification checked was `StaticCache` against `DynamicCache` and graph
+> replay against eager stepping **in isolation**; it never exercised the mask
+> width the real loop uses. `_capture_decode_graph`'s own docstring, written
+> later, had it right: the graph attends over `seq + max_cap` columns against
+> the fallback's `seq + step + 1`, so the softmax reduces a different width —
+> *same distribution, different draw*. `cuda_graphs` is now in the cache key
+> and its env override is gone. See
+> `2026-09-07-tts-graph-pool-and-gpu-va-exhaustion.md`.
+
 ## Context
 
 The GDDR6X cooling on the WSL2 + RTX 3090 workstation was fixed and the power
@@ -87,7 +113,7 @@ the two. Swapping in a cheaper attention kernel *first* would therefore also
 have measured ~0, lowering a floor that was not binding. The graph had to land
 first to expose the GPU floor.
 
-### 5. The graph is byte-identical, which was measured, not assumed
+### 5. The graph is byte-identical, which was measured, not assumed — **and the measurement did not cover the real loop; see the correction at the top of this file (2026-09-07)**
 
 |  | ms/step | TTS stage | agg RTF |
 | --- | ---: | ---: | ---: |

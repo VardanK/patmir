@@ -161,16 +161,33 @@ def config_hash(cfg: PipelineConfig) -> str:
 #                     to a retry is an EMPTY translation, so this can only add
 #                     a line that would otherwise be missing.
 #   retry_backoff_s   how long to wait between those attempts.
-#   cuda_graphs       replay a captured decode step instead of issuing it.
-#                     Verified byte-identical md5-for-md5 on 80 WAVs, and
-#                     pinned by CUDA-gated tests.
 #
 # Anything that touches sampling, prompts, model ids or dtypes does NOT belong
 # here. `decode_attention` is the near miss worth naming: it is also "just" a
 # kernel choice, but its reduction order differs and it re-rolls every line, so
 # it stays in the key.
+#
+# `cuda_graphs` WAS here, on the 2026-09-02 claim that graph replay is
+# byte-identical to eager stepping. **Removed 2026-09-07: that claim is false
+# for this decode loop.** Measured directly — 24 real sentences, one pinned
+# reference, rendered in separate processes with the flag on and off:
+#
+#     graphs ON  vs ON  (repeat): identical 24/24   <- control
+#     graphs OFF vs OFF (repeat): identical 24/24   <- control
+#     graphs ON  vs OFF:          identical  0/24
+#
+# The controls are what make it conclusive: the candidate is deterministic
+# across processes, so the flag alone accounts for the difference, and
+# `graph_captures` read 2 vs 0 so the two runs really did take the two paths.
+# `_capture_decode_graph`'s own docstring had it right all along — the graph
+# attends over `seq + max_cap` columns against the fallback's `seq + step + 1`,
+# so the softmax reduces a different width: same distribution, different draw.
+# The original verification compared `StaticCache` against `DynamicCache` in
+# isolation and never exercised the mask width the real loop uses.
+#
+# It belongs in the key for exactly the reason `decode_attention` does.
 _NON_OUTPUT_KEYS = frozenset({
-    "concurrency", "max_attempts", "retry_backoff_s", "cuda_graphs",
+    "concurrency", "max_attempts", "retry_backoff_s",
 })
 
 
@@ -180,7 +197,7 @@ def _stable_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
     Everything else is kept: model ids, voices, languages, dtypes, sampling
     knobs and prompt controls all change what comes out, so they belong in the
-    key. See `_NON_OUTPUT_KEYS` for the four that do not and why.
+    key. See `_NON_OUTPUT_KEYS` for the three that do not and why.
     """
     trimmed = {k: v for k, v in entry.items() if k not in _NON_OUTPUT_KEYS}
     return json.loads(json.dumps(trimmed, sort_keys=True, ensure_ascii=False))
