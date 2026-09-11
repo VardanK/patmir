@@ -226,6 +226,16 @@
       if (s.phase === "submitting" || !job) kind = "submitting";
       else if (job.status === "queued") kind = "queued";
       else if (job.status === "waiting") kind = "waiting-gpu";
+      // A watch-along record has no `stage_states`, so `runningStage` cannot
+      // see its download; it sat under "prelude" with no percentage and no
+      // fill for the whole fetch (author: "the button stays gray while
+      // loading"). The yt-dlp hook writes `live_stage`/`download_pct` onto
+      // both record kinds, and `download_pct` stays 1.0 once the fetch is
+      // done, so `< 1` is what separates "downloading" from "downloaded".
+      else if (job.status === "prelude" && job.live_stage === "download"
+               && typeof job.download_pct === "number" && job.download_pct < 1) {
+        kind = "downloading";
+      }
       else if (job.status === "prelude") kind = "prelude";
       else if (job.status === "streaming") kind = "streaming";
       else if (runningStage(job) === "download") kind = "downloading";
@@ -238,6 +248,11 @@
       return view(kind, CANCEL, {
         action: "stop", tone: "active", busy: true,
         progress: jobProgress(job),
+        // The download's OWN fraction, for the "Downloading… {pct}%" subtitle.
+        // `progress` is whole-job completion, which for a batch job puts a 60%
+        // download at 6% and for a stream is unknown until the first section.
+        stagePct: kind === "downloading" && typeof job.download_pct === "number"
+          ? clamp01(job.download_pct) : null,
         // `job` is null while phase is "submitting" — the request is in flight
         // and there is no record yet. Reading through it here threw, which took
         // out the button on the very first press.
@@ -357,6 +372,7 @@
       busy: false,
       tone: "idle",
       progress: null,
+      stagePct: null,
       sections: null,
       errorText: null,
       optedOut: false,
@@ -467,7 +483,10 @@
     if (key === "cached-idle" && v.optedOut) key = "cached-idle-optedout";
     var tpl = s[key];
     if (tpl == null) tpl = "";
-    var pct = v.progress == null ? 0 : Math.round(v.progress * 100);
+    // A stage's own fraction wins over whole-job progress when the subtitle
+    // names that stage (`downloading`); the fill keeps showing the whole job.
+    var frac = typeof v.stagePct === "number" ? v.stagePct : v.progress;
+    var pct = frac == null ? 0 : Math.round(frac * 100);
     var out = tpl.replace("{pct}", String(pct)).replace("{n}", String(v.sections || 0));
     if (v.errorText) out = out ? out + " — " + trim(v.errorText) : trim(v.errorText);
     return out;

@@ -144,6 +144,14 @@ dead. Checkpoints, and their cost:
 | Each stage boundary | `runner.py`, before the stage builds | bounded by the longest stage (tts, ~77 s on CUDA) |
 | Each TTS decode chunk | the adapter's `on_chunk`, which the candidate already calls | **~8 s** (~7.7 sentences/chunk) |
 | Each sentence | the adapter's serial (non-batched) path | per sentence |
+| The yt-dlp download | `JobManager._download_url`: before it starts, per playlist entry (`match_filter`), per chunk (progress hook) | one chunk |
+
+The download row exists because the download runs **inside** the accelerator
+lock and, until 2026-09-04, was the one place the token was never read: a
+YouTube Mix URL (`&list=RD...`) had yt-dlp walking the whole mix for 6+ minutes
+with the GPU idle and every later submission `waiting` behind it. `noplaylist`
+is set for the same reason — the cache key is per video, so the download must
+be too. ADR `decisions/2026-09-04-download-inside-the-lock-and-waiting-cancel.md`.
 
 Raising from `on_chunk` needs no cooperation from the TTS candidate, because it
 already invokes that callback after every chunk. `None` (the CLI, bench, tests)

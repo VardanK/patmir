@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Patmir — Eastern Armenian dub",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Translate the active YouTube video into Eastern Armenian using your local Patmir server.",
   "permissions": [
     "activeTab",

@@ -217,6 +217,40 @@ test("a running download is reported as downloading", () => {
   assert.equal(Math.round(v.progress * 100), 20);
 });
 
+test("a watch-along download is reported as downloading, with its own percentage", () => {
+  // A stream record has no `stage_states`, so `runningStage` cannot see the
+  // fetch; it used to read "prelude" with no fill and no number for the whole
+  // download. The yt-dlp hook writes `live_stage`/`download_pct` on both
+  // record kinds.
+  const v = S.deriveView(base({
+    phase: "job",
+    job: { status: "prelude", job_id: "j", live_stage: "download", download_pct: 0.4 },
+  }));
+  assert.equal(v.kind, "downloading");
+  assert.equal(v.progress, null, "whole-video progress is unknown before the first section");
+  assert.equal(v.stagePct, 0.4);
+  assert.equal(S.formatSubtitle(v, S.STRINGS_EN), "Downloading… 40%");
+  // `download_pct` stays 1.0 after the fetch: that is the prelude proper.
+  const done = S.deriveView(base({
+    phase: "job",
+    job: { status: "prelude", job_id: "j", live_stage: "download", download_pct: 1 },
+  }));
+  assert.equal(done.kind, "prelude");
+});
+
+test("the downloading subtitle shows the download's own fraction, not whole-job progress", () => {
+  const v = S.deriveView(base({
+    phase: "job",
+    job: {
+      status: "running", job_id: "j",
+      stage_states: { download: "running", ingest: "pending" },
+      download_pct: 0.6,
+    },
+  }));
+  assert.equal(Math.round(v.progress * 100), 30);          // the fill
+  assert.equal(S.formatSubtitle(v, S.STRINGS_EN), "Downloading… 60%");  // the words
+});
+
 test("failure offers retry and carries the error", () => {
   const v = S.deriveView(base({
     job: { status: "failed", job_id: "j", error: "boom" },

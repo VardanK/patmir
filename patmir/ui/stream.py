@@ -327,7 +327,10 @@ class StreamManager:
             existing_id = self._by_cache_key.get(ck)
             if existing_id and existing_id in self._records and not spec.force:
                 rec = self._records[existing_id]
-                if rec.status in {"queued", "prelude", "streaming"}:
+                # `waiting` (parked on the accelerator lock) is as live as
+                # `queued`; without it here a re-submit during the wait created
+                # a second record for the same video, queued behind the first.
+                if rec.status in {"queued", "waiting", "prelude", "streaming"}:
                     return rec
                 if rec.status == "done":
                     # `done` does NOT imply the video is dubbed: the scheduler
@@ -401,12 +404,19 @@ class StreamManager:
         while the scheduler sits stopped. Sections already written to the cache
         stay there — that is the free-rewatch feature, not leftover garbage.
         """
-        rec = self.get_by_cache_key(ck)
-        if rec is None:
+        # EVERY live record for the key, not just the newest. `_by_cache_key`
+        # points at the latest submission, and `submit()` creates a fresh
+        # record whenever the existing one is `cancelling` — so after one
+        # Stop + re-submit the record actually holding the accelerator was no
+        # longer reachable from here, and the viewer's next Stop hit only the
+        # `waiting` newcomer. Three records for one video piled up that way on
+        # 2026-09-04 (quality issue #33).
+        live = [r for r in self._records.values()
+                if r.cache_key == ck and r.status not in ("done", "failed", "cancelled")]
+        if not live and self.get_by_cache_key(ck) is None:
             return False
-        if rec._scheduler is not None:
-            rec._scheduler.stop()
-        self.cancel(rec.job_id)
+        for rec in live:
+            self.cancel(rec.job_id)
         return True
 
     def cancel(self, job_id: str) -> bool:
@@ -423,7 +433,15 @@ class StreamManager:
             return True
         if rec._scheduler is not None:
             rec._scheduler.stop()
-        if rec.status == "queued":
+        if rec.status in ("queued", "waiting"):
+            # Not started: nothing has touched the accelerator, so this is
+            # exact and immediate, and `_run` skips the body when the lock
+            # frees. `waiting` was missing here — it fell through to the
+            # running branch, found no token (none exists before
+            # `_run_locked`), and left the record `cancelling`, which `_run`
+            # does NOT skip: the "cancelled" stream would have run in full the
+            # moment the lock was released. `JobManager.cancel` had both
+            # statuses from the start.
             rec.status = "cancelled"
             rec.finished_at = time.time()
             return True
@@ -520,7 +538,7 @@ class StreamManager:
         if rec.source_url:
             t_dl = perf_counter()
             local_path = self._jobs._download_url(
-                rec.source_url, rec.download_key or ck, rec,
+                rec.source_url, rec.download_key or ck, rec, cancel=cancel,
             )
             rec.download_s = perf_counter() - t_dl
         else:

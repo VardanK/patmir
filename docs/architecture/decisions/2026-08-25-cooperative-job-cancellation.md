@@ -102,6 +102,11 @@ New statuses `cancelling` and `cancelled` on both managers, rendered in
   batch instead, and the stage boundary still covers it.
 - Cancelling during a yt-dlp download does not stop the download; the subprocess
   is killable in principle (unlike a thread) but that is not wired up.
+  **Superseded 2026-09-04:** yt-dlp runs in-process here, not as a subprocess,
+  and its own abort path is a `DownloadCancelled` raised from a hook; the token
+  is now checked before the download, per playlist entry and per chunk. Also
+  found then: `StreamManager.cancel` lacked the `waiting` case this ADR gave
+  `JobManager.cancel`. See `2026-09-04-download-inside-the-lock-and-waiting-cancel`.
 
 ## Alternatives rejected
 
