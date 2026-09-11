@@ -67,7 +67,7 @@ mix of the old behaviours, and the author already accepted a regeneration for
 the gqa kernel and `max_batch` on 2026-09-02, so one more that folds all of
 this in is cheaper than reasoning about which cached dub has which onset. The
 two `PATMIR_TTS_*` env overrides that bypassed the hash for `max_batch` and
-`decode_attention` are removed; `PATMIR_TTS_CUDA_GRAPHS` stays because
+`decode_attention` are removed; `PATMIR_TTS_CUDA_GRAPHS` was kept at the time because (**and that reasoning was wrong — removed 2026-09-07 after the flag was measured to re-render 24 of 24 lines; `cuda_graphs` is in the cache key now**)
 `cuda_graphs` is in `_NON_OUTPUT_KEYS`.
 
 **Rejected:** recording the accepted drift in the ADR and leaving the key.

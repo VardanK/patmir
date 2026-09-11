@@ -521,12 +521,31 @@ class CacheKeyIgnoresSchedulingKnobs(unittest.TestCase):
             self.assertEqual(config_hash(self._cfg(translate_entry=entry)), base,
                              f"{entry} changed the cache key")
 
-    def test_cuda_graphs_does_not_move_the_key(self):
-        # Byte-identical by measurement (md5-for-md5 on 80 WAVs).
+    def test_cuda_graphs_DOES_move_the_key(self):
+        """Inverted 2026-09-07. This test previously asserted the opposite, on
+        the 2026-09-02 claim that graph replay is byte-identical to eager
+        stepping (md5-for-md5 on 80 WAVs). **That claim is false for the decode
+        loop as it runs**, and this test was pinning it in place.
+
+        Measured — 24 real sentences, one pinned reference, separate processes:
+
+            graphs ON  vs ON  (repeat): identical 24/24   <- control
+            graphs OFF vs OFF (repeat): identical 24/24   <- control
+            graphs ON  vs OFF:          identical  0/24
+
+        The controls establish determinism across processes, so the flag alone
+        accounts for it, and `graph_captures` read 2 vs 0. The original check
+        compared `StaticCache` against `DynamicCache` and replay against eager
+        in isolation, never exercising the mask width the real loop uses:
+        the graph attends over `seq + max_cap` columns against the fallback's
+        `seq + step + 1`, so the softmax reduces a different width.
+        """
         from patmir.ui.cache import config_hash
         base = config_hash(self._cfg())
-        self.assertEqual(config_hash(self._cfg(tts_entry={"cuda_graphs": True})),
-                         base)
+        self.assertNotEqual(
+            config_hash(self._cfg(tts_entry={"cuda_graphs": True})), base,
+            "cuda_graphs re-renders every line; excluding it from the key lets "
+            "one key hold two different renderings")
 
     def test_decode_attention_DOES_move_the_key(self):
         # The near miss: also "just" a kernel choice, but its reduction order

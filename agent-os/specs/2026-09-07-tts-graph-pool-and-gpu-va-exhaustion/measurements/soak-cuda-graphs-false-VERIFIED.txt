@@ -1,0 +1,13 @@
+=== soak nographs ===
+server pid=133144  va_marker=1788804779  prewarm_vram=17230MiB
+run  1 done   tts=  60.46s aggRTF=0.349 total= 105.2s ms/step=   60.2 slow=0 cap=0 fb=0 vram=16494MiB new_va=no
+run  2 done   tts=  51.73s aggRTF=0.318 total=  95.8s ms/step=   59.4 slow=0 cap=0 fb=0 vram=16494MiB new_va=no
+run  3 done   tts=  52.57s aggRTF=0.321 total=  96.6s ms/step=   59.4 slow=0 cap=0 fb=0 vram=16494MiB new_va=no
+run  4 done   tts=  51.62s aggRTF=0.317 total=  95.4s ms/step=   60.1 slow=0 cap=0 fb=0 vram=16457MiB new_va=no
+run  5 done   tts=  55.28s aggRTF=0.332 total=  99.9s ms/step=   59.2 slow=0 cap=0 fb=0 vram=16448MiB new_va=no
+run  6 done   tts=  51.38s aggRTF=0.314 total=  94.5s ms/step=   58.7 slow=0 cap=0 fb=0 vram=16451MiB new_va=no
+run  7 done   tts=  65.24s aggRTF=0.364 total= 109.7s ms/step=   60.8 slow=0 cap=0 fb=0 vram=16449MiB new_va=no
+run  8 done   tts=  53.68s aggRTF=0.324 total=  97.7s ms/step=   61.7 slow=0 cap=0 fb=0 vram=16448MiB new_va=no
+run  9 done   tts=  61.47s aggRTF=0.353 total= 106.3s ms/step=   59.5 slow=0 cap=0 fb=0 vram=16451MiB new_va=no
+run 10 done   tts=  48.96s aggRTF=0.309 total=  93.2s ms/step=   61.5 slow=0 cap=0 fb=0 vram=16451MiB new_va=no
+SOAK nographs COMPLETE

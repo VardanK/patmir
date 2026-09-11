@@ -281,3 +281,47 @@ class SourceIdForFile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CudaGraphsInCacheKeyTest(unittest.TestCase):
+    """`cuda_graphs` changes the audio, so it must reach the cache key.
+
+    It sat in `_NON_OUTPUT_KEYS` from 2026-09-02 to 2026-09-07 on the claim
+    that graph replay is byte-identical to eager stepping. Measured directly on
+    24 real sentences with one pinned reference, in separate processes:
+
+        graphs ON  vs ON  (repeat): identical 24/24   <- control
+        graphs OFF vs OFF (repeat): identical 24/24   <- control
+        graphs ON  vs OFF:          identical  0/24
+
+    The controls establish the candidate is deterministic across processes, so
+    the flag alone accounts for the difference; `graph_captures` read 2 vs 0, so
+    the two runs genuinely took the two paths. While it was excluded, flipping
+    it re-rendered every new dub under an unchanged key.
+    """
+
+    def _cfg(self, **tts):
+        entries = {s: {"id": f"{s}_x"} for s in STAGE_ORDER}
+        entries["tts"] = {"id": "higgs_v3_torch_bf16", **tts}
+        return PipelineConfig(entries=entries, options=PipelineOptions())
+
+    def test_flipping_cuda_graphs_moves_the_hash(self):
+        on = cache_mod.config_hash(self._cfg(cuda_graphs=True))
+        off = cache_mod.config_hash(self._cfg(cuda_graphs=False))
+        self.assertNotEqual(
+            on, off,
+            "cuda_graphs changes 24/24 rendered lines; a shared key would let "
+            "one key hold two renderings")
+
+    def test_it_is_not_in_the_non_output_set(self):
+        self.assertNotIn("cuda_graphs", cache_mod._NON_OUTPUT_KEYS)
+
+    def test_the_genuinely_output_neutral_keys_are_still_excluded(self):
+        """Guard against over-correcting: these three cannot change a sample —
+        two are retry policy and one is request concurrency."""
+        for key in ("concurrency", "max_attempts", "retry_backoff_s"):
+            with self.subTest(key):
+                self.assertIn(key, cache_mod._NON_OUTPUT_KEYS)
+                a = cache_mod.config_hash(self._cfg(**{key: 1}))
+                b = cache_mod.config_hash(self._cfg(**{key: 99}))
+                self.assertEqual(a, b, f"{key} must not move the cache key")

@@ -1,0 +1,3 @@
+=== arm fixedgeom : PYTORCH_CUDA_ALLOC_CONF= ===
+server up pid=113514  va_marker_at_start=1788803450
+run  1 done   tts=  28.52s ms/step=   33.2 slow=0 cap=8 reuse=2 vram=19014MiB new_va_errors=no

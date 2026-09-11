@@ -1,0 +1,2 @@
+run  1  status=done   tts= 24.27s  ms/step=  29.7  slow=0  cap=18 reuse=0 fb=0  vram=18069MiB  va_err=3429
+run  2  status=done   tts= 23.14s  ms/step=  29.7  slow=0  cap=25 reuse=1 fb=0  vram=18413MiB  va_err=3426

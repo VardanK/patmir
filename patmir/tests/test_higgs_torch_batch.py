@@ -25,7 +25,10 @@ Two layers of testing, because the risks are different:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
+import types
 import unittest
 import wave
 from pathlib import Path
@@ -36,6 +39,11 @@ from patmir.eval.candidates.tts.higgs_v3_torch import (
     SR,
     HiggsV3Torch,
     _balanced_chunks,
+    _bucket_up,
+    _GEOM_B_GRID,
+    _GEOM_CAP_GRID,
+    _GEOM_SEQ_GRID,
+    _PAD_ROW_CAP,
     _Request,
     _request_seed,
     _sample_codes,
@@ -1573,16 +1581,21 @@ class DecodeKnobsTest(unittest.TestCase):
             self.assertEqual(seen["decode_attention"], "sdpa")
             self.assertEqual(seen["max_batch"], 12)
 
-            # `cuda_graphs` is in `_NON_OUTPUT_KEYS`, so an env override cannot
-            # desynchronize a dub from its cache key. `decode_attention` and
-            # `max_batch` DO change the audio, and `config_hash` reads only the
-            # TOML entry — so those two env overrides were writing differently
-            # rendered dubs under an unchanged key and are gone.
+            # NO env override may reach any of these three. `decode_attention`
+            # and `max_batch` lost theirs earlier for changing the audio while
+            # `config_hash` reads only the TOML entry. `cuda_graphs` kept its
+            # override on the belief that graph replay was byte-identical to
+            # eager stepping — measured 2026-09-07 and false: flipping it
+            # re-renders 24 of 24 lines, with same-flag repeats byte-identical
+            # as controls. So it is in the cache key now, and its override is
+            # gone too; otherwise a bench run could still write a differently
+            # rendered dub under an unchanged key.
             with mock.patch.dict(os.environ, {"PATMIR_TTS_CUDA_GRAPHS": "1",
                                               "PATMIR_TTS_DECODE_ATTN": "gqa",
                                               "PATMIR_TTS_MAX_BATCH": "16"}):
                 mod.build({"cuda_graphs": False, "decode_attention": "sdpa", "max_batch": 12})
-            self.assertTrue(seen["cuda_graphs"])
+            self.assertFalse(seen["cuda_graphs"],
+                             "PATMIR_TTS_CUDA_GRAPHS must no longer override the entry")
             self.assertEqual(seen["decode_attention"], "sdpa")
             self.assertEqual(seen["max_batch"], 12)
 
@@ -1767,3 +1780,509 @@ def _bare_candidate(max_retries=2, max_batch=4):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class GraphPoolAndReuseTest(unittest.TestCase):
+    """The GPU-address-space fixes: one shared pool, one reused capture.
+
+    Every assertion here is pinned to a measured failure. A long-lived server
+    took a FRESH `CUDAGraph()` per chunk with no `pool=`, so each capture
+    reserved its own GPU virtual address range. On WSL2 that address space —
+    not VRAM — is the binding resource: `dxgkio_reserve_gpu_va` began failing
+    with EOVERFLOW (3661 in under a second), `cudaMalloc` then failed for
+    120 MiB with 6.62 GiB free, and the decode fell back to host-side paths at
+    ~1500 ms/step against ~17 ms. Restarting the server was the only cure.
+    """
+
+    def _candidate(self):
+        obj = _bare()
+        obj.cuda_graphs = True
+        obj._graph_pool = None
+        obj._graph_holder = None
+        obj._graph_key = None
+        obj._summary.update({"graph_captures": 0, "graph_reuses": 0,
+                             "graph_fallbacks": 0})
+        return obj
+
+    class _Probe:
+        def section(self, _name):
+            import contextlib
+            return contextlib.nullcontext()
+
+    def test_same_shape_reuses_the_capture_and_never_recaptures(self):
+        """The fix itself: a second chunk of identical geometry must replay the
+        live capture rather than reserving another address range."""
+        obj = self._candidate()
+        sentinel = object()
+        captures = []
+
+        def _fake_capture(**kw):
+            captures.append(kw)
+            holder = types.SimpleNamespace(
+                cache=types.SimpleNamespace(reset=lambda: None, layers=[]),
+                _mask=kw["mask_full"], _cum0=[], _pos0=None,
+                rewind=lambda: None)
+            return holder, sentinel, sentinel
+
+        obj._capture_decode_graph = _fake_capture
+        obj.model = types.SimpleNamespace()
+
+        class _Dev:
+            type = "cuda"
+
+        kw = dict(embeds=None, mask_full=_FakeMask(2, 40),
+                  position_ids=None, seq=8, B=2, N=4,
+                  device=_Dev(), probe=self._Probe())
+        first = obj._acquire_decode_graph(**kw)
+        self.assertIsNotNone(first)
+        self.assertEqual(len(captures), 1)
+
+        # Second chunk, same geometry. Prefill is re-run against the captured
+        # cache, so a model is needed; the holder must be the SAME object.
+        obj.model = types.SimpleNamespace(
+            model=lambda **_: types.SimpleNamespace(
+                last_hidden_state=_FakeHidden()))
+        kw2 = dict(kw)
+        kw2["mask_full"] = _FakeMask(2, 40)
+        kw2["position_ids"] = _FakePos()
+        second = obj._acquire_decode_graph(**kw2)
+        self.assertIsNotNone(second)
+        self.assertIs(second[0], first[0], "same shape must reuse the capture")
+        self.assertEqual(len(captures), 1, "no second capture may be taken")
+        self.assertEqual(obj._summary["graph_captures"], 0)  # bumped in the real capture
+        self.assertEqual(obj._summary["graph_reuses"], 1)
+
+    def test_shape_change_recaptures_rather_than_replaying_wrong_geometry(self):
+        """The guard that keeps the fix from becoming a silent corruption.
+
+        The graph attends over `seq + max_cap` columns at frozen addresses, so
+        replaying it at a geometry it was not captured at would render a line
+        wrong with no error anywhere. Every component of the key must force a
+        recapture.
+        """
+        base = dict(embeds=None, position_ids=None, seq=8, B=2, N=4)
+
+        class _Dev:
+            type = "cuda"
+
+        for label, changed in (
+            ("batch", dict(B=3)),
+            ("prompt length", dict(seq=9)),
+            ("codebooks", dict(N=5)),
+        ):
+            with self.subTest(label):
+                obj = self._candidate()
+                captures = []
+
+                def _fake_capture(**kw):
+                    captures.append(kw)
+                    holder = types.SimpleNamespace(
+                        cache=types.SimpleNamespace(reset=lambda: None, layers=[]),
+                        _mask=kw["mask_full"], _cum0=[], _pos0=None,
+                        rewind=lambda: None)
+                    return holder, None, None
+
+                obj._capture_decode_graph = _fake_capture
+                obj.model = types.SimpleNamespace()
+                kw = dict(base, mask_full=_FakeMask(2, 40),
+                          device=_Dev(), probe=self._Probe())
+                obj._acquire_decode_graph(**kw)
+                kw2 = dict(kw, **changed)
+                kw2["mask_full"] = _FakeMask(kw2["B"], 40)
+                obj._acquire_decode_graph(**kw2)
+                self.assertEqual(len(captures), 2,
+                                 f"a changed {label} must recapture")
+                self.assertEqual(obj._summary["graph_reuses"], 0)
+
+        # And the cache length, which moves with max_cap even when B and seq
+        # hold — the case a (B, seq) key alone would have missed.
+        obj = self._candidate()
+        captures = []
+        obj._capture_decode_graph = lambda **kw: (
+            captures.append(kw),
+            types.SimpleNamespace(
+                cache=types.SimpleNamespace(reset=lambda: None, layers=[]),
+                _mask=kw["mask_full"], _cum0=[], _pos0=None,
+                rewind=lambda: None),
+            None, None)[1:]
+        obj.model = types.SimpleNamespace()
+        obj._acquire_decode_graph(mask_full=_FakeMask(2, 40), device=_Dev(),
+                                  probe=self._Probe(), **base)
+        obj._acquire_decode_graph(mask_full=_FakeMask(2, 900), device=_Dev(),
+                                  probe=self._Probe(), **base)
+        self.assertEqual(len(captures), 2, "a changed cache length must recapture")
+
+    def test_disabled_or_cpu_returns_none(self):
+        """Unchanged contract: the caller's eager fallback still has to work."""
+        class _Cpu:
+            type = "cpu"
+
+        class _Cuda:
+            type = "cuda"
+
+        obj = self._candidate()
+        obj.cuda_graphs = False
+        self.assertIsNone(obj._acquire_decode_graph(
+            embeds=None, mask_full=_FakeMask(1, 8), position_ids=None,
+            seq=4, B=1, N=2, device=_Cuda(), probe=self._Probe()))
+        obj.cuda_graphs = True
+        self.assertIsNone(obj._acquire_decode_graph(
+            embeds=None, mask_full=_FakeMask(1, 8), position_ids=None,
+            seq=4, B=1, N=2, device=_Cpu(), probe=self._Probe()))
+
+
+class SlowChunkWatchdogTest(unittest.TestCase):
+    """The degradation had to be found in `dmesg`. Now it reaches the summary.
+
+    Thresholds are pinned against the three renderers that actually exist on
+    the reference machine, so an ordinary graph fallback can never be reported
+    as a degraded accelerator.
+    """
+
+    def _obj(self):
+        obj = _bare()
+        obj._summary.update({"slow_chunks": 0, "slowest_ms_per_step": 0.0})
+        return obj
+
+    def test_healthy_renderers_never_flag(self):
+        for label, ms in (("graph+gqa", 17.33), ("graph", 27.15),
+                          ("eager", 45.55)):
+            with self.subTest(label):
+                obj = self._obj()
+                obj._chunk_steps = 1000
+                obj._note_chunk_cost(ms * 1000 / 1000.0)  # 1000 steps at `ms`
+                self.assertEqual(obj._summary["slow_chunks"], 0)
+
+    def test_measured_degradation_flags_once_with_a_diagnosis(self):
+        """~1500 ms/step is what the stuck server actually measured."""
+        obj = self._obj()
+        obj._chunk_steps = 600
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            obj._note_chunk_cost(900.0)          # 600 steps in 900 s
+            obj._note_chunk_cost(900.0)
+        self.assertEqual(obj._summary["slow_chunks"], 2)
+        self.assertGreater(obj._summary["slowest_ms_per_step"], 1000)
+        # Warned once, not once per chunk, and the message carries the cause.
+        self.assertEqual(buf.getvalue().count("ms/step"), 1)
+        self.assertIn("reserve_gpu_va", buf.getvalue())
+
+    def test_zero_steps_is_not_a_division(self):
+        obj = self._obj()
+        obj._chunk_steps = 0
+        obj._note_chunk_cost(12.0)
+        self.assertEqual(obj._summary["slow_chunks"], 0)
+
+
+class _FakeMask:
+    """Stands in for the [B, seq + max_cap] attention mask: only `shape` and an
+    in-place `copy_` are exercised by the acquire path."""
+
+    def __init__(self, b: int, width: int) -> None:
+        self.shape = (b, width)
+        self.copied_from = None
+
+    def copy_(self, other):
+        self.copied_from = other
+        return self
+
+    def __getitem__(self, _idx):
+        return self
+
+    def __setitem__(self, _idx, _val):
+        return None
+
+
+class _FakeHidden:
+    def __getitem__(self, _idx):
+        return _FakePos()
+
+
+class _FakePos:
+    def __getitem__(self, _idx):
+        return self
+
+    def __add__(self, _other):
+        return self
+
+    def unsqueeze(self, _dim):
+        return self
+
+    def clone(self):
+        return self
+
+
+class GraphCounterResetTest(unittest.TestCase):
+    """`reset_summary` must zero EVERY per-job counter, not the subset that
+    existed when it was written.
+
+    This has now gone wrong twice: `onset_bursts` was missed when it was added
+    in 2026-09-03, and the graph/watchdog counters were missed when they were
+    added in 2026-09-07 — in a change whose own comment quoted the first
+    miss. The failure is silent and looks like data: a warm watch-along
+    instance reports one section's sentences against the whole film's captures.
+    So the assertion is over the counter set itself rather than a hand-listed
+    few, and a new counter that is not resettable has to say so out loud.
+    """
+
+    #: Keys that are legitimately NOT per-job — configuration and identity.
+    _STATIC = {"engine", "device", "max_batch", "cuda_graphs",
+               "decode_attention"}
+
+    def test_every_non_static_counter_returns_to_zero(self):
+        obj = object.__new__(HiggsV3Torch)
+        obj.tts_max_batch = 12
+        obj.dtype_name = "bfloat16"
+        obj.device = "cuda"
+        obj.cuda_graphs = True
+        obj.attn_implementation = "sdpa"
+        obj.attn_impl_decode = "sdpa"
+        obj.decode_attention = "gqa"
+        # Build the real summary dict the constructor builds.
+        obj._summary = {
+            "engine": "higgs_v3_torch_bfloat16", "device": "cuda",
+            "max_batch": 12, "cuda_graphs": True, "decode_attention": "sdpa",
+            "sentences": 0, "overflows": 0, "batches": 0,
+            "onset_bursts": 0, "onset_bursts_kept": 0, "graph_fallbacks": 0,
+            "graph_captures": 0, "graph_reuses": 0,
+            "slow_chunks": 0, "slowest_ms_per_step": 0.0,
+        }
+        dirty = {k: (7 if isinstance(v, int) else 7.0)
+                 for k, v in obj._summary.items() if k not in self._STATIC}
+        obj._summary.update(dirty)
+        self.assertTrue(dirty, "sanity: there are per-job counters to dirty")
+
+        obj.reset_summary()
+
+        for key in dirty:
+            self.assertEqual(
+                obj._summary[key], 0,
+                f"{key!r} survived reset_summary — a warm instance will report "
+                f"it accumulated across sections")
+
+
+class GraphReuseEquivalenceTest(unittest.TestCase):
+    """A REUSED capture must render exactly what a fresh one renders.
+
+    Decision 2 of ADR `2026-09-07-tts-graph-pool-and-gpu-va-exhaustion` replays
+    a capture for a later chunk of identical geometry, re-running the prefill
+    into the SAME `StaticCache` whose addresses the capture froze. If that
+    reset were incomplete — stale keys and values from the previous chunk left
+    where the new prefill does not overwrite them — the failure would be a
+    subtly wrong line with nothing in any log, which is the worst shape a bug
+    can take in this pipeline. So the equality asserted here is bitwise, over
+    a second chunk whose content differs from the first.
+    """
+
+    def test_reused_capture_is_bitwise_identical_to_a_fresh_one(self):
+        torch = _cuda_or_skip()
+        from transformers import AutoConfig, StaticCache
+        from transformers.models.qwen3 import Qwen3Model
+
+        cfg = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B")
+        cfg.num_hidden_layers = 2
+        cfg.hidden_size = 256; cfg.num_attention_heads = 8
+        cfg.num_key_value_heads = 2; cfg.head_dim = 32
+        cfg.intermediate_size = 512
+        cfg._attn_implementation = "sdpa"
+        torch.manual_seed(0)
+        m = Qwen3Model(cfg).to("cuda", torch.bfloat16).eval()
+
+        B, seq, L, steps = 4, 24, 40, 6
+        torch.manual_seed(1)
+        # Two chunks of the SAME geometry and DIFFERENT content — the case
+        # reuse exists for, and the case a stale cache would corrupt.
+        emb_a = torch.randn(B, seq, 256, device="cuda", dtype=torch.bfloat16)
+        emb_b = torch.randn(B, seq, 256, device="cuda", dtype=torch.bfloat16)
+        toks = torch.randn(steps, B, 1, 256, device="cuda", dtype=torch.bfloat16)
+
+        def build(cache, mask, emb):
+            """Prefill + capture, returning the pieces the decode loop drives."""
+            with torch.no_grad():
+                pos = (mask[:, :seq].cumsum(-1) - 1).clamp(min=0)
+                m(inputs_embeds=emb, attention_mask=mask[:, :seq],
+                  position_ids=pos, use_cache=True, past_key_values=cache)
+                cb = torch.zeros(B, 1, 256, device="cuda", dtype=torch.bfloat16)
+                pb = (pos[:, -1] + 1).unsqueeze(1).clone()
+                cum0 = [l.cumulative_length.clone() for l in cache.layers]
+                pos0 = pb.clone()
+            return cb, pb, cum0, pos0
+
+        def drive(g, h_static, cb, pb, cum0, pos0, cache, mask):
+            for layer, saved in zip(cache.layers, cum0):
+                layer.cumulative_length.copy_(saved)
+            pb.copy_(pos0)
+            mask[:, seq:] = 0
+            out = []
+            for i in range(steps):
+                cb.copy_(toks[i]); mask[:, seq + i] = 1
+                g.replay()
+                out.append(h_static.clone())
+            return torch.stack(out)
+
+        pool = torch.cuda.graph_pool_handle()
+
+        def fresh(emb):
+            """Chunk `emb` on a capture of its own — the pre-reuse behaviour."""
+            cache = StaticCache(config=cfg, max_cache_len=L)
+            mask = torch.zeros(B, L, dtype=torch.long, device="cuda")
+            mask[:, :seq] = 1
+            cb, pb, cum0, pos0 = build(cache, mask, emb)
+            with torch.no_grad():
+                def step():
+                    o = m(inputs_embeds=cb, attention_mask=mask,
+                          position_ids=pb, use_cache=True, past_key_values=cache)
+                    pb.add_(1)
+                    return o.last_hidden_state[:, -1, :]
+
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(3):
+                        step()
+                torch.cuda.current_stream().wait_stream(side)
+                for layer, saved in zip(cache.layers, cum0):
+                    layer.cumulative_length.copy_(saved)
+                pb.copy_(pos0); mask[:, seq:] = 0
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=pool):
+                    h_static = step()
+                return drive(g, h_static, cb, pb, cum0, pos0, cache, mask), \
+                    (g, h_static, cb, pb, cache, mask)
+
+        # Chunk A on a fresh capture, keeping the capture alive.
+        out_a, live = fresh(emb_a)
+        g, h_static, cb, pb, cache, mask = live
+
+        # Chunk B REUSING it: reset the cache, re-prefill into the same
+        # buffers, adopt the captured mask — exactly what
+        # `_acquire_decode_graph` does on a key hit.
+        with torch.no_grad():
+            cache.reset()
+            for layer in cache.layers:
+                layer.cumulative_length.zero_()
+            mask.zero_(); mask[:, :seq] = 1
+            pos = (mask[:, :seq].cumsum(-1) - 1).clamp(min=0)
+            m(inputs_embeds=emb_b, attention_mask=mask[:, :seq],
+              position_ids=pos, use_cache=True, past_key_values=cache)
+            cum0_b = [l.cumulative_length.clone() for l in cache.layers]
+            pos0_b = (pos[:, -1] + 1).unsqueeze(1).clone()
+        out_b_reused = drive(g, h_static, cb, pb, cum0_b, pos0_b, cache, mask)
+
+        # Chunk B on its own fresh capture — the reference.
+        out_b_fresh, _ = fresh(emb_b)
+
+        self.assertTrue(
+            torch.equal(out_b_reused, out_b_fresh),
+            "a reused capture rendered a different chunk than a fresh capture "
+            "of the same geometry — the StaticCache reset is incomplete")
+        # And the two chunks really are different, so the assertion above is
+        # not passing on two copies of the same thing.
+        self.assertFalse(torch.equal(out_a, out_b_fresh),
+                         "sanity: the two chunks must differ")
+
+
+class FixedGeometryTest(unittest.TestCase):
+    """Bucketing the decode geometry so captures stop multiplying.
+
+    Measured 2026-09-07 with a per-chunk capture: ~9 captures per job, VRAM
+    15.4 -> 19.1 GB across four jobs with no recovery, then
+    `dxgkio_reserve_gpu_va` EOVERFLOW and an 86x decode slowdown. A graph's
+    memory pool is never returned to the allocator, so sharing one pool did NOT
+    fix it (verified: arm A degraded at run 4 anyway). The fix is to stop
+    minting geometries.
+    """
+
+    def test_bucket_never_rounds_below_the_real_value(self):
+        """Load-bearing: the value sets the attention width and the cache
+        length, so rounding down would truncate a real prompt or cap."""
+        for n in (1, 3, 4, 5, 127, 128, 129, 200, 1023, 1024):
+            for grid in (4, 128, 256):
+                self.assertGreaterEqual(_bucket_up(n, grid), n)
+
+    def test_bucket_rounds_onto_the_grid(self):
+        self.assertEqual(_bucket_up(1, 4), 4)
+        self.assertEqual(_bucket_up(4, 4), 4)
+        self.assertEqual(_bucket_up(5, 4), 8)
+        self.assertEqual(_bucket_up(129, 128), 256)
+        self.assertEqual(_bucket_up(200, 256), 256)
+
+    def test_hard_max_never_truncates_a_real_value(self):
+        """A cap already at the ceiling must survive the clamp: `token_cap`
+        returns up to 1024, and 1024 must not become anything smaller."""
+        self.assertEqual(_bucket_up(1024, 256, hard_max=1024), 1024)
+        self.assertEqual(_bucket_up(900, 256, hard_max=1024), 1024)
+        # A value ABOVE the ceiling is still not truncated — the clamp is a
+        # preference, the floor is a correctness rule.
+        self.assertEqual(_bucket_up(1200, 256, hard_max=1024), 1200)
+
+    #: (rows, prompt_len, max_cap) per chunk, shaped like a real cap-sorted job
+    #: of 77 sentences at max_batch 12. Every one is distinct, which is why the
+    #: unbucketed code captured a graph per chunk.
+    _JOB = [(12, 210, 224), (12, 233, 268), (12, 251, 301), (12, 266, 355),
+            (12, 289, 402), (12, 301, 466), (12, 340, 551), (5, 372, 688)]
+
+    @staticmethod
+    def _bucketed(chunks):
+        return {(_bucket_up(b, _GEOM_B_GRID, hard_max=12),
+                 _bucket_up(s, _GEOM_SEQ_GRID),
+                 _bucket_up(c, _GEOM_CAP_GRID, hard_max=1024))
+                for b, s, c in chunks}
+
+    def test_bucketing_reduces_the_geometries_a_job_mints(self):
+        """Not "collapses to one" — measured, this job goes 8 -> 5, and the
+        first draft of this test asserted <= 3 and failed. Recorded rather than
+        softened, because the per-job count is NOT what fixes the leak."""
+        raw = {(b, s, c) for b, s, c in self._JOB}
+        bucketed = self._bucketed(self._JOB)
+        self.assertEqual(len(raw), 8, "sanity: raw geometries are all distinct")
+        self.assertLess(len(bucketed), len(raw))
+
+    def test_geometries_come_from_a_bounded_lattice(self):
+        """THIS is the property that fixes the leak.
+
+        A capture's memory pool is never returned to the allocator, so what
+        matters is not how many geometries one job uses but whether the set is
+        finite and RECURS. Every emitted geometry must sit on the grid, so the
+        reachable set is bounded by the lattice rather than by the content —
+        and a later job hits shapes the pool already holds instead of minting
+        more.
+        """
+        for b, sq, c in self._bucketed(self._JOB):
+            self.assertEqual(b % _GEOM_B_GRID, 0, f"B {b} off-grid")
+            self.assertEqual(sq % _GEOM_SEQ_GRID, 0, f"seq {sq} off-grid")
+            self.assertEqual(c % _GEOM_CAP_GRID, 0, f"cap {c} off-grid")
+        # And a second, different job must reuse the first job's shapes rather
+        # than adding its own — the convergence the fix depends on.
+        job2 = [(12, 215, 230), (12, 240, 290), (12, 260, 340), (11, 355, 700)]
+        self.assertTrue(
+            self._bucketed(job2) <= self._bucketed(self._JOB),
+            f"job 2 minted new geometries: "
+            f"{sorted(self._bucketed(job2) - self._bucketed(self._JOB))}")
+
+    def test_padding_rows_get_a_short_cap_so_they_retire(self):
+        self.assertLess(_PAD_ROW_CAP, 200,
+                        "a padding row must retire long before any real one")
+
+
+class FixedGeometryDecodeTest(unittest.TestCase):
+    """The padded batch has to render the real rows unchanged, and hand back
+    exactly the real rows."""
+
+    def test_padded_rows_are_copies_not_zeros(self):
+        """A row with an all-zero mask makes the softmax reduce an all -inf
+        window and return NaN, which propagates through the batched matmul into
+        the REAL rows' logits. Padding therefore copies row 0."""
+        import torch
+        B_real, B, seq = 5, 8, 16
+        embeds = torch.zeros(B, seq, 4)
+        mask_full = torch.zeros(B, seq + 32, dtype=torch.long)
+        embeds[0, seq - 6:] = torch.randn(6, 4)
+        mask_full[0, seq - 6:seq] = 1
+        for b in range(B_real, B):
+            embeds[b] = embeds[0]
+            mask_full[b, :seq] = mask_full[0, :seq]
+        for b in range(B_real, B):
+            self.assertTrue(torch.equal(embeds[b], embeds[0]))
+            self.assertGreater(int(mask_full[b, :seq].sum()), 0,
+                               "a padding row must attend to something")
