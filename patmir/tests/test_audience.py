@@ -385,6 +385,72 @@ class EmptyLineGuard(unittest.TestCase):
                 _StubTranscript(), ctx)
         self.assertEqual([m for m in ctx.lines if "came back empty" in m], [])
 
+    class _DeadInner:
+        """Every line comes back empty with a 200 — an outage that arrives
+        without a status code (or from a candidate that has none)."""
+        id = "dead_inner"
+
+        def translate(self, text, source_lang, emotion=None, audience=None):
+            return ""
+
+    def test_every_line_empty_is_an_outage_not_a_report(self) -> None:
+        """The 2026-09-13 shape: "12 of 12 line(s) came back empty" logged 226
+        times over two days while the stage said `done`, so the TTS had nothing
+        to say and the "dub" was the music bed plus the original vocals at the
+        gap floor. All-empty must raise, and must NOT write `translated.json`
+        as if the stage had succeeded (quality issue #35)."""
+        import tempfile
+        from patmir.pipeline.context import TranslatorUnavailable
+        from patmir.pipeline.stages.translate.adapter import SentenceTranslator
+        with tempfile.TemporaryDirectory() as td:
+            ctx = _RecordingCtx(Path(td), "teenager")
+            with self.assertRaises(TranslatorUnavailable) as cm:
+                SentenceTranslator(inner=self._DeadInner()).translate(
+                    _StubTranscript(n=12), ctx)
+            self.assertFalse((Path(td) / "translated.json").exists())
+        self.assertIn("12 lines", cm.exception.message)
+        self.assertIn("teenager", cm.exception.message)
+        self.assertEqual([m for m in ctx.lines if "came back empty" in m], [])
+
+    def test_a_single_empty_line_is_still_only_reported(self) -> None:
+        """The ADR's case survives: one line, one refusal, one reported gap —
+        not a dead stream. `ALL_EMPTY_MIN_LINES` is the boundary."""
+        import tempfile
+        from patmir.pipeline.stages.translate.adapter import (
+            ALL_EMPTY_MIN_LINES, SentenceTranslator,
+        )
+        self.assertEqual(ALL_EMPTY_MIN_LINES, 2)
+        with tempfile.TemporaryDirectory() as td:
+            ctx = _RecordingCtx(Path(td), "child")
+            out = SentenceTranslator(inner=self._DeadInner()).translate(
+                _StubTranscript(n=1), ctx)
+            self.assertTrue((Path(td) / "translated.json").exists())
+        self.assertEqual(out.sentences[0].target_text, "")
+        empty = [m for m in ctx.lines if "came back empty" in m]
+        self.assertEqual(len(empty), 1, ctx.lines)
+        self.assertIn("1 of 1", empty[0])
+
+    def test_batch_candidate_all_empty_is_an_outage_too(self) -> None:
+        # The batch path builds target_text from `results.get(idx) or ""`, so
+        # a dict of empty strings — exactly what the 402 storm produced — has
+        # to hit the same rule.
+        import tempfile
+        from patmir.pipeline.context import TranslatorUnavailable
+        from patmir.pipeline.stages.translate.adapter import SentenceTranslator
+
+        class _DeadBatch:
+            id = "dead_batch"
+
+            def translate_batch(self, sentences, source_lang, progress=None,
+                                audience=None):
+                return {s.idx: "" for s in sentences}
+
+        with tempfile.TemporaryDirectory() as td:
+            ctx = _RecordingCtx(Path(td), "teenager")
+            with self.assertRaises(TranslatorUnavailable):
+                SentenceTranslator(inner=_DeadBatch()).translate(
+                    _StubTranscript(n=3), ctx)
+
 
 # --- submission validation ---------------------------------------------------
 

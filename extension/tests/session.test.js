@@ -260,6 +260,20 @@ test("failure offers retry and carries the error", () => {
   assert.equal(v.errorText, "boom");
 });
 
+test("a failed job outranks a still-playing dub", () => {
+  // Watch-along plays while it streams. When the server fails the stream
+  // mid-way (translator unavailable), the content script may not have released
+  // the element yet — the old order rendered "Playing dub." over the failure,
+  // and the reason was never shown. Quality issue #35.
+  const v = S.deriveView(base({
+    job: { status: "failed", job_id: "j", error: "OpenRouter: HTTP 402 — credits exhausted" },
+    playback: { ...IDLE_PB, playing: true },
+  }));
+  assert.equal(v.kind, "job-failed");
+  assert.equal(v.tone, "error");
+  assert.match(S.formatSubtitle(v, S.STRINGS_EN), /credits exhausted/);
+});
+
 test("a cancelled job returns to the idle offer", () => {
   // The old popup fell through to a bare stage count here, printing nothing
   // useful for a job the user had deliberately stopped.
@@ -570,6 +584,30 @@ test("autoPlayOnDone plays when the job finishes; without it, nothing starts", a
     // Either way the state must stop offering "not dubbed".
     assert.notEqual(s.view().kind, "not-cached");
   }
+});
+
+test("a job that fails while the dub is playing releases the player", async () => {
+  // Watch-along: the stream is accepted, playback attaches, then the server
+  // fails the stream (translator unavailable). The next poll must stop the
+  // player so the original audio comes back, and the view must show the
+  // failure with its reason — not "Playing dub." forever.
+  const f = makeFake({
+    submit: { job_id: "j1", cache_key: "kw", status: "prelude" },
+    job: { job_id: "j1", cache_key: "kw", status: "failed",
+           error: "OpenRouter: HTTP 402 from m — credits exhausted" },
+  });
+  const s = S.createSession({ transport: f.transport, mode: "watch-along" });
+  await s.refresh();
+  await s.primary();
+  assert.equal(s.getState().playback.playing, true);
+  f.advance(S.JOB_POLL_MS + 1);
+  await s.tick();
+  assert.equal(f.typesOf("player:stop").length, 1, "player was not released");
+  assert.equal(s.getState().playback.playing, false);
+  assert.equal(s.view().kind, "job-failed");
+  assert.match(S.formatSubtitle(s.view(), S.STRINGS_HY), /credits exhausted/);
+  // Nothing is auto-retried: a failure the server diagnosed is deterministic.
+  assert.equal(f.typesOf("jobs:submit").length, 1);
 });
 
 test("stopping a running quality job cancels it server-side", async () => {

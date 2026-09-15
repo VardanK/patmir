@@ -14,7 +14,21 @@ const sync = require("../lib/sync.js");
 const {
   resolveVolumeEvent, dubGainFor, shouldScheduleAudio, driftDecision,
   pickSection, isCovered, median, clamp, DEFAULT_THRESHOLDS, HAVE_FUTURE_DATA,
+  shouldReleaseOnServerStatus,
 } = sync;
+
+// --- server-ended streams ---------------------------------------------
+
+test("a failed or externally cancelled stream releases the video; every live status does not", () => {
+  // The sections poll used to read only `waiting` off the server's status
+  // overlay, so a stream the server had failed kept the element muted with
+  // nothing ever arriving (quality issue #35).
+  assert.equal(shouldReleaseOnServerStatus("failed"), true);
+  assert.equal(shouldReleaseOnServerStatus("cancelled"), true);
+  for (const live of ["queued", "waiting", "prelude", "streaming", "cancelling", "done", undefined, null]) {
+    assert.equal(shouldReleaseOnServerStatus(live), false, String(live));
+  }
+});
 
 // --- helpers ---------------------------------------------------------
 

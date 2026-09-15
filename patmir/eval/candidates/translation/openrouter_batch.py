@@ -42,10 +42,18 @@ from patmir.eval.candidates.translation.openrouter import (
     _SYSTEM,
     _audience_clause,
     _strip_thinking,
+    unavailable_from_status,
 )
+from patmir.pipeline.context import TranslatorUnavailable
 
 # Shared with the per-sentence candidate so one retry policy governs both.
 _RETRYABLE = OpenRouterTranslator._RETRYABLE
+# And one outage policy: 401/402/404 mean NO line can be translated, so they
+# must not be degraded into `chunk_size` per-sentence calls that each fail the
+# same way and each become "". That is exactly what happened on 2026-09-13
+# when the account ran out of credits (quality issue #35): one 402 on the
+# chunk, twelve more on the fallback, twelve empty lines, stage `done`.
+_FATAL = OpenRouterTranslator._FATAL
 
 _BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -322,6 +330,11 @@ class OpenRouterBatchTranslator:
             else:
                 if resp.status_code == 200:
                     break
+                if resp.status_code in _FATAL:
+                    # Not a _BatchError: `translate_batch` must NOT catch this
+                    # and fall back per sentence.
+                    raise unavailable_from_status(resp.status_code, resp.text,
+                                                  model=self.model)
                 last = f"HTTP {resp.status_code}: {resp.text[:300]}"
                 if resp.status_code not in _RETRYABLE:
                     raise _BatchError(last)
@@ -366,7 +379,11 @@ class OpenRouterBatchTranslator:
         sequential ones.
 
         A sentence that still fails yields "" — the empty-translation case the
-        adapter counts and reports, rather than a silent gap.
+        adapter counts and reports, rather than a silent gap. A sentence that
+        fails because the translator is UNAVAILABLE (no credits, bad key) is
+        not "a sentence that still fails": it re-raises, because every other
+        sentence is about to fail identically and an all-empty section is a
+        muffled copy of the original, not a dub (quality issue #35).
         """
         from concurrent.futures import ThreadPoolExecutor
 
@@ -378,6 +395,8 @@ class OpenRouterBatchTranslator:
                     it.text, source_lang=source_lang, emotion=it.emotion,
                     audience=audience,
                 )
+            except TranslatorUnavailable:
+                raise
             except Exception:  # noqa: BLE001
                 return it.idx, ""
 

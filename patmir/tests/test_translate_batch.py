@@ -411,6 +411,175 @@ class RetryPolicy(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class OutagePolicy(unittest.TestCase):
+    """A translator that cannot translate ANY line raises, it does not degrade.
+
+    On 2026-09-13 the OpenRouter account ran out of credits. Every call
+    answered 402; 402 was not retryable, so the batched candidate raised
+    `_BatchError`, fell back to per-sentence calls, each of those 402'd too and
+    `_fallback_chunk` turned each into "". `translate_batch` returned a dict of
+    empty strings, the adapter logged "12 of 12 line(s) came back empty" and
+    the stage said `done`. Two days of watch-along sections were the music bed
+    plus the original vocals at the gap floor (quality issue #35). These tests
+    pin the boundary: 401/402/404 raise `TranslatorUnavailable` from the first
+    response, with no per-sentence storm; a 403 (per-input moderation) is still
+    a per-line matter and still falls back.
+    """
+
+    def _sentence_translator(self, responses):
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter import (
+            OpenRouterTranslator,
+        )
+        t = OpenRouterTranslator(model="m", max_attempts=3, retry_backoff_s=0.0)
+        client = FakeClient(responses)
+        t._client = client
+        return t, client
+
+    def _batch_translator(self, responses):
+        _set_env_key()
+        from patmir.eval.candidates.translation.openrouter_batch import (
+            OpenRouterBatchTranslator,
+        )
+        t = OpenRouterBatchTranslator(model="m", chunk_size=20, overlap=0,
+                                      max_attempts=3, retry_backoff_s=0.0)
+        client = FakeClient(responses)
+        t._client = client
+        return t, client
+
+    def test_402_is_unavailable_on_the_sentence_candidate(self):
+        from patmir.pipeline.context import TranslatorUnavailable
+        t, client = self._sentence_translator(
+            [_FakeResp(402, '{"error":{"message":"Insufficient credits"}}')])
+        with self.assertRaises(TranslatorUnavailable) as cm:
+            t.translate("x", source_lang="ru")
+        self.assertEqual(cm.exception.status, 402)
+        self.assertIn("402", cm.exception.message)
+        self.assertIn("credits exhausted", cm.exception.message)
+        self.assertIn("Insufficient credits", cm.exception.message)
+        # Not retried: it fails identically next time.
+        self.assertEqual(len(client.requests), 1)
+
+    def test_401_and_404_are_unavailable_too(self):
+        from patmir.pipeline.context import TranslatorUnavailable
+        for status in (401, 404):
+            with self.subTest(status=status):
+                t, client = self._sentence_translator([_FakeResp(status, "no")])
+                with self.assertRaises(TranslatorUnavailable) as cm:
+                    t.translate("x", source_lang="ru")
+                self.assertEqual(cm.exception.status, status)
+                self.assertEqual(len(client.requests), 1)
+
+    def test_the_message_is_one_readable_line(self):
+        # The extension prints `error` under the button; a traceback there is
+        # noise. Multi-line provider bodies are flattened and truncated.
+        from patmir.pipeline.context import TranslatorUnavailable
+        t, _ = self._sentence_translator([_FakeResp(402, "line one\nline two\n" + "x" * 500)])
+        with self.assertRaises(TranslatorUnavailable) as cm:
+            t.translate("x", source_lang="ru")
+        self.assertNotIn("\n", cm.exception.message)
+        self.assertLess(len(cm.exception.message), 320)
+
+    def test_400_is_still_a_plain_error(self):
+        # Usually our own payload; not an outage, not `TranslatorUnavailable`.
+        from patmir.pipeline.context import TranslatorUnavailable
+        t, _ = self._sentence_translator([_FakeResp(400, "bad")])
+        with self.assertRaises(RuntimeError) as cm:
+            t.translate("x", source_lang="ru")
+        self.assertNotIsInstance(cm.exception, TranslatorUnavailable)
+
+    def test_batch_402_raises_without_the_per_sentence_storm(self):
+        """The measured shape of the incident: 1 chunk call + 12 fallback calls
+        for a 12-sentence section, every one a 402. Now: one call, one raise."""
+        from patmir.pipeline.context import TranslatorUnavailable
+        t, client = self._batch_translator([_FakeResp(402, "Insufficient credits")])
+        fallback_calls: list[str] = []
+
+        class _Fallback:
+            translate_concurrency = 12
+
+            def translate(self, text, *, source_lang, emotion=None, audience=None):
+                fallback_calls.append(text)
+                return ""
+
+        t._fallback = _Fallback()
+        with self.assertRaises(TranslatorUnavailable) as cm:
+            t.translate_batch(_items_from(list(range(12))), source_lang="ru")
+        self.assertEqual(cm.exception.status, 402)
+        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(fallback_calls, [], "fell back per sentence on an outage")
+
+    def test_batch_403_is_per_line_and_still_falls_back(self):
+        # OpenRouter answers 403 when the provider's moderation flags one
+        # input. That is the refusal the audience ADR routes to an empty line,
+        # so it must keep degrading to per-sentence calls, not fail the dub.
+        t, client = self._batch_translator([_FakeResp(403, "flagged")])
+        calls: list[str] = []
+
+        class _Fallback:
+            translate_concurrency = 1
+
+            def translate(self, text, *, source_lang, emotion=None, audience=None):
+                calls.append(text)
+                return f"fb_{text}"
+
+        t._fallback = _Fallback()
+        out = t.translate_batch(_items_from([0, 1]), source_lang="ru")
+        self.assertEqual(out, {0: "fb_ru_0", 1: "fb_ru_1"})
+        self.assertEqual(len(calls), 2)
+
+    def test_fallback_reraises_unavailable_but_blanks_other_failures(self):
+        """`_fallback_chunk._one` catches everything and returns "" — that is
+        the per-line refusal contract. An outage raised INSIDE the fallback
+        (the chunk call failed for another reason, then the credits ran out)
+        must escape it; any other exception still becomes an empty line."""
+        from patmir.pipeline.context import TranslatorUnavailable
+
+        for exc, expect_raise in ((TranslatorUnavailable("gone", status=402), True),
+                                  (RuntimeError("one bad line"), False)):
+            with self.subTest(exc=type(exc).__name__):
+                t, _ = self._batch_translator([_FakeResp(400, "bad")])  # -> fallback
+
+                class _Fallback:
+                    translate_concurrency = 1
+
+                    def translate(self, text, *, source_lang, emotion=None,
+                                  audience=None):
+                        raise exc
+
+                t._fallback = _Fallback()
+                if expect_raise:
+                    with self.assertRaises(TranslatorUnavailable):
+                        t.translate_batch(_items_from([0, 1]), source_lang="ru")
+                else:
+                    out = t.translate_batch(_items_from([0, 1]), source_lang="ru")
+                    self.assertEqual(out, {0: "", 1: ""})
+
+    def test_fallback_reraises_unavailable_when_concurrent(self):
+        # The thread-pool path: `ex.map` must surface the worker's raise.
+        from patmir.pipeline.context import TranslatorUnavailable
+        t, _ = self._batch_translator([_FakeResp(400, "bad")])
+
+        class _Fallback:
+            translate_concurrency = 4
+
+            def translate(self, text, *, source_lang, emotion=None, audience=None):
+                raise TranslatorUnavailable("gone", status=402)
+
+        t._fallback = _Fallback()
+        with self.assertRaises(TranslatorUnavailable):
+            t.translate_batch(_items_from([0, 1, 2, 3]), source_lang="ru")
+
+    def test_shared_fatal_set(self):
+        # One outage policy for both candidates, like the retry set.
+        from patmir.eval.candidates.translation import openrouter, openrouter_batch
+        self.assertEqual(openrouter_batch._FATAL, openrouter.OpenRouterTranslator._FATAL)
+        self.assertEqual(openrouter.OpenRouterTranslator._FATAL, frozenset({401, 402, 404}))
+        self.assertNotIn(403, openrouter.OpenRouterTranslator._FATAL)
+        self.assertFalse(openrouter.OpenRouterTranslator._FATAL
+                         & openrouter.OpenRouterTranslator._RETRYABLE)
+
+
 class ConcurrencyKnob(unittest.TestCase):
     def test_concurrency_is_configurable_per_instance(self):
         _set_env_key()

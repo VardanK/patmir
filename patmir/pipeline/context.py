@@ -33,6 +33,36 @@ class JobCancelled(Exception):
     """
 
 
+class TranslatorUnavailable(RuntimeError):
+    """The translate candidate cannot translate ANYTHING right now.
+
+    Distinct from a failed line. The audience guardrail (ADR
+    `2026-08-28-audience-age-guardrail`) deliberately turns a per-line provider
+    refusal into an empty line that the adapter counts and reports, because a
+    silent gap on one line beats losing the dub. That rule assumed the
+    translator was otherwise working. On 2026-09-13 the OpenRouter account ran
+    out of credits, every call answered HTTP 402, and the same machinery turned
+    a two-day outage into hundreds of "dubs" whose every line was empty: the
+    TTS synthesized nothing, the mux emitted the music bed plus the original
+    vocals at the gap floor, and the extension played that over the muted
+    original while counting sections as translated (quality issue #35).
+
+    So an outage must be a different type of thing from a refusal, and every
+    layer must let it through the way it lets `JobCancelled` through: the
+    section pipeline does not skip the section, the stream manager does not
+    swallow it into "one section failed", and the record ends `failed` with
+    `message` as its error text -- short and readable, because the extension
+    shows it under the button.
+
+    `status` is the HTTP status that established it, when there was one.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
 # --- Audience age guardrail --------------------------------------------------
 #
 # The age register the translator is steered toward. Prompt-only softening: the

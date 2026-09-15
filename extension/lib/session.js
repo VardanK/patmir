@@ -260,14 +260,18 @@
       });
     }
 
-    if (pb.playing) {
-      return view("playing", STOP, { action: "stop", tone: "active" });
-    }
-
+    // A failed job outranks "playing". Watch-along plays while it streams, so
+    // a stream the server fails mid-way (translator unavailable, say) used to
+    // render as "Playing dub." for as long as the content script had not yet
+    // released the element — the one moment the viewer most needs the reason.
     if (job && job.status === "failed") {
       return view("job-failed", RETRY, {
         action: "retry", tone: "error", errorText: job.error || null,
       });
+    }
+
+    if (pb.playing) {
+      return view("playing", STOP, { action: "stop", tone: "active" });
     }
     if (job && job.status === "cancelled") {
       return view("cancelled", TRANSLATE, { action: "start", tone: "idle" });
@@ -875,6 +879,18 @@
           if (TERMINAL[rec.status]) {
             if (rec.cache_key) forgetJob(rec.cache_key);
             st.jobId = null;
+            if (rec.status === "failed" && st.playback.playing) {
+              // The dub is still attached to a job the server has failed.
+              // Release the element so the original audio comes back, then
+              // re-read playback so the view flips off "playing". The
+              // content script does the same off its own sections poll; this
+              // is the belt for a poll it missed (popup-only surface, or a
+              // page whose poll was already torn down).
+              return Promise.resolve(player.stop())
+                .catch(function () { return null; })
+                .then(function () { return readStatus(); })
+                .then(function () { return null; });
+            }
             if (rec.status === "done") {
               // Re-read the cache so an idle button says "ready" rather than
               // "not dubbed" if we do not auto-play.

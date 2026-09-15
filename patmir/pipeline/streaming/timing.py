@@ -55,6 +55,8 @@ def section_timing(
     new_speakers: list[str] | None = None,
     buffer_ahead_s: float | None = None,
     produced_at: float | None = None,
+    lines: int | None = None,
+    voiced_lines: int | None = None,
 ) -> dict[str, Any]:
     """One section's timing, read back out of its `manifest.json`.
 
@@ -96,4 +98,13 @@ def section_timing(
         rec["buffer_ahead_s"] = round(buffer_ahead_s, 2)
     if produced_at is not None:
         rec["produced_at"] = round(produced_at, 3)
+    # Not timing, but the same additive, absent-able contract: a cached section
+    # says how many lines it had and how many carry Armenian. The 2026-09-13
+    # outage (quality issue #35) left nine cache keys full of sections whose
+    # only tell was `stage_wall_s.tts == 0.0`; with these two numbers a
+    # voiceless section is identifiable from the manifest alone.
+    if lines is not None:
+        rec["lines"] = int(lines)
+    if voiced_lines is not None:
+        rec["voiced_lines"] = int(voiced_lines)
     return rec

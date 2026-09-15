@@ -901,6 +901,19 @@
     // The server overlays the live record's status here. `waiting` means this
     // stream is queued behind another job on the one GPU, not stalled.
     waWaitingForGpu = data.status === "waiting";
+    // `failed` (or a `cancelled` we did not issue) means the server has given
+    // up on this stream — e.g. the translator is unavailable and nothing more
+    // will ever arrive. Hand the picture its own audio back NOW rather than
+    // sitting muted behind a dub that is not coming; the button reads the
+    // reason off the job record. Not the revive path: a failure the server
+    // diagnosed is deterministic, and re-submitting would only repeat it.
+    if (S.shouldReleaseOnServerStatus(data.status)) {
+      console.warn(`[patmir] server ended the dub stream (${data.status}): `
+        + `${data.error || "no reason given"} — releasing the video.`);
+      stopWatchAlong(`server-${data.status}`);
+      if (video && video.paused) { try { waPlay(); } catch (_) { /* ok */ } }
+      return;
+    }
     for (const s of data.sections || []) {
       const existing = waSections.get(s.index);
       if (existing) {
