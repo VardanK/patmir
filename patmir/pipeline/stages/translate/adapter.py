@@ -19,10 +19,17 @@ from typing import Any
 from patmir.pipeline.context import (
     NEUTRAL_AUDIENCE,
     JobContext,
+    TranslatorUnavailable,
     resolve_audience,
 )
 
 log = logging.getLogger(__name__)
+
+# A translate result in which EVERY line is empty is treated as an outage and
+# raises, but only from this many lines up. Below it — one line — an empty
+# result is still what a per-line provider refusal looks like, and the audience
+# guardrail's rule (an empty line, reported, never a failed dub) stands.
+ALL_EMPTY_MIN_LINES = 2
 
 
 def _accepts(fn: Any, name: str) -> bool:
@@ -211,10 +218,31 @@ class SentenceTranslator:
         # the candidate turns into "" and the TTS adapter then skips — a silent
         # hole in the dub. The batch path already catches this per chunk
         # ("empty translation for idx=" -> per-sentence fallback); the
-        # per-sentence path had nothing. Count and report; never fail the run,
-        # because the rest of the dub is good and the operator needs to know
-        # which lines to look at.
+        # per-sentence path had nothing. SOME blank lines: count and report,
+        # never fail the run, because the rest of the dub is good and the
+        # operator needs to know which lines to look at.
+        #
+        # EVERY line blank is a different thing. "Never fail the run" assumed a
+        # translator that was otherwise working; on 2026-09-13 the account ran
+        # out of credits, the candidate turned every 402 into "", and this
+        # branch reported "12 of 12 line(s) came back empty" on 226 sections
+        # over two days while the stage said `done` — so the TTS synthesized
+        # nothing and the "dub" was the music bed plus the original vocals at
+        # the gap floor, which the extension then played as a translation
+        # (quality issue #35). The candidates now raise `TranslatorUnavailable`
+        # on the statuses that mean that; this is the backstop for an outage
+        # that arrives as a 200 with no text, or from a candidate that has no
+        # status codes at all. The floor of ALL_EMPTY_MIN_LINES lines keeps the
+        # ADR's case intact: a one-line section whose only line a child-register
+        # provider declines is still a reported empty line, not a dead stream.
         blank = sum(1 for s in sentences if not (s.target_text or "").strip())
+        if blank and blank == len(sentences) and blank >= ALL_EMPTY_MIN_LINES:
+            cid = getattr(self.inner, "id", type(self.inner).__name__)
+            raise TranslatorUnavailable(
+                f"translator {cid!r} returned no text for any of {blank} lines "
+                f"(audience={audience}) — refusing to produce a dub with no "
+                f"speech in it"
+            )
         if blank:
             msg = (
                 f"{blank} of {len(sentences)} line(s) came back empty from the "

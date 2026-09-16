@@ -43,6 +43,7 @@ from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.context import (
     NEUTRAL_AUDIENCE,
     JobCancelled,
+    TranslatorUnavailable,
     resolve_audience,
 )
 from patmir.pipeline.streaming.pipeline import SectionPipeline
@@ -94,6 +95,10 @@ class StreamRecord:
     # in-page progress bar showed nothing at all in watch-along once it became
     # the default mode.
     dubbed_s: float = 0.0
+    # Sections that raised and were skipped (the stream carried on). Before
+    # this a skipped section left no trace outside the server log; the client
+    # saw `streaming` and a section count that simply did not grow.
+    sections_failed: int = 0
     cached: bool = False
     # Download progress. These four names are what JobManager's yt-dlp hook
     # writes; carrying them here is what lets a watch-along stream pass `rec`
@@ -138,6 +143,7 @@ class StreamRecord:
             # The progress bar divides this by `duration`; without it the
             # extension read `undefined` and hid the bar in watch-along.
             "dubbed_s": self.dubbed_s,
+            "sections_failed": self.sections_failed,
             "cached": self.cached,
             "speakers": self.speakers,
             "playhead": {"t": self.playhead.t, "paused": self.playhead.paused},
@@ -154,6 +160,18 @@ class StreamRecord:
         }
 
 
+
+
+def _is_voiceless(result: SectionResult) -> bool:
+    """A section the translate stage saw at least two lines of and gave text to
+    none of them. Two, not one: one empty line is what a per-line provider
+    refusal looks like and the audience ADR keeps that as a reported gap. A
+    section with NO lines (music, silence) is not voiceless — there was nothing
+    to say. Unknown counts (`None`) are trusted, since the stage would have
+    raised on an outage it could see."""
+    if result.lines is None or result.voiced_lines is None:
+        return False
+    return result.lines >= 2 and result.voiced_lines == 0
 
 
 def _dubbed_seconds(prior: dict[str, Any] | None) -> float:
@@ -514,6 +532,15 @@ class StreamManager:
             rec.status = "failed"
             rec.error = "cancelled"
             raise
+        except TranslatorUnavailable as exc:
+            # The translator cannot translate anything (no credits, bad key,
+            # every line empty). A diagnosed condition with a one-line reason,
+            # so the record carries THAT — the extension prints `error` under
+            # the button, and a traceback there is noise. Ends `failed`, not
+            # `done`: a stream that produced nothing translated is not done.
+            rec.error = exc.message
+            rec.status = "failed"
+            log.error("Stream %s: translator unavailable — %s", rec.job_id, exc.message)
         except Exception as exc:  # noqa: BLE001
             rec.error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
             rec.status = "failed"
@@ -658,8 +685,16 @@ class StreamManager:
                 # report a failed section, so Stop would be silently downgraded
                 # to "one section didn't work" and the stream would carry on.
                 raise
+            except TranslatorUnavailable:
+                # MUST propagate too. Every later section would fail the same
+                # way, so "skip this one and carry on" means a stream that
+                # reports `streaming` forever and produces nothing — or, before
+                # the candidates raised at all, one that produced voiceless
+                # sections and called them translated (quality issue #35).
+                raise
             except Exception:  # noqa: BLE001
                 log.exception("Section at %.1fs failed.", start)
+                rec.sections_failed += 1
                 return None
 
         scheduler = StreamScheduler(
@@ -695,6 +730,19 @@ class StreamManager:
     def _emit(self, rec: StreamRecord, result: SectionResult) -> None:
         if result.dub_wav is None:
             return
+        if _is_voiceless(result):
+            # Last line of defence. With the candidates raising on 401/402 and
+            # the adapter raising on all-empty, this should be unreachable;
+            # it exists because the cache is the free-rewatch store, so a
+            # voiceless section written once plays wrong on every viewing
+            # (nine keys had to be purged after 2026-09-13, quality issue #35).
+            log.error(
+                "Section %d (%.1f-%.1f s) has %s lines and none with text — "
+                "not caching it.", result.index, result.start, result.end,
+                result.lines,
+            )
+            rec.sections_failed += 1
+            return
         cache_mod.append_section(
             self._cache_root, rec.cache_key,
             index=result.index, start=result.start, end=result.end,
@@ -719,6 +767,8 @@ class StreamManager:
                 new_speakers=result.new_speakers,
                 buffer_ahead_s=self._buffer_ahead(rec),
                 produced_at=time.time(),
+                lines=result.lines,
+                voiced_lines=result.voiced_lines,
             )
         except Exception:  # noqa: BLE001 — see docstring
             log.exception("Section timing failed for %s.", rec.job_id)

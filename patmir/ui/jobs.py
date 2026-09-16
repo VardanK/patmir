@@ -29,6 +29,7 @@ from patmir.pipeline.config import PipelineConfig
 from patmir.pipeline.context import (
     NEUTRAL_AUDIENCE,
     JobCancelled,
+    TranslatorUnavailable,
     normalize_audience,
     resolve_audience,
 )
@@ -451,6 +452,12 @@ class JobManager:
                     # artifacts stay in the job dir so `--resume-from` works.
                     rec.status = "cancelled"
                     log.info("Job %s cancelled.", rec.job_id)
+                except TranslatorUnavailable as exc:
+                    # Diagnosed, not unexpected: the reason is the whole
+                    # message and the popup prints `error` verbatim.
+                    rec.error = exc.message
+                    rec.status = "failed"
+                    log.error("Job %s: translator unavailable — %s", rec.job_id, exc.message)
                 except Exception as exc:  # noqa: BLE001
                     rec.error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
                     rec.status = "failed"

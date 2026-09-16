@@ -162,3 +162,9 @@ dub`, `patmir submit` and anything else that omits the field.
   applying, and the adapter's warning is the tripwire that says so.
 * Provider-side refusals show up as empty lines often enough to need a retry
   rather than a report.
+  **Fired 2026-09-13, in a form this ADR did not anticipate:** not refusals but
+  an outage. The OpenRouter account ran out of credits, every call answered 402,
+  and "count and report, never fail the run" turned two days of watch-along into
+  sections with every line empty (quality issue #35). The rule here stands for a
+  *refused line*; an outage is now a distinct `TranslatorUnavailable` that fails
+  the dub. ADR `2026-09-15-translator-outage-fails-loudly`.

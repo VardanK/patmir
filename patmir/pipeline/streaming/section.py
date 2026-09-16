@@ -63,6 +63,26 @@ class SectionResult:
     # (ffmpeg slice/trim, ECAPA embed, age-gender profile). Set by the two
     # producers below so the live path and bench read one number, not two.
     wall_s: float | None = None
+    # How many lines the translate stage saw, and how many of them carry text.
+    # `voiced_lines == 0` with `lines >= 2` is a section with no speech in it —
+    # the music bed plus the original vocals at the gap floor — which is what
+    # two days of watch-along produced while the translator was answering 402
+    # (quality issue #35). Carried here so `_emit` can refuse to cache it and
+    # so `sections.json` records it. None when the counts could not be read.
+    lines: int | None = None
+    voiced_lines: int | None = None
+
+
+def line_counts(job_dir: Path) -> tuple[int | None, int | None]:
+    """`(lines, voiced_lines)` from a section's `translated.json`, or
+    `(None, None)` when it is missing or unreadable — telemetry, never fatal."""
+    try:
+        data = json.loads((job_dir / "translated.json").read_text())
+        sents = data.get("sentences", [])
+        voiced = sum(1 for s in sents if (s.get("target_text") or "").strip())
+        return len(sents), voiced
+    except Exception:  # noqa: BLE001 — see docstring
+        return None, None
 
 
 def _slice_audio(source: Path, start: float, duration: float, dest: Path) -> None:
@@ -199,10 +219,11 @@ def dub_prelude_window(
     else:
         out_chunk = None  # type: ignore[assignment]
 
+    lines, voiced = line_counts(job_dir)
     return SectionResult(
         index=0, start=0.0, end=end_rel, dub_wav=out_chunk, job_dir=job_dir,
         local_to_global={}, new_speakers=list(prelude.registry.known_speakers()),
-        wall_s=perf_counter() - t0,
+        wall_s=perf_counter() - t0, lines=lines, voiced_lines=voiced,
     )
 
 
@@ -353,6 +374,7 @@ def speak_section(
     else:
         out_chunk = None  # type: ignore[assignment]
 
+    lines, voiced = line_counts(analyzed.job_dir)
     return SectionResult(
         index=analyzed.index,
         start=analyzed.start,
@@ -362,6 +384,8 @@ def speak_section(
         local_to_global=analyzed.local_to_global,
         new_speakers=analyzed.new_speakers,
         wall_s=perf_counter() - analyzed.started_at,
+        lines=lines,
+        voiced_lines=voiced,
     )
 
 

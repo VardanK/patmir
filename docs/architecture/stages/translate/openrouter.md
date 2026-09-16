@@ -31,6 +31,22 @@
 
 To swap, change `[pipeline].translate` in `patmir.toml`. To add a new model, copy a `[[eval.translation.candidates]]` block and change `id` + `model`.
 
+## Failure semantics (2026-09-15)
+
+| Response | Per-sentence candidate | Batched candidate |
+| --- | --- | --- |
+| 200 | text (a `content: null` becomes `""` — a per-line refusal, reported by the adapter) | parsed; idx mismatch / empty text -> `_BatchError` -> per-sentence fallback for that chunk |
+| 408 / 409 / 425 / 429 / 5xx / transport | retried (`max_attempts`, exponential `retry_backoff_s`) | same, then `_BatchError` -> fallback |
+| **401 / 402 / 404** | **`TranslatorUnavailable`**, first response, no retry | **`TranslatorUnavailable`**, not a `_BatchError`, so **no** per-sentence fallback; the fallback's `_one` also re-raises it |
+| 403 (provider moderation flagged the input) | `RuntimeError` on that line -> in the batched fallback, `""` for that line | `_BatchError` -> fallback -> `""` for the flagged line |
+| other 4xx (400) | `RuntimeError` | `_BatchError` -> fallback |
+
+`TranslatorUnavailable` ends the stream or job `failed` with the one-line message as `error`
+(`OpenRouter: HTTP 402 from google/gemini-3.5-flash — credits exhausted (...)`). Two days of
+402s in 2026-09 had instead produced sections with every line empty and every stage `done`
+(quality issue #35). Watch the account balance: there is no preflight probe by decision.
+
 ## ADR
 
 [2026-05-26 — Cloud translate via OpenRouter (Gemini 2.5 Flash default)](../../decisions/2026-05-26-cloud-translate-via-openrouter.md)
+[2026-09-15 — A translator outage must fail the dub, not mute it](../../decisions/2026-09-15-translator-outage-fails-loudly.md)

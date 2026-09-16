@@ -400,9 +400,30 @@
     return since >= limit;
   }
 
+  /**
+   * Has the server ended this stream from under us?
+   *
+   * `/stream/<key>/sections` overlays the live record's `status`. The client
+   * read only `waiting` off it, so a stream the server had marked `failed`
+   * kept the element muted and the dub graph attached forever: nothing new
+   * arrived, and the 60 s starvation rule was the only way out — and it does
+   * not fire while cached sections still cover the playhead. For two days in
+   * 2026-09 the server produced sections with no Armenian in them and called
+   * them done; once it fails such a stream instead, THIS is what hands the
+   * original audio back (quality issue #35).
+   *
+   * `cancelled` counts too: our own stop tears the poll down before it could
+   * observe it, so a `cancelled` seen while still polling came from elsewhere
+   * (another tab, the popup) and the audio should be released the same way.
+   */
+  function shouldReleaseOnServerStatus(status) {
+    return status === "failed" || status === "cancelled";
+  }
+
   return {
     STREAM_STALL_MS: STREAM_STALL_MS,
     shouldAbandonStream: shouldAbandonStream,
+    shouldReleaseOnServerStatus: shouldReleaseOnServerStatus,
     HAVE_FUTURE_DATA: HAVE_FUTURE_DATA,
     SECTION_LEAD: SECTION_LEAD,
     DEFAULT_AD_SEEK_ATTEMPTS: DEFAULT_AD_SEEK_ATTEMPTS,

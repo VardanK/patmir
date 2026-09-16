@@ -32,7 +32,30 @@ from typing import Any
 
 import httpx
 
+from patmir.pipeline.context import TranslatorUnavailable
+
 _LANG_NAME = {"en": "English", "ru": "Russian", "hy": "Armenian"}
+
+# What each fatal status means to the person reading the button. The raw
+# response body is kept too (truncated), but after the status name: the first
+# line is what the extension shows, and "credits exhausted" is the diagnosis
+# where `{"error":{"message":"Insufficient credits..."}}` is the evidence.
+_FATAL_REASON = {
+    401: "the API key was rejected",
+    402: "credits exhausted",
+    404: "the model id was not found",
+}
+
+
+def unavailable_from_status(status: int, body: str, *, model: str) -> TranslatorUnavailable:
+    """Build the outage error for a fatal HTTP status. Shared by both
+    OpenRouter candidates so the two cannot describe one failure differently."""
+    reason = _FATAL_REASON.get(status, "request refused")
+    detail = (body or "").strip().replace("\n", " ")[:200]
+    msg = f"OpenRouter: HTTP {status} from {model} — {reason}"
+    if detail:
+        msg += f" ({detail})"
+    return TranslatorUnavailable(msg, status=status)
 
 _SYSTEM = (
     "You translate dialogue into spoken, casual Eastern Armenian (hy_AM) — "
@@ -231,6 +254,16 @@ class OpenRouterTranslator:
     # retrying them only delays a real error.
     _RETRYABLE = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 
+    # Statuses that mean the translator cannot translate ANY line right now --
+    # not this line, every line: no credits (402), a bad key (401), a model id
+    # that does not exist (404). These raise `TranslatorUnavailable`, which
+    # every layer above lets through so the job/stream ends `failed` with a
+    # readable reason. Deliberately NOT here: 403, which OpenRouter returns
+    # when the provider's moderation flags one input -- a per-line refusal, and
+    # the guardrail ADR says a refused line becomes an empty line, never a
+    # failed dub. 400 stays a plain RuntimeError: it is usually our payload.
+    _FATAL = frozenset({401, 402, 404})
+
     def _post_with_retry(self, payload: dict[str, Any]) -> dict[str, Any]:
         """One chat completion, retried on transient failures.
 
@@ -256,6 +289,9 @@ class OpenRouterTranslator:
             else:
                 if resp.status_code == 200:
                     return resp.json()
+                if resp.status_code in self._FATAL:
+                    raise unavailable_from_status(resp.status_code, resp.text,
+                                                  model=self.model)
                 last = RuntimeError(
                     f"openrouter translator: HTTP {resp.status_code} from "
                     f"{self.model}: {resp.text[:500]}"
